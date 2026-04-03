@@ -250,6 +250,166 @@ class TestChangeBias(unittest.TestCase):
             "Bias should have changed after change-bias on frozen model",
         )
 
+    def test_change_bias_frozen_pt2(self) -> None:
+        """Change-bias on a .pt2 frozen model."""
+        from deepmd.pt_expt.entrypoints.main import (
+            freeze,
+        )
+        from deepmd.pt_expt.model.model import (
+            BaseModel,
+        )
+        from deepmd.pt_expt.utils.serialization import (
+            serialize_from_file,
+        )
+
+        pt2_path = os.path.join(self.tmpdir, "frozen.pt2")
+        freeze(model=self.model_path, output=pt2_path)
+
+        original_data = serialize_from_file(pt2_path)
+        original_model = BaseModel.deserialize(original_data["model"])
+        original_bias = to_numpy(original_model.get_out_bias())
+
+        output_pt2 = os.path.join(self.tmpdir, "frozen_updated.pt2")
+        run_dp(
+            f"dp --pt-expt change-bias {pt2_path} "
+            f"-s {self.data_file[0]} -o {output_pt2}"
+        )
+
+        updated_data = serialize_from_file(output_pt2)
+        updated_model = BaseModel.deserialize(updated_data["model"])
+        updated_bias = to_numpy(updated_model.get_out_bias())
+
+        self.assertFalse(
+            np.allclose(original_bias, updated_bias),
+            "Bias should have changed after change-bias on .pt2 model",
+        )
+
+    def test_change_bias_frozen_pt2_user_defined(self) -> None:
+        """Change-bias with user-defined values on a .pt2 model."""
+        from deepmd.pt_expt.entrypoints.main import (
+            freeze,
+        )
+        from deepmd.pt_expt.model.model import (
+            BaseModel,
+        )
+        from deepmd.pt_expt.utils.serialization import (
+            serialize_from_file,
+        )
+
+        pt2_path = os.path.join(self.tmpdir, "frozen_ud.pt2")
+        freeze(model=self.model_path, output=pt2_path)
+
+        output_pt2 = os.path.join(self.tmpdir, "frozen_ud_updated.pt2")
+        run_dp(f"dp --pt-expt change-bias {pt2_path} -b 1.0 2.0 -o {output_pt2}")
+
+        updated_data = serialize_from_file(output_pt2)
+        updated_model = BaseModel.deserialize(updated_data["model"])
+        updated_bias = to_numpy(updated_model.get_out_bias())
+
+        expected = np.array([[1.0], [2.0]])
+        np.testing.assert_allclose(updated_bias.squeeze(0), expected, atol=1e-10)
+
+    def test_change_bias_pt2_pte_consistency(self) -> None:
+        """Change-bias on .pte and .pt2 should produce same bias values."""
+        from deepmd.pt_expt.entrypoints.main import (
+            freeze,
+        )
+        from deepmd.pt_expt.model.model import (
+            BaseModel,
+        )
+        from deepmd.pt_expt.utils.serialization import (
+            serialize_from_file,
+        )
+
+        pte_path = os.path.join(self.tmpdir, "cons.pte")
+        pt2_path = os.path.join(self.tmpdir, "cons.pt2")
+        freeze(model=self.model_path, output=pte_path)
+        freeze(model=self.model_path, output=pt2_path)
+
+        output_pte = os.path.join(self.tmpdir, "cons_updated.pte")
+        output_pt2 = os.path.join(self.tmpdir, "cons_updated.pt2")
+        run_dp(
+            f"dp --pt-expt change-bias {pte_path} "
+            f"-s {self.data_file[0]} -o {output_pte}"
+        )
+        run_dp(
+            f"dp --pt-expt change-bias {pt2_path} "
+            f"-s {self.data_file[0]} -o {output_pt2}"
+        )
+
+        pte_data = serialize_from_file(output_pte)
+        pt2_data = serialize_from_file(output_pt2)
+        pte_bias = to_numpy(BaseModel.deserialize(pte_data["model"]).get_out_bias())
+        pt2_bias = to_numpy(BaseModel.deserialize(pt2_data["model"]).get_out_bias())
+
+        np.testing.assert_allclose(pte_bias, pt2_bias, atol=1e-10)
+
+    def test_change_bias_pte_preserves_model_def_script(self) -> None:
+        """change_bias on .pte should preserve model_def_script (training config)."""
+        from deepmd.pt_expt.entrypoints.main import (
+            freeze,
+        )
+        from deepmd.pt_expt.utils.serialization import (
+            serialize_from_file,
+        )
+
+        # Freeze the checkpoint (embeds training config as model_def_script)
+        pte_path = os.path.join(self.tmpdir, "frozen_mds.pte")
+        freeze(model=self.model_path, output=pte_path)
+
+        # Verify training config is present
+        original_data = serialize_from_file(pte_path)
+        self.assertIn("model_def_script", original_data)
+        original_mds = original_data["model_def_script"]
+        self.assertIn("type_map", original_mds)  # training config has model params
+
+        # Run change-bias with user-defined values
+        output_pte = os.path.join(self.tmpdir, "frozen_mds_updated.pte")
+        run_dp(f"dp --pt-expt change-bias {pte_path} -b 0.1 3.2 -o {output_pte}")
+
+        # Verify model_def_script is preserved in the output
+        updated_data = serialize_from_file(output_pte)
+        self.assertIn("model_def_script", updated_data)
+        self.assertEqual(updated_data["model_def_script"], original_mds)
+
+    def test_change_bias_pt2_preserves_model_def_script(self) -> None:
+        """change_bias on .pt2 should preserve model_def_script (training config)."""
+        from deepmd.pt_expt.entrypoints.main import (
+            freeze,
+        )
+        from deepmd.pt_expt.utils.serialization import (
+            serialize_from_file,
+        )
+
+        # Freeze to .pt2
+        # Clear default device: tests/pt/__init__.py sets it to "cuda:9999999"
+        # for CPU fallback, which poisons AOTInductor compilation.
+        pt2_path = os.path.join(self.tmpdir, "frozen_mds.pt2")
+        torch.set_default_device(None)
+        try:
+            freeze(model=self.model_path, output=pt2_path)
+        finally:
+            torch.set_default_device("cuda:9999999")
+
+        # Verify training config is present
+        original_data = serialize_from_file(pt2_path)
+        self.assertIn("model_def_script", original_data)
+        original_mds = original_data["model_def_script"]
+        self.assertIn("type_map", original_mds)  # training config has model params
+
+        # Run change-bias with user-defined values (same device workaround)
+        output_pt2 = os.path.join(self.tmpdir, "frozen_mds_updated.pt2")
+        torch.set_default_device(None)
+        try:
+            run_dp(f"dp --pt-expt change-bias {pt2_path} -b 0.1 3.2 -o {output_pt2}")
+        finally:
+            torch.set_default_device("cuda:9999999")
+
+        # Verify model_def_script is preserved in the output
+        updated_data = serialize_from_file(output_pt2)
+        self.assertIn("model_def_script", updated_data)
+        self.assertEqual(updated_data["model_def_script"], original_mds)
+
 
 class TestChangeBiasFittingStats(unittest.TestCase):
     """Test that model_change_out_bias recomputes fitting stats for set-by-statistic."""
