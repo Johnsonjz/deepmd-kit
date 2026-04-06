@@ -356,9 +356,7 @@ def _install_fine_frame_corr_profiler(
             latent_charge = model_ret["latent_charge"]
             need_force = self.do_grad_r("energy") or self.do_grad_c("energy")
             need_virial = self.do_grad_c("energy")
-            latent_charge_runtime = (
-                latent_charge if self.training else latent_charge.detach()
-            )
+            latent_charge_runtime = latent_charge
 
         with (
             _time_block("fc_compute_corr_bundle", detail_times, device)
