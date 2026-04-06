@@ -31,7 +31,7 @@ from deepmd.pt.model.task.lr_fitting import (
     LRFittingNet,
 )
 
-LES_DEFAULT_SIGMA = to_numpy_array(np.array(2.8 / np.sqrt(2.0)))
+LES_DEFAULT_SIGMA = to_numpy_array(1.0)
 
 
 @LRFittingNet.register("les_energy")
@@ -109,6 +109,7 @@ class LESEnergyFittingNet(LRFittingNet):
         neuron_sr: list[int] = [128, 128, 128],
         neuron_lr: list[int] = [128, 128, 128],
         bias_atom_e: torch.Tensor | None = None,
+        bias_atom_q: torch.Tensor | None = None,
         resnet_dt: bool = True,
         numb_fparam: int = 0,
         numb_aparam: int = 0,
@@ -138,6 +139,7 @@ class LESEnergyFittingNet(LRFittingNet):
             neuron_sr=neuron_sr,
             neuron_lr=neuron_lr,
             bias_atom_e=bias_atom_e,
+            bias_atom_q=bias_atom_q,
             resnet_dt=resnet_dt,
             numb_fparam=numb_fparam,
             numb_aparam=numb_aparam,
@@ -155,12 +157,13 @@ class LESEnergyFittingNet(LRFittingNet):
             default_fparam=default_fparam,
             **kwargs,
         )
-        if isinstance(sigma, (list, tuple)):
-            sigma = sigma[0] if len(sigma) > 0 else None
-        sigma_tensor = to_torch_tensor(sigma)
-        if sigma_tensor is None:
-            sigma_tensor = to_torch_tensor(LES_DEFAULT_SIGMA)
-        sigma_tensor = sigma_tensor.to(dtype=dtype, device=device).reshape(1)
+        if sigma is None:
+            sigma_tensor = torch.as_tensor(LES_DEFAULT_SIGMA)
+        else:
+            sigma_tensor = torch.as_tensor(sigma)
+        if sigma_tensor.numel() == 0:
+            sigma_tensor = torch.as_tensor(LES_DEFAULT_SIGMA)
+        sigma_tensor = sigma_tensor.to(dtype=dtype, device=device).reshape(-1)[:1]
         sigma_tensor = torch.clamp(
             sigma_tensor,
             min=torch.finfo(sigma_tensor.dtype).eps,

@@ -31,42 +31,9 @@ from deepmd.pt.model.task.lr_fitting import (
     LRFittingNet,
 )
 
-SOG_DEFAULT_AMPLITUDE = to_numpy_array(
-    np.array(
-        [
-            0.2750,
-            0.1375,
-            0.0688,
-            0.0344,
-            0.0172,
-            0.0086,
-            0.0043,
-            0.0021,
-            0.0011,
-            0.0005,
-            0.0003,
-            0.0001,
-        ]
-    )
-)
-SOG_DEFAULT_SHIFT = to_numpy_array(
-    np.array(
-        [
-            2.8,
-            5.7,
-            11.4,
-            22.7,
-            45.5,
-            91.0,
-            182.0,
-            364.0,
-            728.0,
-            1456.0,
-            2912.0,
-            5823.9,
-        ]
-    )
-)
+SOG_DEFAULT_B = to_numpy_array(np.array(1.62976708826776469))
+SOG_DEFAULT_SIGMA = to_numpy_array(np.array(2.180230445405648))
+SOG_DEFAULT_M = int(12)
 
 
 @LRFittingNet.register("sog_energy")
@@ -128,6 +95,12 @@ class SOGEnergyFittingNet(LRFittingNet):
     default_fparam: list[float], optional
         The default frame parameter. If set, when `fparam.npy` files are not included in the data system,
         this value will be used as the default value for the frame parameter in the fitting net.
+    b : float
+        Geometric base used by SOG parameterization.
+    sigma : float
+        Base bandwidth used by SOG parameterization.
+    M : int
+        Number of geometric bandwidth levels.
     n_dl : int
         NUFFT long-range grid density control factor.
     remove_self_interaction : bool
@@ -144,6 +117,7 @@ class SOGEnergyFittingNet(LRFittingNet):
         neuron_sr: list[int] = [128, 128, 128],
         neuron_lr: list[int] = [128, 128, 128],
         bias_atom_e: torch.Tensor | None = None,
+        bias_atom_q: torch.Tensor | None = None,
         resnet_dt: bool = True,
         numb_fparam: int = 0,
         numb_aparam: int = 0,
@@ -159,8 +133,11 @@ class SOGEnergyFittingNet(LRFittingNet):
         type_map: list[str] | None = None,
         use_aparam_as_mask: bool = False,
         default_fparam: list[float] | None = None,
-        shift: list[float] | torch.Tensor | None = None,
-        amplitude: list[float] | torch.Tensor | None = None,
+        amp: float | torch.Tensor | None = None,
+        bandwidth: list[float] | torch.Tensor | None = None,
+        b: float | torch.Tensor | None = None,
+        sigma: float | torch.Tensor | None = None,
+        M: int | None = None,
         n_dl: int = 1,
         remove_self_interaction: bool = False,
         **kwargs: Any,
@@ -174,6 +151,7 @@ class SOGEnergyFittingNet(LRFittingNet):
             neuron_sr=neuron_sr,
             neuron_lr=neuron_lr,
             bias_atom_e=bias_atom_e,
+            bias_atom_q=bias_atom_q,
             resnet_dt=resnet_dt,
             numb_fparam=numb_fparam,
             numb_aparam=numb_aparam,
@@ -191,37 +169,66 @@ class SOGEnergyFittingNet(LRFittingNet):
             default_fparam=default_fparam,
             **kwargs,
         )
-        if isinstance(shift, (list, tuple)):
-            shift = to_numpy_array(np.array(shift))
-        if isinstance(amplitude, (list, tuple)):
-            amplitude = to_numpy_array(np.array(amplitude))
-        shift_tensor = to_torch_tensor(shift)
-        amplitude_tensor = to_torch_tensor(amplitude)
-        if shift_tensor is None:
-            shift_tensor = to_torch_tensor(SOG_DEFAULT_SHIFT)
-        if amplitude_tensor is None:
-            amplitude_tensor = to_torch_tensor(SOG_DEFAULT_AMPLITUDE)
+        if b is None:
+            b_tensor = torch.as_tensor(SOG_DEFAULT_B, dtype=dtype, device=device)
+        else:
+            b_tensor = torch.as_tensor(b, dtype=dtype, device=device)
+        if b_tensor.numel() == 0:
+            b_tensor = torch.as_tensor(SOG_DEFAULT_B, dtype=dtype, device=device)
+        b_value = float(b_tensor.reshape(-1)[0].item())
+        if b_value <= 0.0:
+            raise ValueError("`b` should be positive.")
 
-        shift_tensor = shift_tensor.to(dtype=dtype, device=device)
-        amplitude_tensor = amplitude_tensor.to(dtype=dtype, device=device)
-        pi_tensor = torch.tensor(torch.pi, dtype=dtype, device=device)
-        sqr_pi_tensor = torch.sqrt(pi_tensor)
-        shift_safe = torch.clamp(
-            shift_tensor,
-            min=torch.finfo(shift_tensor.dtype).eps,
-        )
-        wl_tensor = amplitude_tensor * (sqr_pi_tensor**3) * (shift_safe**3)
-        sl_tensor = -torch.log(2.0 / shift_safe)
+        if sigma is None:
+            sigma_tensor = torch.as_tensor(SOG_DEFAULT_SIGMA, dtype=dtype, device=device)
+        else:
+            sigma_tensor = torch.as_tensor(sigma, dtype=dtype, device=device)
+        if sigma_tensor.numel() == 0:
+            sigma_tensor = torch.as_tensor(SOG_DEFAULT_SIGMA, dtype=dtype, device=device)
+        sigma_value = float(sigma_tensor.reshape(-1)[0].item())
+        if sigma_value <= 0.0:
+            raise ValueError("`sigma` should be positive.")
+
+        m_value = SOG_DEFAULT_M if M is None else int(M)
+        m_value = max(1, m_value)
+
+        if amp is None:
+            amp_value = float(4.0 * np.pi * np.log(b_value))
+        else:
+            amp_tensor = torch.as_tensor(amp, dtype=dtype, device=device)
+            if amp_tensor.numel() == 0:
+                raise ValueError("`amp` should not be empty.")
+            amp_value = float(amp_tensor.reshape(-1)[0].item())
+        if not np.isfinite(amp_value):
+            raise ValueError("`amp` should be finite.")
+
+        if bandwidth is None:
+            b_base = torch.tensor(b_value, dtype=dtype, device=device)
+            bandwidth_tensor = sigma_value * torch.pow(
+                b_base,
+                torch.arange(m_value, dtype=dtype, device=device),
+            )
+        else:
+            bandwidth_tensor = torch.as_tensor(bandwidth, dtype=dtype, device=device).reshape(-1)
+        if bandwidth_tensor.numel() == 0:
+            raise ValueError("`bandwidth` should not be empty.")
+        if not torch.isfinite(bandwidth_tensor).all():
+            raise ValueError("`bandwidth` should be finite.")
+        if torch.any(bandwidth_tensor <= 0.0):
+            raise ValueError("`bandwidth` values should be positive.")
 
         self.n_dl = max(1, int(n_dl))
-        self.wl = torch.nn.Parameter(
-            wl_tensor,
+        self.amp = torch.nn.Parameter(
+            torch.tensor([amp_value], dtype=dtype, device=device),
             requires_grad=bool(self.trainable),
         )
-        self.sl = torch.nn.Parameter(
-            sl_tensor,
+        self.bandwidth = torch.nn.Parameter(
+            bandwidth_tensor,
             requires_grad=bool(self.trainable),
         )
+        self.b = b_value
+        self.sigma = sigma_value
+        self.M = m_value
         self.remove_self_interaction = bool(remove_self_interaction)
         self._nufft_fallback_warned = False
 
@@ -245,52 +252,15 @@ class SOGEnergyFittingNet(LRFittingNet):
             ]
         )
 
-    @staticmethod
-    def _wl_sl_to_shift_amplitude(
-        wl_tensor: torch.Tensor,
-        sl_tensor: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        pi_tensor = torch.tensor(
-            torch.pi,
-            dtype=sl_tensor.dtype,
-            device=sl_tensor.device,
-        )
-        sqr_pi_tensor = torch.sqrt(pi_tensor)
-        shift_tensor = 2.0 * torch.exp(sl_tensor)
-        amplitude_tensor = wl_tensor / ((sqr_pi_tensor**3) * (shift_tensor**3))
-        return shift_tensor, amplitude_tensor
-
-    @staticmethod
-    def _shift_amplitude_to_wl_sl(
-        shift_tensor: torch.Tensor,
-        amplitude_tensor: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        pi_tensor = torch.tensor(
-            torch.pi,
-            dtype=shift_tensor.dtype,
-            device=shift_tensor.device,
-        )
-        sqr_pi_tensor = torch.sqrt(pi_tensor)
-        shift_safe = torch.clamp(
-            shift_tensor,
-            min=torch.finfo(shift_tensor.dtype).eps,
-        )
-        wl_tensor = amplitude_tensor * (sqr_pi_tensor**3) * (shift_safe**3)
-        sl_tensor = -torch.log(2.0 / shift_safe)
-        return wl_tensor, sl_tensor
-
     def serialize(self) -> dict:
         data = super().serialize()
         data["type"] = "sog_energy"
         variables = data["@variables"]
-        variables["wl"] = to_numpy_array(self.wl)
-        variables["sl"] = to_numpy_array(self.sl)
-        shift_tensor, amplitude_tensor = self._wl_sl_to_shift_amplitude(
-            self.wl,
-            self.sl,
-        )
-        variables["shift"] = to_numpy_array(shift_tensor)
-        variables["amplitude"] = to_numpy_array(amplitude_tensor)
+        variables["amp"] = to_numpy_array(self.amp)
+        variables["bandwidth"] = to_numpy_array(self.bandwidth)
+        data["b"] = float(self.b)
+        data["sigma"] = float(self.sigma)
+        data["M"] = int(self.M)
         data["n_dl"] = self.n_dl
         data["remove_self_interaction"] = bool(self.remove_self_interaction)
         return data
@@ -301,29 +271,31 @@ class SOGEnergyFittingNet(LRFittingNet):
 
         variables = data.get("@variables", {}).copy()
 
-        wl_tensor = to_torch_tensor(variables.pop("wl", None))
-        sl_tensor = to_torch_tensor(variables.pop("sl", None))
-        shift_tensor = to_torch_tensor(variables.pop("shift", None))
-        amplitude_tensor = to_torch_tensor(variables.pop("amplitude", None))
+        amp_tensor = to_torch_tensor(variables.pop("amp", None))
+        bandwidth_tensor = to_torch_tensor(variables.pop("bandwidth", None))
         data["@variables"] = variables
 
         obj = super().deserialize(data)
 
         with torch.no_grad():
-            if wl_tensor is not None and sl_tensor is not None:
-                obj.wl.copy_(wl_tensor.to(dtype=obj.wl.dtype, device=obj.wl.device))
-                obj.sl.copy_(sl_tensor.to(dtype=obj.sl.dtype, device=obj.sl.device))
-            elif shift_tensor is not None and amplitude_tensor is not None:
-                wl_tensor, sl_tensor = cls._shift_amplitude_to_wl_sl(
-                    shift_tensor.to(dtype=obj.wl.dtype, device=obj.wl.device),
-                    amplitude_tensor.to(dtype=obj.wl.dtype, device=obj.wl.device),
+            if amp_tensor is not None:
+                obj.amp.copy_(
+                    amp_tensor.to(dtype=obj.amp.dtype, device=obj.amp.device).reshape(-1)[:1]
                 )
-                obj.wl.copy_(wl_tensor)
-                obj.sl.copy_(sl_tensor)
+            if bandwidth_tensor is not None:
+                bw = bandwidth_tensor.to(dtype=obj.bandwidth.dtype, device=obj.bandwidth.device).reshape(-1)
+                if obj.bandwidth.shape != bw.shape:
+                    obj.bandwidth = torch.nn.Parameter(
+                        bw,
+                        requires_grad=bool(obj.trainable),
+                    )
+                else:
+                    obj.bandwidth.copy_(bw)
+                obj.M = int(obj.bandwidth.numel())
         return obj
 
     def _kernel_params(self) -> tuple[torch.Tensor, torch.Tensor]:
-        return self.wl, self.sl
+        return self.amp, self.bandwidth
 
     def forward(
         self,

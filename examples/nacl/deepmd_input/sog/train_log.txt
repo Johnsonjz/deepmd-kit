@@ -1,0 +1,168 @@
+To get the best performance, it is recommended to adjust the number of threads by setting the environment variables OMP_NUM_THREADS, DP_INTRA_OP_PARALLELISM_THREADS, and DP_INTER_OP_PARALLELISM_THREADS. See https://deepmd.rtfd.io/parallelism/ for more information.
+[2026-04-04 00:49:40,281] DEEPMD INFO    DeePMD version: 3.0.0
+[2026-04-04 00:49:40,281] DEEPMD INFO    Configuration path: input_torch_nacl_sog_split.json
+[2026-04-04 00:49:40,608] DEEPMD INFO     _____               _____   __  __  _____           _     _  _   
+[2026-04-04 00:49:40,608] DEEPMD INFO    |  __ \             |  __ \ |  \/  ||  __ \         | |   (_)| |  
+[2026-04-04 00:49:40,608] DEEPMD INFO    | |  | |  ___   ___ | |__) || \  / || |  | | ______ | | __ _ | |_ 
+[2026-04-04 00:49:40,608] DEEPMD INFO    | |  | | / _ \ / _ \|  ___/ | |\/| || |  | ||______|| |/ /| || __|
+[2026-04-04 00:49:40,608] DEEPMD INFO    | |__| ||  __/|  __/| |     | |  | || |__| |        |   < | || |_ 
+[2026-04-04 00:49:40,608] DEEPMD INFO    |_____/  \___| \___||_|     |_|  |_||_____/         |_|\_\|_| \__|
+[2026-04-04 00:49:40,608] DEEPMD INFO    Please read and cite:
+[2026-04-04 00:49:40,608] DEEPMD INFO    Wang, Zhang, Han and E, Comput.Phys.Comm. 228, 178-184 (2018)
+[2026-04-04 00:49:40,608] DEEPMD INFO    Zeng et al, J. Chem. Phys., 159, 054801 (2023)
+[2026-04-04 00:49:40,608] DEEPMD INFO    Zeng et al, J. Chem. Theory Comput., 21, 4375-4385 (2025)
+[2026-04-04 00:49:40,608] DEEPMD INFO    See https://deepmd.rtfd.io/credits/ for details.
+[2026-04-04 00:49:40,608] DEEPMD INFO    ---------------------------------------------------------------------------------------------------------------------------
+[2026-04-04 00:49:40,608] DEEPMD INFO    Installed to:         /home/zyjin/anaconda3/envs/base_env/lib/python3.13/site-packages/deepmd
+[2026-04-04 00:49:40,608] DEEPMD INFO    Source:               
+[2026-04-04 00:49:40,608] DEEPMD INFO    Source Branch:        
+[2026-04-04 00:49:40,608] DEEPMD INFO    Source Commit:        
+[2026-04-04 00:49:40,608] DEEPMD INFO    Source Commit at:     
+[2026-04-04 00:49:40,608] DEEPMD INFO    Float Precision:      Double
+[2026-04-04 00:49:40,608] DEEPMD INFO    Build Variant:        CPU
+[2026-04-04 00:49:40,608] DEEPMD INFO    Backend:              PyTorch
+[2026-04-04 00:49:40,608] DEEPMD INFO    PT Ver:               v2.10.0+cu128-g449b1768410
+[2026-04-04 00:49:40,608] DEEPMD INFO    Custom OP Enabled:    True
+[2026-04-04 00:49:40,608] DEEPMD INFO    Built with PT Ver:    2.10.0
+[2026-04-04 00:49:40,608] DEEPMD INFO    Built with PT Inc:    /home/zyjin/anaconda3/envs/base_env/lib/python3.13/site-packages/torch/include
+[2026-04-04 00:49:40,608] DEEPMD INFO                          /home/zyjin/anaconda3/envs/base_env/lib/python3.13/site-packages/torch/include/torch/csrc/api/include
+[2026-04-04 00:49:40,608] DEEPMD INFO    Built with PT Lib:    /home/zyjin/anaconda3/envs/base_env/lib/python3.13/site-packages/torch/lib
+[2026-04-04 00:49:40,608] DEEPMD INFO    Running on:           ps
+[2026-04-04 00:49:40,608] DEEPMD INFO    Computing Device:     CUDA:0
+[2026-04-04 00:49:40,608] DEEPMD INFO    Device Name:          NVIDIA GeForce RTX 5090
+[2026-04-04 00:49:40,608] DEEPMD INFO    CUDA_VISIBLE_DEVICES: unset
+[2026-04-04 00:49:40,608] DEEPMD INFO    Visible GPU Count:    8
+[2026-04-04 00:49:40,608] DEEPMD INFO    Num Intra Threads:    0
+[2026-04-04 00:49:40,608] DEEPMD INFO    Num Inter Threads:    0
+[2026-04-04 00:49:40,608] DEEPMD INFO    ---------------------------------------------------------------------------------------------------------------------------
+[2026-04-04 00:49:40,640] DEEPMD INFO    Calculate neighbor statistics... (add --skip-neighbor-stat to skip this step)
+[2026-04-04 00:49:41,639] DEEPMD INFO    Adjust batch size from 1024 to 2048
+[2026-04-04 00:49:41,661] DEEPMD INFO    Adjust batch size from 2048 to 4096
+[2026-04-04 00:49:41,665] DEEPMD INFO    Adjust batch size from 4096 to 8192
+[2026-04-04 00:49:41,667] DEEPMD INFO    Adjust batch size from 8192 to 16384
+[2026-04-04 00:49:41,670] DEEPMD INFO    Adjust batch size from 16384 to 32768
+[2026-04-04 00:49:41,686] DEEPMD INFO    Adjust batch size from 32768 to 65536
+[2026-04-04 00:49:41,687] DEEPMD INFO    Neighbor statistics: training data with minimal neighbor distance: 2.209163
+[2026-04-04 00:49:41,687] DEEPMD INFO    Neighbor statistics: training data with maximum neighbor size: [9] (cutoff radius: 6.000000)
+[2026-04-04 00:49:41,691] DEEPMD INFO    Adjust batch size from 1024 to 2048
+[2026-04-04 00:49:41,692] DEEPMD INFO    Adjust batch size from 2048 to 4096
+[2026-04-04 00:49:41,693] DEEPMD INFO    Adjust batch size from 4096 to 8192
+[2026-04-04 00:49:41,695] DEEPMD INFO    Adjust batch size from 8192 to 16384
+[2026-04-04 00:49:41,697] DEEPMD INFO    Adjust batch size from 16384 to 32768
+[2026-04-04 00:49:41,703] DEEPMD INFO    Adjust batch size from 32768 to 65536
+[2026-04-04 00:49:41,705] DEEPMD INFO    Neighbor statistics: training data with minimal neighbor distance: 2.209163
+[2026-04-04 00:49:41,705] DEEPMD INFO    Neighbor statistics: training data with maximum neighbor size: [5] (cutoff radius: 4.000000)
+[2026-04-04 00:49:41,708] DEEPMD INFO    Constructing DataLoaders from 2 systems
+[2026-04-04 00:49:41,718] DEEPMD INFO    Constructing DataLoaders from 2 systems
+[2026-04-04 00:49:41,881] DEEPMD INFO    ---Summary of DataSystem: Training     -----------------------------------------------
+[2026-04-04 00:49:41,881] DEEPMD INFO    Found 2 System(s):
+[2026-04-04 00:49:41,881] DEEPMD INFO                                        system  natoms  bch_sz   n_bch       prob  pbc
+[2026-04-04 00:49:41,881] DEEPMD INFO                ../../data/split/data_16_train      16       1    2250  5.000e-01    T
+[2026-04-04 00:49:41,881] DEEPMD INFO                ../../data/split/data_17_train      17       1    2250  5.000e-01    T
+[2026-04-04 00:49:41,881] DEEPMD INFO    --------------------------------------------------------------------------------------
+[2026-04-04 00:49:41,881] DEEPMD INFO    ---Summary of DataSystem: Validation   -----------------------------------------------
+[2026-04-04 00:49:41,881] DEEPMD INFO    Found 2 System(s):
+[2026-04-04 00:49:41,881] DEEPMD INFO                                        system  natoms  bch_sz   n_bch       prob  pbc
+[2026-04-04 00:49:41,881] DEEPMD INFO                  ../../data/split/data_16_val      16       1     250  5.000e-01    T
+[2026-04-04 00:49:41,881] DEEPMD INFO                  ../../data/split/data_17_val      17       1     250  5.000e-01    T
+[2026-04-04 00:49:41,881] DEEPMD INFO    --------------------------------------------------------------------------------------
+[2026-04-04 00:49:41,882] DEEPMD INFO    Model Params:  1.355 M   (Trainable: 1.355 M)
+[2026-04-04 00:49:41,883] DEEPMD INFO    Start to train 5 steps.
+Traceback (most recent call last):
+  File "/home/zyjin/anaconda3/envs/base_env/bin/dp", line 6, in <module>
+    sys.exit(main())
+             ~~~~^^
+  File "/home/zyjin/anaconda3/envs/base_env/lib/python3.13/site-packages/deepmd/main.py", line 1052, in main
+    deepmd_main(args)
+    ~~~~~~~~~~~^^^^^^
+  File "/home/zyjin/anaconda3/envs/base_env/lib/python3.13/site-packages/torch/distributed/elastic/multiprocessing/errors/__init__.py", line 362, in wrapper
+    return f(*args, **kwargs)
+  File "/home/zyjin/anaconda3/envs/base_env/lib/python3.13/site-packages/deepmd/pt/entrypoints/main.py", line 570, in main
+    train(
+    ~~~~~^
+        input_file=FLAGS.INPUT,
+        ^^^^^^^^^^^^^^^^^^^^^^^
+    ...<8 lines>...
+        output=FLAGS.output,
+        ^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "/home/zyjin/anaconda3/envs/base_env/lib/python3.13/site-packages/deepmd/pt/entrypoints/main.py", line 389, in train
+    trainer.run()
+    ~~~~~~~~~~~^^
+  File "/home/zyjin/anaconda3/envs/base_env/lib/python3.13/site-packages/deepmd/pt/train/training.py", line 1435, in run
+    step(step_id)
+    ~~~~^^^^^^^^^
+  File "/home/zyjin/anaconda3/envs/base_env/lib/python3.13/site-packages/deepmd/pt/train/training.py", line 1013, in step
+    model_pred, loss, more_loss = self.wrapper(
+                                  ~~~~~~~~~~~~^
+        **input_dict, cur_lr=pref_lr, label=label_dict, task_key=task_key
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "/home/zyjin/anaconda3/envs/base_env/lib/python3.13/site-packages/torch/nn/modules/module.py", line 1776, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+  File "/home/zyjin/anaconda3/envs/base_env/lib/python3.13/site-packages/torch/nn/modules/module.py", line 1787, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/home/zyjin/anaconda3/envs/base_env/lib/python3.13/site-packages/deepmd/pt/train/wrapper.py", line 198, in forward
+    model_pred, loss, more_loss = self.loss[task_key](
+                                  ~~~~~~~~~~~~~~~~~~~^
+        input_dict,
+        ^^^^^^^^^^^
+    ...<3 lines>...
+        learning_rate=cur_lr,
+        ^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "/home/zyjin/anaconda3/envs/base_env/lib/python3.13/site-packages/torch/nn/modules/module.py", line 1776, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+  File "/home/zyjin/anaconda3/envs/base_env/lib/python3.13/site-packages/torch/nn/modules/module.py", line 1787, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/home/zyjin/anaconda3/envs/base_env/lib/python3.13/site-packages/deepmd/pt/loss/ener.py", line 214, in forward
+    model_pred = model(**input_dict)
+  File "/home/zyjin/anaconda3/envs/base_env/lib/python3.13/site-packages/torch/nn/modules/module.py", line 1776, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+  File "/home/zyjin/anaconda3/envs/base_env/lib/python3.13/site-packages/torch/nn/modules/module.py", line 1787, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/home/zyjin/anaconda3/envs/base_env/lib/python3.13/site-packages/deepmd/pt/model/model/sog_model.py", line 428, in forward
+    model_predict_lower = self.forward_common_lower(
+        extended_coord,
+    ...<6 lines>...
+        comm_dict=comm_dict,
+    )
+  File "/home/zyjin/anaconda3/envs/base_env/lib/python3.13/site-packages/deepmd/pt/model/model/sog_model.py", line 392, in forward_common_lower
+    return self._apply_frame_correction_lower(
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^
+        model_ret,
+        ^^^^^^^^^^
+    ...<3 lines>...
+        do_atomic_virial,
+        ^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "/home/zyjin/anaconda3/envs/base_env/lib/python3.13/site-packages/deepmd/pt/model/model/sog_model.py", line 312, in _apply_frame_correction_lower
+    corr_bundle = self._compute_sog_frame_correction_bundle(
+        coord_local,
+    ...<3 lines>...
+        need_virial=need_virial,
+    )
+  File "/home/zyjin/anaconda3/envs/base_env/lib/python3.13/site-packages/deepmd/pt/model/model/sog_model.py", line 217, in _compute_sog_frame_correction_bundle
+    recon = pytorch_finufft.functional.finufft_type1(
+        nufft_points,
+    ...<3 lines>...
+        isign=-1,
+    )
+  File "/home/zyjin/anaconda3/envs/base_env/lib/python3.13/site-packages/pytorch_finufft/functional.py", line 497, in finufft_type1
+    res: torch.Tensor = FinufftType1.apply(points, values, output_shape, finufftkwargs)
+                        ~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/zyjin/anaconda3/envs/base_env/lib/python3.13/site-packages/torch/autograd/function.py", line 583, in apply
+    return super().apply(*args, **kwargs)  # type: ignore[misc]
+           ~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+  File "/home/zyjin/anaconda3/envs/base_env/lib/python3.13/site-packages/pytorch_finufft/functional.py", line 145, in forward
+    nufft_func = get_nufft_func(ndim, 1, points.device)
+  File "/home/zyjin/anaconda3/envs/base_env/lib/python3.13/site-packages/pytorch_finufft/functional.py", line 44, in get_nufft_func
+    raise RuntimeError("CUDA device requested but cufinufft failed to import")
+RuntimeError: CUDA device requested but cufinufft failed to import

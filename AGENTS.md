@@ -1,191 +1,62 @@
-# DeePMD-kit
+# Project Guidelines
 
-DeePMD-kit is a deep learning package for many-body potential energy representation and molecular dynamics. It supports multiple backends (TensorFlow, PyTorch, JAX, Paddle) and integrates with MD packages like LAMMPS, GROMACS, and i-PI.
+## Code Style
+- Follow the repository hooks and lint stack in `.pre-commit-config.yaml`.
+- For Python, rely on `ruff`, `ruff-format`, `isort`, and NumPy-style docstrings configured in `pyproject.toml`.
+- Keep imports backend-light at module top level. The repo bans module-level heavy backend imports (for example `torch`, `tensorflow`, `jax`, `paddle`) in many paths; see `[tool.ruff.lint.flake8-tidy-imports]` in `pyproject.toml`.
+- Respect existing license header conventions; pre-commit inserts headers automatically.
 
-**Always reference these instructions first and fallback to search or bash commands only when you encounter unexpected information that does not match the info here.**
+## Architecture
+- `deepmd/`: primary Python package, including CLI entrypoints and backend-specific implementations (`tf`, `pt`, `jax`, `pd`).
+- `backend/`: build backend helpers used by `scikit-build-core` to detect TensorFlow/PyTorch and generate CMake flags.
+- `source/`: C/C++ core libraries, operators, and interfaces (`api_c`, `api_cc`, `lmp`, `ipi`, `gmx`).
+- `source/tests/`: main test tree for Python/C++ integration and backend behavior.
+- `doc/`: Sphinx documentation and developer guides.
 
-## Working Effectively
+## Build And Test
+- Preferred local setup (matches CI setup logic):
+  - `uv venv venv && source venv/bin/activate`
+  - `uv pip install --group pin_tensorflow_cpu --group pin_pytorch_cpu --torch-backend cpu`
+  - `uv pip install -e .[cpu,test]`
+- Fast validation:
+  - `dp --version`
+  - `python -m deepmd -h`
+  - `pytest source/tests -k <pattern>`
+- Full Python test sweep used in CI:
+  - `pytest --cov=deepmd source/tests`
+- Build C++ interfaces when needed:
+  - `source/install/build_cc.sh`
+  - Enable related features through environment variables before build (for example `DP_ENABLE_PYTORCH`, `DP_ENABLE_IPI`, `DP_LAMMPS_VERSION`, `DP_VARIANT`).
+- Build docs from `doc/`:
+  - `make html`
 
-### Bootstrap and Build Repository
+## Conventions
+- This project is multi-backend. Avoid introducing unconditional backend assumptions in shared code paths.
+- Check environment-driven behavior before changing build/runtime logic:
+  - Runtime/threading/precision: `deepmd/env.py`
+  - Build flags from env vars: `backend/read_env.py`
+- For backend enablement and build options, prefer existing `DP_*` variables instead of new ad-hoc flags.
+- Keep changes scoped to the touched backend unless a cross-backend refactor is explicitly required.
 
-- Create virtual environment: `uv venv venv && source venv/bin/activate`
-- Install base dependencies: `uv pip install tensorflow-cpu` (takes ~8 seconds)
-- Install PyTorch: `uv pip install torch --index-url https://download.pytorch.org/whl/cpu` (takes ~5 seconds)
-- Build Python package: `uv pip install -e .[cpu,test]` -- takes 67 seconds. **NEVER CANCEL. Set timeout to 120+ seconds.**
-- Build C++ components: `export TENSORFLOW_ROOT=$(python -c 'import importlib.util,pathlib;print(pathlib.Path(importlib.util.find_spec("tensorflow").origin).parent)')` then `export PYTORCH_ROOT=$(python -c 'import torch;print(torch.__path__[0])')` then `./source/install/build_cc.sh` -- takes 164 seconds. **NEVER CANCEL. Set timeout to 300+ seconds.**
+## Pitfalls
+- `pip install -e .` triggers CMake via `scikit-build-core`; missing backend dependencies can look like generic build failures.
+- `DP_VARIANT` controls CPU/CUDA/ROCm build mode in the backend logic; mismatched environment leads to confusing CMake errors.
+- Tests are under `source/tests/` (not a top-level `tests/` directory), so default test discovery assumptions may miss coverage.
 
-### Test Repository
+## Reference Docs (Link, Don’t Embed)
+- Project overview and top-level structure: `README.md`
+- Contribution workflow: `CONTRIBUTING.md`
+- Build configuration and lint/test settings: `pyproject.toml`
+- Backend and environment variables: `doc/backend.md`, `doc/env.md`
+- Source build and CMake details: `doc/install/install-from-source.md`, `doc/development/cmake.md`
+- CI/testing behavior: `.github/workflows/test_python.yml`, `.github/workflows/build_cc.yml`, `doc/development/cicd.md`
 
-- Run single test: `pytest source/tests/tf/test_dp_test.py::TestDPTestEner::test_1frame -v` -- takes 8-13 seconds
-- Run test subset: `pytest source/tests/tf/test_dp_test.py -v` -- takes 15 seconds. **NEVER CANCEL. Set timeout to 60+ seconds.**
-- **Recommended: Use single test cases for validation instead of full test suite** -- full suite has 314 test files and takes 60+ minutes
-
-### Lint and Format Code
-
-- Install linter: `uv pip install ruff`
-- Run linting: `ruff check .` -- takes \<1 second
-- Format code: `ruff format .` -- takes \<1 second
-- **Always run `ruff check .` and `ruff format .` before committing changes or the CI will fail.**
-
-### Training and Validation
-
-- Test TensorFlow training: `cd examples/water/se_e2_a && dp train input.json --skip-neighbor-stat` -- training proceeds but is slow on CPU
-- Test PyTorch training: `cd examples/water/se_e2_a && dp --pt train input_torch.json --skip-neighbor-stat` -- training proceeds but is slow on CPU
-- **Training examples are for validation only. Real training takes hours/days. Timeout training tests after 60 seconds for validation.**
-
-## Validation Scenarios
-
-**ALWAYS manually validate any new code through at least one complete scenario:**
-
-### Basic Functionality Validation
-
-1. **CLI Interface**: Run `dp --version` and `dp -h` to verify installation
-1. **Python Interface**: Run `python -c "import deepmd; import deepmd.tf; print('Both interfaces work')"`
-1. **Backend Selection**: Test `dp --tf -h`, `dp --pt -h`, `dp --jax -h`, `dp --pd -h`
-
-### Training Workflow Validation
-
-1. **TensorFlow Training**: `cd examples/water/se_e2_a && timeout 60 dp train input.json --skip-neighbor-stat` -- should start training and show decreasing loss
-1. **PyTorch Training**: `cd examples/water/se_e2_a && timeout 60 dp --pt train input_torch.json --skip-neighbor-stat` -- should start training and show decreasing loss
-1. **Verify training output**: Look for "batch X: trn: rmse" messages showing decreasing error values
-
-### Test-Based Validation
-
-1. **Core Tests**: `pytest source/tests/tf/test_dp_test.py::TestDPTestEner::test_1frame -v` -- should pass in ~10 seconds
-1. **Multi-backend**: Test both TensorFlow and PyTorch components work
-
-## Common Commands and Timing
-
-### Repository Structure
-
-```
-ls -la [repo-root]
-.github/               # GitHub workflows and templates
-CONTRIBUTING.md        # Contributing guide
-README.md             # Project overview
-deepmd/               # Python package source
-doc/                  # Documentation
-examples/             # Training examples and configurations
-pyproject.toml        # Python build configuration
-source/               # C++ source code and tests
-```
-
-### Key Directories and Files
-
-- `deepmd/` - Main Python package with backend implementations
-- `source/lib/` - Core C++ library
-- `source/op/` - Backend-specific operators (TF, PyTorch, etc.)
-- `source/api_cc/` - C++ API
-- `source/api_c/` - C API
-- `source/tests/` - Test suite (314 test files)
-- `examples/water/se_e2_a/` - Basic water training example
-- `examples/` - Various model examples for different scenarios
-
-### Common CLI Commands
-
-- `dp --version` - Show version information
-- `dp -h` - Show help and available commands
-- `dp train input.json` - Train a model (TensorFlow backend)
-- `dp --pt train input.json` - Train with PyTorch backend
-- `dp --jax train input.json` - Train with JAX backend
-- `dp --pd train input.json` - Train with Paddle backend
-- `dp test -m model.pb -s system/` - Test a trained model
-- `dp freeze -o model.pb` - Freeze/save a model
-
-### Build Dependencies and Setup
-
-- **Python 3.10+** required
-- **Virtual environment** strongly recommended: `uv venv venv && source venv/bin/activate`
-- **Backend dependencies**: TensorFlow, PyTorch, JAX, or Paddle (install before building)
-- **Build tools**: CMake, C++ compiler, scikit-build-core
-- **C++ build requires**: Both TensorFlow and PyTorch installed, set TENSORFLOW_ROOT and PYTORCH_ROOT environment variables
-
-### Key Configuration Files
-
-- `pyproject.toml` - Python build configuration and dependencies
-- `source/CMakeLists.txt` - C++ build configuration
-- `examples/water/se_e2_a/input.json` - Basic TensorFlow training config
-- `examples/water/se_e2_a/input_torch.json` - Basic PyTorch training config
-
-## Frequent Patterns and Time Expectations
-
-### Installation and Build Times
-
-- **Virtual environment setup**: ~5 seconds
-- **TensorFlow CPU install**: ~8 seconds
-- **PyTorch CPU install**: ~5 seconds
-- **Python package build**: ~67 seconds. **NEVER CANCEL.**
-- **C++ components build**: ~164 seconds. **NEVER CANCEL.**
-- **Full fresh setup**: ~3-4 minutes total
-
-### Testing Times
-
-- **Single test**: 8-13 seconds
-- **Test file (~5 tests)**: ~15 seconds
-- **Backend-specific test subset**: 15-30 minutes. **Use sparingly.**
-- **Full test suite (314 files)**: 60+ minutes. **Avoid in development - use single tests instead.**
-
-### Linting and Formatting
-
-- **Ruff check**: \<1 second
-- **Ruff format**: \<1 second
-- **Pre-commit hooks**: May have network issues, use individual tools
-
-### Commit Messages and PR Titles
-
-**All commit messages and PR titles must follow [conventional commit specification](https://www.conventionalcommits.org/):**
-
-- **Format**: `type(scope): description`
-- **Common types**: `feat`, `fix`, `docs`, `style`, `refactor`, `test`, `chore`, `ci`
-- **Examples**:
-  - `feat(core): add new descriptor type`
-  - `fix(tf): resolve memory leak in training`
-  - `docs: update installation guide`
-  - `ci: add workflow for testing`
-
-### Training and Model Operations
-
-- **Training initialization**: 10-30 seconds
-- **Training per batch**: 0.1-1 second (CPU), much faster on GPU
-- **Model freezing**: 5-15 seconds
-- **Model testing**: 10-30 seconds
-
-## Backend-Specific Notes
-
-### TensorFlow Backend
-
-- **Default backend** when no flag specified
-- **Configuration**: Use `input.json` format
-- **Training**: `dp train input.json`
-- **Requirements**: `tensorflow` or `tensorflow-cpu` package
-
-### PyTorch Backend
-
-- **Activation**: Use `--pt` flag or `export DP_BACKEND=pytorch`
-- **Configuration**: Use `input_torch.json` format typically
-- **Training**: `dp --pt train input_torch.json`
-- **Requirements**: `torch` package
-
-### JAX Backend
-
-- **Activation**: Use `--jax` flag
-- **Training**: `dp --jax train input.json`
-- **Requirements**: `jax` and related packages
-- **Note**: Experimental backend, may have limitations
-
-### Paddle Backend
-
-- **Activation**: Use `--pd` flag
-- **Training**: `dp --pd train input.json`
-- **Requirements**: `paddlepaddle` package
-- **Note**: Less commonly used
-
-## Critical Warnings
-
-- **NEVER CANCEL BUILD OPERATIONS**: Python build takes 67 seconds, C++ build takes 164 seconds
-- **USE SINGLE TESTS FOR VALIDATION**: Run individual tests instead of full test suite for faster feedback
-- **ALWAYS activate virtual environment**: Build and runtime failures occur without proper environment
-- **ALWAYS install backend dependencies first**: TensorFlow/PyTorch required before building C++ components
-- **ALWAYS run linting before commits**: `ruff check . && ruff format .` or CI will fail
-- **ALWAYS test both Python and C++ components**: Some features require both to be built
-- **ALWAYS follow conventional commit format**: All commit messages and PR titles must use conventional commit specification (`type(scope): description`)
+## High-Value Paths
+- `pyproject.toml`
+- `.pre-commit-config.yaml`
+- `deepmd/env.py`
+- `backend/read_env.py`
+- `backend/dp_backend.py`
+- `source/CMakeLists.txt`
+- `source/tests/`
+- `deepmd/pt/model/model/`
