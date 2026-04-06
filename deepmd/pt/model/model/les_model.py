@@ -288,9 +288,7 @@ class LESEnergyModel(DPModelCommon, LESEnergyModel_):
         latent_charge = model_ret["latent_charge"]
         need_force = self.do_grad_r("energy") or self.do_grad_c("energy")
         need_virial = self.do_grad_c("energy")
-        latent_charge_runtime = (
-            latent_charge if self.training else latent_charge.detach()
-        )
+        latent_charge_runtime = latent_charge
         corr_bundle = self._compute_les_frame_correction_bundle(
             coord_local,
             latent_charge_runtime,
