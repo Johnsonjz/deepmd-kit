@@ -423,7 +423,7 @@ std::string read_zip_entry(const std::string& zip_path,
     }
 
     // Match exact name or suffix (handles archives with directory prefixes,
-    // e.g. "model/extra/output_keys.json" matches "extra/output_keys.json")
+    // e.g. "model/extra/metadata.json" matches "extra/metadata.json")
     bool match = (name == entry_name);
     if (!match && name.size() > entry_name.size()) {
       size_t suffix_start = name.size() - entry_name.size();
@@ -619,10 +619,7 @@ void DeepPotPTExpt::init(const std::string& model,
   }
 
   // Read metadata from the .pt2 ZIP archive
-  std::string metadata_json =
-      read_zip_entry(model, "extra/model_def_script.json");
-  std::string output_keys_json =
-      read_zip_entry(model, "extra/output_keys.json");
+  std::string metadata_json = read_zip_entry(model, "extra/metadata.json");
 
   auto metadata = parse_json(metadata_json);
   rcut = metadata["rcut"].as_double();
@@ -666,10 +663,9 @@ void DeepPotPTExpt::init(const std::string& model,
     sel.push_back(v.as_int());
   }
 
-  // Parse output keys
-  auto keys_val = parse_json(output_keys_json);
+  // Parse output keys from metadata
   output_keys.clear();
-  for (const auto& v : keys_val.as_array()) {
+  for (const auto& v : metadata["output_keys"].as_array()) {
     output_keys.push_back(v.as_string());
   }
 
@@ -726,7 +722,7 @@ void DeepPotPTExpt::extract_outputs(
     throw deepmd::deepmd_exception(
         "Model returned " + std::to_string(flat_outputs.size()) +
         " outputs but expected " + std::to_string(output_keys.size()) +
-        " (from output_keys.json)");
+        " (from metadata.json)");
   }
   for (size_t i = 0; i < output_keys.size(); ++i) {
     output_map[output_keys[i]] = flat_outputs[i];
@@ -1011,6 +1007,15 @@ void DeepPotPTExpt::compute(ENERGYVTYPE& ener,
       max_y = std::max(max_y, coord_d[ii * 3 + 1]);
       min_z = std::min(min_z, coord_d[ii * 3 + 2]);
       max_z = std::max(max_z, coord_d[ii * 3 + 2]);
+    }
+    // Shift coords so minimum is at rcut (ensures all atoms are in [0, L))
+    double shift_x = rcut - min_x;
+    double shift_y = rcut - min_y;
+    double shift_z = rcut - min_z;
+    for (int ii = 0; ii < natoms; ++ii) {
+      coord_d[ii * 3 + 0] += shift_x;
+      coord_d[ii * 3 + 1] += shift_y;
+      coord_d[ii * 3 + 2] += shift_z;
     }
     box_d.resize(9, 0.0);
     box_d[0] = (max_x - min_x) + 2.0 * rcut;
