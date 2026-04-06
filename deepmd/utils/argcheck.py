@@ -2108,8 +2108,11 @@ def fitting_sog_energy() -> list[Argument]:
         "Whether to use the aparam as a mask in input."
         "If True, the aparam will not be used in fitting net for embedding."
     )
-    doc_shift = "Shift values of the SOG long-range correction kernels."
-    doc_amplitude = "Amplitude values of the SOG long-range correction kernels."
+    doc_amp = "Trainable amplitude parameter used in SOG correction kernel."
+    doc_bandwidth = "Trainable bandwidth array used in SOG correction kernel."
+    doc_b = "SOG correction hyper-parameter b."
+    doc_sigma = "SOG correction hyper-parameter sigma."
+    doc_M = "SOG correction hyper-parameter M (positive integer)."
     doc_n_dl = "NUFFT long-range grid density control factor."
     doc_remove_self_interaction = (
         "Whether to remove self interaction term in long-range correction."
@@ -2150,6 +2153,12 @@ def fitting_sog_energy() -> list[Argument]:
             optional=True,
             default=[128, 128, 128],
             doc=doc_only_pt_supported + doc_neuron_lr,
+        ),
+        Argument(
+            "bias_atom_q",
+            list[float],
+            optional=True,
+            doc=doc_only_pt_supported + "Initial bias values for the latent charge (q) of each atomic type.",
         ),
         Argument(
             "numb_fparam",
@@ -2218,6 +2227,41 @@ def fitting_sog_energy() -> list[Argument]:
             doc=doc_only_pt_supported + doc_use_aparam_as_mask,
         ),
         Argument(
+            "amp",
+            [float, list[float], type(None)],
+            optional=True,
+            default=None,
+            doc=doc_only_pt_supported + doc_amp,
+        ),
+        Argument(
+            "bandwidth",
+            [list[float], float, type(None)],
+            optional=True,
+            default=None,
+            doc=doc_only_pt_supported + doc_bandwidth,
+        ),
+        Argument(
+            "b",
+            [float, list[float]],
+            optional=True,
+            default=1.6297670882677647,
+            doc=doc_only_pt_supported + doc_b,
+        ),
+        Argument(
+            "sigma",
+            [float, list[float]],
+            optional=True,
+            default=2.180230445405648,
+            doc=doc_only_pt_supported + doc_sigma,
+        ),
+        Argument(
+            "M",
+            int,
+            optional=True,
+            default=12,
+            doc=doc_only_pt_supported + doc_M,
+        ),
+        Argument(
             "n_dl",
             int,
             optional=True,
@@ -2230,46 +2274,6 @@ def fitting_sog_energy() -> list[Argument]:
             optional=True,
             default=False,
             doc=doc_only_pt_supported + doc_remove_self_interaction,
-        ),
-        Argument(
-            "shift",
-            list[float],
-            optional=True,
-            default=[
-                0.2750,
-                0.1375,
-                0.0688,
-                0.0344,
-                0.0172,
-                0.0086,
-                0.0043,
-                0.0021,
-                0.0011,
-                0.0005,
-                0.0003,
-                0.0001,
-            ],
-            doc=doc_only_pt_supported + doc_shift,
-        ),
-        Argument(
-            "amplitude",
-            list[float],
-            optional=True,
-            default=[
-                2.8,
-                5.7,
-                11.4,
-                22.7,
-                45.5,
-                91.0,
-                182.0,
-                364.0,
-                728.0,
-                1456.0,
-                2912.0,
-                5823.9,
-            ],
-            doc=doc_only_pt_supported + doc_amplitude,
         ),
     ]
 
@@ -2306,6 +2310,7 @@ def fitting_les_energy() -> list[Argument]:
     )
     doc_shift = "Shift values of the LES long-range correction kernels."
     doc_amplitude = "Amplitude values of the LES long-range correction kernels."
+    doc_sigma = "Gaussian width parameter for LES long-range correction kernel."
     doc_n_dl = "NUFFT long-range grid density control factor."
     doc_remove_self_interaction = (
         "Whether to remove self interaction term in long-range correction."
@@ -2346,6 +2351,12 @@ def fitting_les_energy() -> list[Argument]:
             optional=True,
             default=[128, 128, 128],
             doc=doc_only_pt_supported + doc_neuron_lr,
+        ),
+        Argument(
+            "bias_atom_q",
+            list[float],
+            optional=True,
+            doc=doc_only_pt_supported + "Initial bias values for the latent charge (q) of each atomic type.",
         ),
         Argument(
             "numb_fparam",
@@ -2419,6 +2430,13 @@ def fitting_les_energy() -> list[Argument]:
             optional=True,
             default=1,
             doc=doc_only_pt_supported + doc_n_dl,
+        ),
+        Argument(
+            "sigma",
+            [float, list[float]],
+            optional=True,
+            default=1.9798989873223332,
+            doc=doc_only_pt_supported + doc_sigma,
         ),
         Argument(
             "remove_self_interaction",

@@ -44,66 +44,6 @@ class SOGEnergyModel(DPModelCommon, SOGEnergyModel_):
         DPModelCommon.__init__(self)
         SOGEnergyModel_.__init__(self, *args, **kwargs)
         self._hessian_enabled = False
-        # Runtime-only caches for NUFFT correction path.
-        self._sog_param_cache: dict[
-            tuple[Any, ...], tuple[torch.Tensor, torch.Tensor, torch.Tensor]
-        ] = {}
-
-    @staticmethod
-    def _device_key(device: torch.device) -> str:
-        if device.index is None:
-            return device.type
-        return f"{device.type}:{device.index}"
-
-    @staticmethod
-    def _trim_cache(cache: dict[Any, Any], max_size: int = 8) -> None:
-        if len(cache) > max_size:
-            oldest_key = next(iter(cache.keys()))
-            cache.pop(oldest_key, None)
-
-    def _get_cached_sog_params(
-        self,
-        fitting: Any,
-        runtime_device: torch.device,
-        real_dtype: torch.dtype,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        wl_raw = fitting.wl
-        sl_raw = fitting.sl
-        grad_mode = torch.is_grad_enabled() and (
-            wl_raw.requires_grad or sl_raw.requires_grad
-        )
-
-        wl = (
-            wl_raw
-            if (wl_raw.device == runtime_device and wl_raw.dtype == real_dtype)
-            else wl_raw.to(dtype=real_dtype, device=runtime_device)
-        )
-        sl = (
-            sl_raw
-            if (sl_raw.device == runtime_device and sl_raw.dtype == real_dtype)
-            else sl_raw.to(dtype=real_dtype, device=runtime_device)
-        )
-        min_term = -1.0 / torch.exp(-2.0 * sl)
-
-        # Do not cache differentiable tensors across iterations.
-        if grad_mode:
-            return wl, sl, min_term
-
-        wl_version = int(getattr(fitting.wl, "_version", 0))
-        sl_version = int(getattr(fitting.sl, "_version", 0))
-        cache_key = (
-            self._device_key(runtime_device),
-            str(real_dtype),
-            wl_version,
-            sl_version,
-        )
-        cached = self._sog_param_cache.get(cache_key)
-        if cached is not None:
-            return cached
-
-        self._sog_param_cache[cache_key] = (wl, sl, min_term)
-        self._trim_cache(self._sog_param_cache)
-        return wl, sl, min_term
 
     def enable_hessian(self) -> None:
         self.__class__ = make_hessian_model(type(self))
@@ -193,15 +133,20 @@ class SOGEnergyModel(DPModelCommon, SOGEnergyModel_):
                 f"`box` should be [nf, 3, 3], got shape {tuple(box.shape)}"
             )
 
-        wl, _sl, min_term = self._get_cached_sog_params(
-            fitting,
-            runtime_device,
-            real_dtype,
-        )
         remove_self_interaction = bool(fitting.remove_self_interaction)
+        amp = torch.as_tensor(fitting.amp, dtype=real_dtype, device=runtime_device)
+        bandwidth = torch.as_tensor(
+            fitting.bandwidth,
+            dtype=real_dtype,
+            device=runtime_device,
+        )
+        if not torch.isfinite(amp):
+            raise ValueError("Invalid SOG `amp` value in fitting net.")
+        if bandwidth.ndim != 1 or bandwidth.numel() == 0:
+            raise ValueError("Invalid SOG `bandwidth` in fitting net.")
         n_dl = int(fitting.n_dl)
         pi_tensor = torch.tensor(torch.pi, dtype=real_dtype, device=runtime_device)
-        two_pi = torch.tensor(2.0 * torch.pi, dtype=real_dtype, device=runtime_device)
+        two_pi = 2.0 * pi_tensor
 
         nf, nloc, _ = coord.shape
         corr = torch.zeros((nf, 1), dtype=real_dtype, device=runtime_device)
@@ -250,12 +195,16 @@ class SOGEnergyModel(DPModelCommon, SOGEnergyModel_):
                 -nk[2], nk[2] + 1, device=runtime_device, dtype=real_dtype
             )
             kx_grid, ky_grid, kz_grid = torch.meshgrid(n1, n2, n3, indexing="ij")
-            k_sq = kx_grid**2 + ky_grid**2 + kz_grid**2
+            
+            k_grid_int = torch.stack((kx_grid, ky_grid, kz_grid), dim=0)
+            g_cart_unshifted = two_pi * torch.einsum("ik,k...->i...", cell_inv, k_grid_int)
+            k_sq = torch.sum(g_cart_unshifted**2, dim=0)
+            
             zero_mask = k_sq == 0
 
-            kfac = wl.view(1, 1, 1, -1) * torch.exp(k_sq.unsqueeze(-1) * min_term)
+            bw2 = bandwidth.square().view(1, 1, 1, -1)
+            kfac = amp * bw2 * torch.exp(-0.5 * bw2 * k_sq.unsqueeze(-1))
             kfac = kfac.sum(dim=-1)
-            kfac = kfac.to(dtype=real_dtype)
             kfac[zero_mask] = 0.0
             output_shape = tuple(int(x) for x in kx_grid.shape)
 
@@ -314,7 +263,7 @@ class SOGEnergyModel(DPModelCommon, SOGEnergyModel_):
                     ).reshape(nloc, 1, 9)
 
             if remove_self_interaction:
-                diag_sum = kfac.sum(dim=-1).sum(dim=-1).sum(dim=-1) / (2.0 * volume)
+                diag_sum = kfac.sum() / (2.0 * volume)
                 corr[ff, 0] -= torch.sum(q**2) * diag_sum
 
         out: dict[str, torch.Tensor] = {"corr_redu": corr}

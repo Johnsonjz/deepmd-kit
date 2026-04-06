@@ -1,9 +1,9 @@
 {
-  "_comment": "SOG example based on water/dpa3 layout",
+  "_comment": "NaCl SOG-corrected input based on water/sog template and split dataset",
   "model": {
     "type_map": [
-      "O",
-      "H"
+      "Na",
+      "Cl"
     ],
     "descriptor": {
       "type": "dpa3",
@@ -40,6 +40,7 @@
     "fitting_net": {
       "type": "sog_energy",
       "var_name": "energy",
+      "bias_atom_q": [0.3, -0.3],
       "dim_out_sr": 1,
       "dim_out_lr": 1,
       "neuron_sr": [
@@ -56,12 +57,12 @@
       "precision": "float32",
       "activation_function": "silut:10.0",
       "seed": 1,
-      "n_dl": 1,
-      "remove_self_interaction": true,
       "_comment": "SOG trainable LR kernel parameters: amp and bandwidth are initialized from (b, sigma, M)",
       "b": 1.6297670882677647,
-      "sigma": 2.180230445405648,
-      "M": 12
+      "sigma": 3.633717409009413,
+      "M": 12,
+      "n_dl": 3,
+      "remove_self_interaction": true
     }
   },
   "learning_rate": {
@@ -76,8 +77,8 @@
     "limit_pref_e": 20,
     "start_pref_f": 100,
     "limit_pref_f": 60,
-    "start_pref_v": 0.02,
-    "limit_pref_v": 1
+    "start_pref_v": 0.0,
+    "limit_pref_v": 0.0
   },
   "optimizer": {
     "type": "AdamW",
@@ -86,26 +87,27 @@
     "weight_decay": 0.001
   },
   "training": {
-    "stat_file": "./sog.hdf5",
+    "stat_file": "./sog_nacl.hdf5",
     "training_data": {
       "systems": [
-        "../data/data_0",
-        "../data/data_1",
-        "../data/data_2"
+        "../../data/split/data_16_train",
+        "../../data/split/data_17_train"
       ],
       "batch_size": 1
     },
     "validation_data": {
       "systems": [
-        "../data/data_3"
+        "../../data/split/data_16_val",
+        "../../data/split/data_17_val"
       ],
       "batch_size": 1
     },
-    "numb_steps": 500000,
+    "numb_steps": 5,
     "gradient_max_norm": 5.0,
     "seed": 10,
-    "disp_file": "lcurve_remove_self.out",
+    "disp_file": "../../output/lcurve_sog_6.out",
     "disp_freq": 100,
-    "save_freq": 2000
+    "save_freq": 2000,
+    "save_ckpt": "../../output/nlayers_6/sog_model.ckpt"
   }
 }

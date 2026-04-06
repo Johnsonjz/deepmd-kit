@@ -110,6 +110,7 @@ class LRFittingNet(Fitting):
         neuron_sr: list[int] = [128, 128, 128],
         neuron_lr: list[int] = [128, 128, 128],
         bias_atom_e: torch.Tensor | None = None,
+        bias_atom_q: torch.Tensor | None = None,
         resnet_dt: bool = True,
         numb_fparam: int = 0,
         numb_aparam: int = 0,
@@ -168,6 +169,17 @@ class LRFittingNet(Fitting):
         if not self.mixed_types:
             assert self.ntypes == bias_atom_e.shape[0], "Element count mismatches!"
         self.register_buffer("bias_atom_e", bias_atom_e)
+
+        if bias_atom_q is None:
+            # small random initialization to break saddle point
+            bias_atom_q = np.random.randn(self.ntypes, self.lr_net_dim_out) * 0.01
+        bias_atom_q = torch.tensor(
+            bias_atom_q, dtype=env.GLOBAL_PT_FLOAT_PRECISION, device=device
+        )
+        bias_atom_q = bias_atom_q.view([self.ntypes, self.lr_net_dim_out])
+        if not self.mixed_types:
+            assert self.ntypes == bias_atom_q.shape[0], "Element count mismatches!"
+        self.bias_atom_q = torch.nn.Parameter(bias_atom_q, requires_grad=bool(self.trainable))
 
         if self.numb_fparam > 0:
             self.register_buffer(
@@ -299,7 +311,21 @@ class LRFittingNet(Fitting):
                 device=self.bias_atom_e.device,
             )
             self.bias_atom_e = torch.cat([self.bias_atom_e, extend_bias_atom_e], dim=0)
+
+            extend_shape_q = [len(type_map), *list(self.bias_atom_q.shape[1:])]
+            extend_bias_atom_q = torch.zeros(
+                extend_shape_q,
+                dtype=self.bias_atom_q.dtype,
+                device=self.bias_atom_q.device,
+            )
+            self.bias_atom_q = torch.nn.Parameter(
+                torch.cat([self.bias_atom_q, extend_bias_atom_q], dim=0), requires_grad=bool(self.trainable)
+            )
+
         self.bias_atom_e = self.bias_atom_e[remap_index]
+        self.bias_atom_q = torch.nn.Parameter(
+            self.bias_atom_q.data[remap_index], requires_grad=bool(self.trainable)
+        )
 
     def serialize(self) -> dict:
         """Serialize the fitting to dict."""
@@ -327,6 +353,7 @@ class LRFittingNet(Fitting):
             "exclude_types": self.exclude_types,
             "@variables": {
                 "bias_atom_e": to_numpy_array(self.bias_atom_e),
+                "bias_atom_q": to_numpy_array(self.bias_atom_q),
                 "case_embd": to_numpy_array(self.case_embd),
                 "fparam_avg": to_numpy_array(self.fparam_avg),
                 "fparam_inv_std": to_numpy_array(self.fparam_inv_std),
@@ -413,6 +440,9 @@ class LRFittingNet(Fitting):
         if key in ["bias_atom_e"]:
             value = value.view([self.ntypes, self._sr_net_out_dim()])
             self.bias_atom_e = value
+        elif key in ["bias_atom_q"]:
+            value = value.view([self.ntypes, self._lr_net_out_dim()])
+            self.bias_atom_q.data.copy_(value)
         elif key in ["fparam_avg"]:
             self.fparam_avg = value
         elif key in ["fparam_inv_std"]:
@@ -433,6 +463,8 @@ class LRFittingNet(Fitting):
     def __getitem__(self, key: str) -> torch.Tensor:
         if key in ["bias_atom_e"]:
             return self.bias_atom_e
+        elif key in ["bias_atom_q"]:
+            return self.bias_atom_q
         elif key in ["fparam_avg"]:
             return self.fparam_avg
         elif key in ["fparam_inv_std"]:
@@ -552,7 +584,7 @@ class LRFittingNet(Fitting):
             xx_zeros,
             atype,
             middle_output=results,
-            bool_bias=True,
+            bias_tensor=self.bias_atom_e,
         )
         lr_out = self._apply_networks(
             self.filter_layers_lr,
@@ -562,6 +594,7 @@ class LRFittingNet(Fitting):
             xx_zeros,
             atype,
             middle_output=results,
+            bias_tensor=self.bias_atom_q,
         )
         mask = self.emask(atype).to(torch.bool)
         sr_out = torch.where(mask[:, :, None], sr_out, 0.0)
@@ -579,7 +612,7 @@ class LRFittingNet(Fitting):
         xx_zeros: torch.Tensor | None,
         atype: torch.Tensor,
         middle_output: dict[str, torch.Tensor] | None,
-        bool_bias: bool = False,
+        bias_tensor: torch.Tensor | None = None,
     ) -> torch.Tensor:
         nf, nloc, _ = xx.shape
         outs = torch.zeros((nf, nloc, dim_out), dtype=self.prec, device=xx.device)
@@ -589,6 +622,11 @@ class LRFittingNet(Fitting):
                 middle_output["middle_output"] = layers.networks[0].call_until_last(xx)
             if xx_zeros is not None:
                 atom_property -= layers.networks[0](xx_zeros)
+            
+            if bias_tensor is not None:
+                atom_bias = bias_tensor[atype.to(torch.long)].to(self.prec)
+                atom_property = atom_property + atom_bias
+                
             outs = outs + atom_property
         else:
             if self.eval_return_middle_output and middle_output is not None:
@@ -619,12 +657,10 @@ class LRFittingNet(Fitting):
                         and not self.remove_vaccum_contribution[type_i]
                     ):
                         atom_property -= ll(xx_zeros)
-                if bool_bias:
-                    atom_property = atom_property + self.bias_atom_e[type_i].to(
-                        self.prec
-                    )
-                else:
-                    atom_property = atom_property
+                
+                if bias_tensor is not None:
+                    atom_property = atom_property + bias_tensor[type_i].to(self.prec)
+                
                 atom_property = torch.where(mask, atom_property, 0.0)
                 outs = outs + atom_property
         return outs

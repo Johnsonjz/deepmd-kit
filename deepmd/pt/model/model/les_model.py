@@ -179,7 +179,11 @@ class LESEnergyModel(DPModelCommon, LESEnergyModel_):
             )
 
             kx_grid, ky_grid, kz_grid = torch.meshgrid(n1, n2, n3, indexing="ij")
-            k_sq = kx_grid**2 + ky_grid**2 + kz_grid**2
+            
+            k_grid_int = torch.stack((kx_grid, ky_grid, kz_grid), dim=0)
+            g_cart_unshifted = two_pi * torch.einsum("ik,k...->i...", cell_inv, k_grid_int)
+            k_sq = torch.sum(g_cart_unshifted**2, dim=0)
+            
             zero_mask = k_sq == 0
 
             k_sq_safe = torch.where(zero_mask, torch.ones_like(k_sq), k_sq)
