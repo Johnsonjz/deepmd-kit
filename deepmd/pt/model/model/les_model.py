@@ -181,8 +181,8 @@ class LESEnergyModel(DPModelCommon, LESEnergyModel_):
             kx_grid, ky_grid, kz_grid = torch.meshgrid(n1, n2, n3, indexing="ij")
             
             k_grid_int = torch.stack((kx_grid, ky_grid, kz_grid), dim=0)
-            g_cart_unshifted = two_pi * torch.einsum("ik,k...->i...", cell_inv, k_grid_int)
-            k_sq = torch.sum(g_cart_unshifted**2, dim=0)
+            g_cart = two_pi * torch.einsum("ik,k...->i...", cell_inv, k_grid_int)
+            k_sq = torch.sum(g_cart**2, dim=0)
             
             zero_mask = k_sq == 0
 
@@ -207,7 +207,7 @@ class LESEnergyModel(DPModelCommon, LESEnergyModel_):
             )
 
             rho_sq = recon.real.square() + recon.imag.square()
-            corr[ff, 0] = (kfac.unsqueeze(0) * rho_sq).sum() / (2.0 * volume)
+            corr[ff, 0] = (kfac.unsqueeze(0) * rho_sq).sum() * two_pi / volume
 
             conv = None
             if need_force:
@@ -215,11 +215,6 @@ class LESEnergyModel(DPModelCommon, LESEnergyModel_):
 
             if need_force:
                 assert conv is not None
-                kk1 = torch.fft.ifftshift(kx_grid, dim=0)
-                kk2 = torch.fft.ifftshift(ky_grid, dim=1)
-                kk3 = torch.fft.ifftshift(kz_grid, dim=2)
-                k_grid = torch.stack((kk1, kk2, kk3), dim=0)
-                g_cart = two_pi * torch.einsum("ik,k...->i...", cell_inv, k_grid)
                 grad_conv = (
                     1j * g_cart.unsqueeze(1).to(dtype=complex_dtype)
                 ) * conv.unsqueeze(0)
@@ -234,7 +229,7 @@ class LESEnergyModel(DPModelCommon, LESEnergyModel_):
                     .sum(dim=1)
                     .transpose(0, 1)
                 )
-                force_frame = force_frame / volume
+                force_frame = force_frame * 2 * two_pi / volume
                 force_local[ff] = force_frame
 
                 if need_virial:
@@ -245,7 +240,7 @@ class LESEnergyModel(DPModelCommon, LESEnergyModel_):
                     ).reshape(nloc, 1, 9)
 
             if remove_self_interaction:
-                diag_sum = kfac.sum(dim=-1).sum(dim=-1).sum(dim=-1) / (2.0 * volume)
+                diag_sum = kfac.sum() * two_pi / volume
                 corr[ff, 0] -= torch.sum(q**2) * diag_sum
 
         out: dict[str, torch.Tensor] = {"corr_redu": corr}
@@ -288,7 +283,9 @@ class LESEnergyModel(DPModelCommon, LESEnergyModel_):
         latent_charge = model_ret["latent_charge"]
         need_force = self.do_grad_r("energy") or self.do_grad_c("energy")
         need_virial = self.do_grad_c("energy")
-        latent_charge_runtime = latent_charge
+        
+        latent_charge_runtime = latent_charge[:, :nloc, :]
+        
         corr_bundle = self._compute_les_frame_correction_bundle(
             coord_local,
             latent_charge_runtime,
@@ -300,7 +297,7 @@ class LESEnergyModel(DPModelCommon, LESEnergyModel_):
 
         model_ret["energy_redu"] = model_ret["energy_redu"] + corr_redu.to(
             model_ret["energy_redu"].dtype
-        )
+        ).view_as(model_ret["energy_redu"])
 
         if need_force:
             corr_force_local = corr_bundle["force_local"].to(coord_local.dtype)
@@ -314,7 +311,9 @@ class LESEnergyModel(DPModelCommon, LESEnergyModel_):
             if "energy_derv_r" in model_ret:
                 model_ret["energy_derv_r"] = model_ret[
                     "energy_derv_r"
-                ] + corr_force_ext.unsqueeze(-2).to(model_ret["energy_derv_r"].dtype)
+                ] + corr_force_ext.unsqueeze(-2).to(model_ret["energy_derv_r"].dtype).view_as(
+                    model_ret["energy_derv_r"]
+                )
 
             if need_virial:
                 corr_virial_local = corr_bundle["virial_local"].to(
@@ -324,7 +323,9 @@ class LESEnergyModel(DPModelCommon, LESEnergyModel_):
                 if "energy_derv_c_redu" in model_ret:
                     model_ret["energy_derv_c_redu"] = model_ret[
                         "energy_derv_c_redu"
-                    ] + corr_virial_redu.to(model_ret["energy_derv_c_redu"].dtype)
+                    ] + corr_virial_redu.to(model_ret["energy_derv_c_redu"].dtype).view_as(
+                        model_ret["energy_derv_c_redu"]
+                    )
                 if do_atomic_virial and "energy_derv_c" in model_ret:
                     corr_atom_virial = torch.zeros(
                         (nf, nall, 1, 9),
@@ -334,7 +335,9 @@ class LESEnergyModel(DPModelCommon, LESEnergyModel_):
                     corr_atom_virial[:, :nloc, :, :] = corr_virial_local
                     model_ret["energy_derv_c"] = model_ret[
                         "energy_derv_c"
-                    ] + corr_atom_virial.to(model_ret["energy_derv_c"].dtype)
+                    ] + corr_atom_virial.to(model_ret["energy_derv_c"].dtype).view_as(
+                        model_ret["energy_derv_c"]
+                    )
 
         return model_ret
 

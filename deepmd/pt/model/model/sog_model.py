@@ -197,8 +197,8 @@ class SOGEnergyModel(DPModelCommon, SOGEnergyModel_):
             kx_grid, ky_grid, kz_grid = torch.meshgrid(n1, n2, n3, indexing="ij")
             
             k_grid_int = torch.stack((kx_grid, ky_grid, kz_grid), dim=0)
-            g_cart_unshifted = two_pi * torch.einsum("ik,k...->i...", cell_inv, k_grid_int)
-            k_sq = torch.sum(g_cart_unshifted**2, dim=0)
+            g_cart = two_pi * torch.einsum("ik,k...->i...", cell_inv, k_grid_int)
+            k_sq = torch.sum(g_cart**2, dim=0)
             
             zero_mask = k_sq == 0
 
@@ -231,13 +231,6 @@ class SOGEnergyModel(DPModelCommon, SOGEnergyModel_):
 
             if need_force:
                 assert conv is not None
-                # Reuse the already built k-grid and only reorder it to the FFT
-                # storage order required by type-2 inputs.
-                kk1 = torch.fft.ifftshift(kx_grid, dim=0)
-                kk2 = torch.fft.ifftshift(ky_grid, dim=1)
-                kk3 = torch.fft.ifftshift(kz_grid, dim=2)
-                k_grid = torch.stack((kk1, kk2, kk3), dim=0)
-                g_cart = two_pi * torch.einsum("ik,k...->i...", cell_inv, k_grid)
                 grad_conv = (
                     1j * g_cart.unsqueeze(1).to(dtype=complex_dtype)
                 ) * conv.unsqueeze(0)
@@ -306,7 +299,9 @@ class SOGEnergyModel(DPModelCommon, SOGEnergyModel_):
         latent_charge = model_ret["latent_charge"]
         need_force = self.do_grad_r("energy") or self.do_grad_c("energy")
         need_virial = self.do_grad_c("energy")
-        latent_charge_runtime = latent_charge
+        
+        latent_charge_runtime = latent_charge[:, :nloc, :]
+        
         corr_bundle = self._compute_sog_frame_correction_bundle(
             coord_local,
             latent_charge_runtime,
@@ -318,7 +313,7 @@ class SOGEnergyModel(DPModelCommon, SOGEnergyModel_):
 
         model_ret["energy_redu"] = model_ret["energy_redu"] + corr_redu.to(
             model_ret["energy_redu"].dtype
-        )
+        ).view_as(model_ret["energy_redu"])
 
         if need_force:
             corr_force_local = corr_bundle["force_local"].to(coord_local.dtype)
@@ -332,7 +327,9 @@ class SOGEnergyModel(DPModelCommon, SOGEnergyModel_):
             if "energy_derv_r" in model_ret:
                 model_ret["energy_derv_r"] = model_ret[
                     "energy_derv_r"
-                ] + corr_force_ext.unsqueeze(-2).to(model_ret["energy_derv_r"].dtype)
+                ] + corr_force_ext.unsqueeze(-2).to(model_ret["energy_derv_r"].dtype).view_as(
+                    model_ret["energy_derv_r"]
+                )
 
             if need_virial:
                 corr_virial_local = corr_bundle["virial_local"].to(
@@ -342,7 +339,9 @@ class SOGEnergyModel(DPModelCommon, SOGEnergyModel_):
                 if "energy_derv_c_redu" in model_ret:
                     model_ret["energy_derv_c_redu"] = model_ret[
                         "energy_derv_c_redu"
-                    ] + corr_virial_redu.to(model_ret["energy_derv_c_redu"].dtype)
+                    ] + corr_virial_redu.to(model_ret["energy_derv_c_redu"].dtype).view_as(
+                        model_ret["energy_derv_c_redu"]
+                    )
                 if do_atomic_virial and "energy_derv_c" in model_ret:
                     corr_atom_virial = torch.zeros(
                         (nf, nall, 1, 9),
@@ -352,7 +351,9 @@ class SOGEnergyModel(DPModelCommon, SOGEnergyModel_):
                     corr_atom_virial[:, :nloc, :, :] = corr_virial_local
                     model_ret["energy_derv_c"] = model_ret[
                         "energy_derv_c"
-                    ] + corr_atom_virial.to(model_ret["energy_derv_c"].dtype)
+                    ] + corr_atom_virial.to(model_ret["energy_derv_c"].dtype).view_as(
+                        model_ret["energy_derv_c"]
+                    )
 
         return model_ret
 
