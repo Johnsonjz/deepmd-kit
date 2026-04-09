@@ -1,0 +1,164 @@
+#include <torch/extension.h>
+#include <ATen/ATen.h>
+#include <c10/cuda/CUDAStream.h>
+#include <unordered_map>
+#include <mutex>
+#include <vector>
+#include <iostream>
+#include <cuda_runtime.h>
+#include "cufinufft_hdrs/cufinufft_dl.h"
+
+void launch_sog_modulate_kernel(
+    int nkx, int nky, int nkz,
+    int num_species,
+    const double* coeff_ptr,
+    const double* amp_ptr,
+    const double* bw_sq_ptr,
+    const double* cell_inv_ptr,
+    double* out_corr_ptr,
+    cudaStream_t stream
+);
+
+struct PlanKey {
+    int nkx, nky, nkz;
+    int type;
+
+    bool operator==(const PlanKey& other) const {
+        return nkx == other.nkx && nky == other.nky && nkz == other.nkz && type == other.type;
+    }
+};
+
+namespace std {
+    template <>
+    struct hash<PlanKey> {
+        size_t operator()(const PlanKey& k) const {
+            return (hash<int>()(k.nkx) ^ (hash<int>()(k.nky) << 1)) ^
+                   (hash<int>()(k.nkz) << 2) ^ (hash<int>()(k.type) << 3);
+        }
+    };
+}
+
+static std::unordered_map<PlanKey, cufinufft_plan> g_plan_cache;
+static std::mutex g_plan_mutex;
+
+cufinufft_plan get_or_create_plan(int nkx, int nky, int nkz, int type) {
+    PlanKey key = {nkx, nky, nkz, type};
+    std::lock_guard<std::mutex> lock(g_plan_mutex);
+    if (g_plan_cache.find(key) != g_plan_cache.end()) {
+        return g_plan_cache[key];
+    }
+    
+    auto& finufft = CuFinufftLib::getInstance();
+    cufinufft_opts opts;
+    finufft.default_optsf(type, 3, &opts);
+    
+    cufinufft_plan plan;
+    int nmodes[3] = { (2 * nkx + 1), (2 * nky + 1), (2 * nkz + 1) };
+    
+    // Type 1, 3D, 1 transform
+    int ier = finufft.makepland(type, 3, nmodes, 1, &plan, &opts);
+    if (ier != 0) {
+        throw std::runtime_error("cufinufftf_makeplan failed.");
+    }
+    
+    g_plan_cache[key] = plan;
+    return plan;
+}
+
+std::vector<at::Tensor> nufft_sog_frame_correction_bundle(
+    const at::Tensor& coord,
+    const at::Tensor& latent_charge, // complex
+    const at::Tensor& box,
+    const at::Tensor& amp,
+    const at::Tensor& bandwidth,
+    const std::vector<int64_t>& nk_cpu,
+    bool remove_self_interaction,
+    bool need_force,
+    bool need_virial
+) {
+    TORCH_CHECK(coord.is_cuda(), "coord must be a CUDA tensor");
+    TORCH_CHECK(coord.scalar_type() == at::kDouble, "coord must be float64 in this implementation temporarily");
+    
+    int nf = coord.size(0);
+    int nloc = coord.size(1);
+    
+    auto bw_sq = at::square(bandwidth);
+    int num_species = amp.size(0);
+    
+    auto corr_out = at::zeros({nf, 1}, coord.options());
+    auto force_out = need_force ? at::zeros({nf, nloc, 3}, coord.options()) : at::Tensor();
+    auto virial_out = need_virial ? at::zeros({nf, nloc, 1, 9}, coord.options()) : at::Tensor();
+
+    auto& finufft = CuFinufftLib::getInstance();
+    TORCH_CHECK(finufft.handle != nullptr, "Could not load libcufinufft.so");
+
+    auto cells_inv = at::linalg_inv(box);
+    
+    cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
+
+    for (int f = 0; f < nf; ++f) {
+        int nkx = nk_cpu[f * 3 + 0];
+        int nky = nk_cpu[f * 3 + 1];
+        int nkz = nk_cpu[f * 3 + 2];
+        
+        cufinufft_plan plan = get_or_create_plan(nkx, nky, nkz, 1);
+        
+        // 1. Prepare inputs: r_in (scaled to [-pi, pi])
+        auto r_fracs_f = at::einsum("ni,ij->nj", {coord[f], cells_inv[f]});
+        auto r_fracs_shifted = at::remainder(r_fracs_f + 0.5, 1.0) - 0.5;
+        double point_limit = M_PI - 32.0 * 1e-15; 
+        auto r_in = at::clamp(2.0 * M_PI * r_fracs_shifted, -point_limit, point_limit).contiguous();
+        
+        auto charge_f = latent_charge[f].contiguous(); // Assumed complex128
+
+        auto r_in_t = r_in.transpose(0, 1).contiguous();
+
+        // 2. Set points in cuFINUFFT
+        int ier_set = finufft.setptsd(plan, 
+            nloc, 
+            r_in_t[0].data_ptr<double>(), 
+            r_in_t[1].data_ptr<double>(), 
+            r_in_t[2].data_ptr<double>(), 
+            0, nullptr, nullptr, nullptr
+        );
+        TORCH_CHECK(ier_set == 0, "cufinufftf_setpts failed.");
+
+        // Allocate buffer for returned complex grid
+        int dim_x = 2 * nkx + 1;
+        int dim_y = 2 * nky + 1;
+        int dim_z = 2 * nkz + 1;
+        int total_grid = dim_x * dim_y * dim_z;
+        auto grid_out = at::zeros({total_grid, 2}, coord.options()); // equivalent to complex buffer
+
+        // 3. Execute Type-1 NUFFT
+        int ier_exec = finufft.executed(
+            plan, 
+            (double*)charge_f.data_ptr<c10::complex<double>>(), 
+            grid_out.data_ptr<double>()
+        );
+        TORCH_CHECK(ier_exec == 0, "cufinufftf_execute failed.");
+
+        // 4. Modulate and reduce to compute Energy (corr_redu)
+        launch_sog_modulate_kernel(
+            nkx, nky, nkz, 
+            num_species,
+            grid_out.data_ptr<double>(),
+            amp.data_ptr<double>(),
+            bw_sq.data_ptr<double>(),
+            cells_inv[f].data_ptr<double>(),
+            corr_out[f].data_ptr<double>(),
+            stream
+        );
+    }
+
+    std::vector<at::Tensor> res;
+    res.push_back(corr_out);
+    if (need_force) res.push_back(force_out);
+    if (need_virial) res.push_back(virial_out);
+    return res;
+}
+
+TORCH_LIBRARY_FRAGMENT(deepmd, m) {
+    m.def("nufft_sog_frame_correction_bundle(Tensor coord, Tensor latent_charge, Tensor box, Tensor amp, Tensor bandwidth, int[] nk_cpu, bool remove_self_interaction, bool need_force, bool need_virial) -> Tensor[]");
+    m.impl("nufft_sog_frame_correction_bundle", torch::kCUDA, &nufft_sog_frame_correction_bundle);
+}

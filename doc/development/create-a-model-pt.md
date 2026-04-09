@@ -201,6 +201,19 @@ Follow [PyTorch documentation](https://pytorch.org/tutorials/advanced/torch_scri
 
 When using your customized C++ OPs in the Python interface, use {py:meth}`torch.ops.load_library` to load the OP library in the module defined in `entry_points`.
 
+For PyTorch backend runtime safety, DeePMD-kit now supports explicit library pinning with environment variable `DEEPMD_OP_PT_LIB`.
+When this variable is set, the loader will use that exact shared-library path and fail fast if the file does not exist.
+
+To avoid silently attaching stale preloaded libraries, DeePMD-kit checks whether `torch.ops.deepmd` was already registered before loading the expected library path.
+By default this condition raises an error with diagnostic hints.
+If your workflow intentionally preloads the library (for example, external C++ linkage), you can bypass this guard by setting `DEEPMD_OP_PT_ALLOW_PRELOADED=1`.
+
+For SOG frame correction in PyTorch, the custom-op bridge now includes a force-aware backward path (`nufft_sog_frame_correction_backward_bundle`).
+When force is included in the loss, gradients for SOG kernel parameters (`amp`, `bandwidth`) are computed on the custom-op side instead of falling back to Python autograd.
+Current scope of this force-aware custom path is `need_force=True` and `need_virial=False`.
+This path targets parameter optimization and does not return coordinate/box gradients for the correction-force branch.
+If your workload needs coordinate/box derivatives from this branch, keep using the Python fallback path.
+
 When using your customized C++ OPs in the C++ library, define the environment variable {envvar}`DP_PLUGIN_PATH` to load the OP library.
 
 ## Unit tests

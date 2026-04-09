@@ -1,7 +1,9 @@
-file(GLOB OP_SRC print_summary.cc comm.cc tabulate_multi_device.cc)
+file(GLOB OP_SRC print_summary.cc comm.cc tabulate_multi_device.cc nufft_sog_op.cc sog_nufft_kernels.cu nufft_les_op.cc les_nufft_kernels.cu)
 
 add_library(deepmd_op_pt MODULE ${OP_SRC})
 # link: libdeepmd libtorch
+find_package(Python COMPONENTS Interpreter Development REQUIRED)
+target_include_directories(deepmd_op_pt PRIVATE ${Python_INCLUDE_DIRS})
 target_link_libraries(deepmd_op_pt PRIVATE ${TORCH_LIBRARIES})
 if(${OP_CXX_ABI_PT} EQUAL ${OP_CXX_ABI})
   target_link_libraries(deepmd_op_pt PRIVATE ${LIB_DEEPMD})
@@ -42,3 +44,4 @@ if(BUILD_PY_IF)
 else(BUILD_PY_IF)
   install(TARGETS deepmd_op_pt DESTINATION lib/)
 endif(BUILD_PY_IF)
+set_target_properties(deepmd_op_pt PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)

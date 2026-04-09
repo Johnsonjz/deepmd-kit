@@ -28,6 +28,9 @@ from .make_hessian_model import (
 from .make_model import (
     make_model,
 )
+from .nufft_custom_op import (
+    maybe_sog_frame_correction_bundle,
+)
 
 SOGEnergyModel_ = make_model(SOGEnergyAtomicModel)
 
@@ -140,11 +143,28 @@ class SOGEnergyModel(DPModelCommon, SOGEnergyModel_):
             dtype=real_dtype,
             device=runtime_device,
         )
-        if not torch.isfinite(amp):
-            raise ValueError("Invalid SOG `amp` value in fitting net.")
         if bandwidth.ndim != 1 or bandwidth.numel() == 0:
             raise ValueError("Invalid SOG `bandwidth` in fitting net.")
         n_dl = int(fitting.n_dl)
+        
+        norms = torch.norm(box, dim=-1)
+        nk_tensor = torch.clamp((norms / n_dl).to(torch.int32), min=1)
+        nk_cpu = nk_tensor.cpu().numpy().flatten().tolist()
+        
+        fast_out = maybe_sog_frame_correction_bundle(
+            coord,
+            latent_charge,
+            box,
+            amp,
+            bandwidth,
+            nk_cpu,
+            remove_self_interaction,
+            need_force,
+            need_virial,
+        )
+        if fast_out is not None:
+            return fast_out
+
         pi_tensor = torch.tensor(torch.pi, dtype=real_dtype, device=runtime_device)
         two_pi = 2.0 * pi_tensor
 
@@ -161,59 +181,75 @@ class SOGEnergyModel(DPModelCommon, SOGEnergyModel_):
             else None
         )
 
+        volumes = torch.det(box)
+        if torch.any(torch.abs(volumes) <= torch.finfo(real_dtype).eps):
+            raise ValueError(
+                "`box` is singular (near-zero volume), cannot run NUFFT."
+            )
+
+        cells_inv = torch.linalg.inv(box)
+        r_fracs = torch.einsum("fni,fij->fnj", coord, cells_inv)
+        r_fracs = torch.remainder(r_fracs + 0.5, 1.0) - 0.5
+        point_limit = pi_tensor - 32.0 * torch.finfo(real_dtype).eps
+        r_ins = torch.clamp(
+            2.0 * pi_tensor * r_fracs,
+            min=-point_limit,
+            max=point_limit,
+        ).contiguous()
+
+        norms = torch.norm(box, dim=-1)
+        nk_tensor = torch.clamp((norms / n_dl).to(torch.int32), min=1)
+        nk_cpu = nk_tensor.cpu().numpy()
+
+        q_ts = latent_charge.transpose(1, 2).contiguous()
+        charges = (
+            torch.complex(q_ts, torch.zeros_like(q_ts))
+            .to(dtype=complex_dtype)
+            .contiguous()
+        )
+        
+        bw2 = bandwidth.square().view(1, 1, 1, -1)
+
+        nk_tuples = [tuple(int(v) for v in nk_row) for nk_row in nk_cpu]
+        k_grid_cache: dict[tuple[int, int, int], tuple[torch.Tensor, tuple[int, int, int]]] = {}
+        for nk in sorted(set(nk_tuples)):
+            i1 = torch.arange(
+                0, 2 * nk[0] + 1, device=runtime_device, dtype=real_dtype
+            )
+            i2 = torch.arange(
+                0, 2 * nk[1] + 1, device=runtime_device, dtype=real_dtype
+            )
+            i3 = torch.arange(
+                0, 2 * nk[2] + 1, device=runtime_device, dtype=real_dtype
+            )
+            n1 = torch.where(i1 <= nk[0], i1, i1 - (2 * nk[0] + 1))
+            n2 = torch.where(i2 <= nk[1], i2, i2 - (2 * nk[1] + 1))
+            n3 = torch.where(i3 <= nk[2], i3, i3 - (2 * nk[2] + 1))
+            kx_grid, ky_grid, kz_grid = torch.meshgrid(n1, n2, n3, indexing="ij")
+            k_grid_int = torch.stack((kx_grid, ky_grid, kz_grid), dim=0)
+            output_shape = tuple(int(x) for x in k_grid_int.shape[1:])
+            k_grid_cache[nk] = (k_grid_int, output_shape)
+
         for ff in range(nf):
             r_raw = coord[ff]
-            q = latent_charge[ff]
-            box_frame = box[ff]
+            q_t = q_ts[ff]
+            charge = charges[ff]
+            volume = volumes[ff]
+            cell_inv = cells_inv[ff]
+            r_in = r_ins[ff]
 
-            volume = torch.det(box_frame)
-            if torch.abs(volume) <= torch.finfo(real_dtype).eps:
-                raise ValueError(
-                    "`box` is singular (near-zero volume), cannot run NUFFT."
-                )
-
-            cell_inv = torch.linalg.inv(box_frame)
-            r_frac = torch.matmul(r_raw, cell_inv)
-            r_frac = torch.remainder(r_frac + 0.5, 1.0) - 0.5
-            point_limit = pi_tensor - 32.0 * torch.finfo(real_dtype).eps
-            r_in = torch.clamp(
-                2.0 * pi_tensor * r_frac,
-                min=-point_limit,
-                max=point_limit,
-            ).contiguous()
             nufft_points = r_in.transpose(0, 1).contiguous()
-
-            norms = torch.norm(box_frame, dim=1)
-            nk = tuple(max(1, int(n.item() / n_dl)) for n in norms)
-            n1 = torch.arange(
-                -nk[0], nk[0] + 1, device=runtime_device, dtype=real_dtype
-            )
-            n2 = torch.arange(
-                -nk[1], nk[1] + 1, device=runtime_device, dtype=real_dtype
-            )
-            n3 = torch.arange(
-                -nk[2], nk[2] + 1, device=runtime_device, dtype=real_dtype
-            )
-            kx_grid, ky_grid, kz_grid = torch.meshgrid(n1, n2, n3, indexing="ij")
-            
-            k_grid_int = torch.stack((kx_grid, ky_grid, kz_grid), dim=0)
+            nk = nk_tuples[ff]
+            k_grid_int, output_shape = k_grid_cache[nk]
             g_cart = two_pi * torch.einsum("ik,k...->i...", cell_inv, k_grid_int)
             k_sq = torch.sum(g_cart**2, dim=0)
             
             zero_mask = k_sq == 0
 
-            bw2 = bandwidth.square().view(1, 1, 1, -1)
             kfac = amp * bw2 * torch.exp(-0.5 * bw2 * k_sq.unsqueeze(-1))
             kfac = kfac.sum(dim=-1)
             kfac[zero_mask] = 0.0
-            output_shape = tuple(int(x) for x in kx_grid.shape)
 
-            q_t = q.transpose(0, 1).contiguous()
-            charge = (
-                torch.complex(q_t, torch.zeros_like(q_t))
-                .to(dtype=complex_dtype)
-                .contiguous()
-            )
             recon = pytorch_finufft.functional.finufft_type1(
                 nufft_points,
                 charge,
@@ -257,7 +293,7 @@ class SOGEnergyModel(DPModelCommon, SOGEnergyModel_):
 
             if remove_self_interaction:
                 diag_sum = kfac.sum() / (2.0 * volume)
-                corr[ff, 0] -= torch.sum(q**2) * diag_sum
+                corr[ff, 0] -= torch.sum(q_t**2) * diag_sum
 
         out: dict[str, torch.Tensor] = {"corr_redu": corr}
         if force_local is not None:
