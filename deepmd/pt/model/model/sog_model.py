@@ -44,6 +44,51 @@ class SOGEnergyModel(DPModelCommon, SOGEnergyModel_):
         DPModelCommon.__init__(self)
         SOGEnergyModel_.__init__(self, *args, **kwargs)
         self._hessian_enabled = False
+        self._kgrid_base_cache: dict[
+            tuple[Any, ...], tuple[torch.Tensor, torch.Tensor, tuple[int, int, int]]
+        ] = {}
+
+    @staticmethod
+    def _device_key(device: torch.device) -> str:
+        if device.index is None:
+            return device.type
+        return f"{device.type}:{device.index}"
+
+    @staticmethod
+    def _trim_cache(cache: dict[Any, Any], max_size: int = 8) -> None:
+        if len(cache) > max_size:
+            oldest_key = next(iter(cache.keys()))
+            cache.pop(oldest_key, None)
+
+    def _get_cached_kgrid_base(
+        self,
+        nk: tuple[int, int, int],
+        runtime_device: torch.device,
+        real_dtype: torch.dtype,
+    ) -> tuple[torch.Tensor, torch.Tensor, tuple[int, int, int]]:
+        cache_key = (
+            self._device_key(runtime_device),
+            str(real_dtype),
+            int(nk[0]),
+            int(nk[1]),
+            int(nk[2]),
+        )
+        cached = self._kgrid_base_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        n1 = torch.arange(-nk[0], nk[0] + 1, device=runtime_device, dtype=real_dtype)
+        n2 = torch.arange(-nk[1], nk[1] + 1, device=runtime_device, dtype=real_dtype)
+        n3 = torch.arange(-nk[2], nk[2] + 1, device=runtime_device, dtype=real_dtype)
+        kx_grid, ky_grid, kz_grid = torch.meshgrid(n1, n2, n3, indexing="ij")
+        k_grid_int = torch.stack((kx_grid, ky_grid, kz_grid), dim=0)
+        zero_mask = (k_grid_int[0] == 0) & (k_grid_int[1] == 0) & (k_grid_int[2] == 0)
+        output_shape = tuple(int(x) for x in kx_grid.shape)
+
+        out = (k_grid_int, zero_mask, output_shape)
+        self._kgrid_base_cache[cache_key] = out
+        self._trim_cache(self._kgrid_base_cache)
+        return out
 
     def enable_hessian(self) -> None:
         self.__class__ = make_hessian_model(type(self))
@@ -185,28 +230,18 @@ class SOGEnergyModel(DPModelCommon, SOGEnergyModel_):
 
             norms = torch.norm(box_frame, dim=1)
             nk = tuple(max(1, int(n.item() / n_dl)) for n in norms)
-            n1 = torch.arange(
-                -nk[0], nk[0] + 1, device=runtime_device, dtype=real_dtype
+            k_grid_int, zero_mask, output_shape = self._get_cached_kgrid_base(
+                nk,
+                runtime_device,
+                real_dtype,
             )
-            n2 = torch.arange(
-                -nk[1], nk[1] + 1, device=runtime_device, dtype=real_dtype
-            )
-            n3 = torch.arange(
-                -nk[2], nk[2] + 1, device=runtime_device, dtype=real_dtype
-            )
-            kx_grid, ky_grid, kz_grid = torch.meshgrid(n1, n2, n3, indexing="ij")
-            
-            k_grid_int = torch.stack((kx_grid, ky_grid, kz_grid), dim=0)
             g_cart = two_pi * torch.einsum("ik,k...->i...", cell_inv, k_grid_int)
             k_sq = torch.sum(g_cart**2, dim=0)
-            
-            zero_mask = k_sq == 0
 
             bw2 = bandwidth.square().view(1, 1, 1, -1)
             kfac = amp * bw2 * torch.exp(-0.5 * bw2 * k_sq.unsqueeze(-1))
             kfac = kfac.sum(dim=-1)
             kfac[zero_mask] = 0.0
-            output_shape = tuple(int(x) for x in kx_grid.shape)
 
             q_t = q.transpose(0, 1).contiguous()
             charge = (

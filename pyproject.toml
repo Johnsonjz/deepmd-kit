@@ -171,8 +171,9 @@ pin_pytorch_cpu = [
 ]
 pin_pytorch_gpu = [
   "torch==2.10.0",
-  "pytorch-finufft>=0.1.0",
-  "cufinufft>=2.5.0; platform_system=='Linux' and platform_machine=='x86_64'",
+  "finufft>=2.5.0",
+  # Temporary: use fork with simple-API plan-cache fix until upstream release includes it.
+  "cufinufft @ git+https://github.com/Johnsonjz/finufft.git@feature/cufinufft-simple-plan-cache#subdirectory=python/cufinufft",
 ]
 pin_jax = [
   "jax==0.5.0;python_version>='3.10'",
