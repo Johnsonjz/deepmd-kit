@@ -54,6 +54,10 @@ dependencies = [
     'ml_dtypes',
     'mendeleev',
     'array-api-compat',
+    # Required by PT LES/SOG long-range correction path.
+    'finufft>=2.5.0',
+    'cufinufft @ git+https://github.com/Johnsonjz/finufft.git@feature/cufinufft-simple-plan-cache#subdirectory=python/cufinufft',
+    'pytorch-finufft',
 ]
 requires-python = ">=3.10"
 keywords = ["deepmd"]
