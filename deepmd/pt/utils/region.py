@@ -21,7 +21,14 @@ def phys2inter(
         the internal coordinates
 
     """
-    rec_cell, _ = torch.linalg.inv_ex(cell)
+    try:
+        rec_cell, _ = torch.linalg.inv_ex(cell)
+    except RuntimeError as err:
+        # Some CUDA/cuSOLVER combinations can fail to create a solver handle.
+        # Fall back to CPU inversion for 3x3 cell matrices and move back.
+        if "cusolver" not in str(err).lower():
+            raise
+        rec_cell = torch.linalg.inv(cell.cpu()).to(device=cell.device, dtype=cell.dtype)
     return torch.matmul(coord, rec_cell)
 
 
