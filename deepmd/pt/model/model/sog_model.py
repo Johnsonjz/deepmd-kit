@@ -206,93 +206,103 @@ class SOGEnergyModel(DPModelCommon, SOGEnergyModel_):
             else None
         )
 
-        for ff in range(nf):
-            r_raw = coord[ff]
-            q = latent_charge[ff]
-            box_frame = box[ff]
+        volume_all = torch.det(box)
+        if torch.any(torch.abs(volume_all) <= torch.finfo(real_dtype).eps):
+            raise ValueError("`box` is singular (near-zero volume), cannot run NUFFT.")
 
-            volume = torch.det(box_frame)
-            if torch.abs(volume) <= torch.finfo(real_dtype).eps:
-                raise ValueError(
-                    "`box` is singular (near-zero volume), cannot run NUFFT."
-                )
+        cell_inv_all = torch.linalg.inv(box)
+        r_frac_all = torch.matmul(coord, cell_inv_all)
+        r_frac_all = torch.remainder(r_frac_all + 0.5, 1.0) - 0.5
+        point_limit = pi_tensor - 32.0 * torch.finfo(real_dtype).eps
+        r_in_all = torch.clamp(
+            2.0 * pi_tensor * r_frac_all,
+            min=-point_limit,
+            max=point_limit,
+        ).contiguous()
+        nufft_points_all = r_in_all.transpose(1, 2).contiguous()
+        q_all = latent_charge.transpose(1, 2).contiguous()
 
-            cell_inv = torch.linalg.inv(box_frame)
-            r_frac = torch.matmul(r_raw, cell_inv)
-            r_frac = torch.remainder(r_frac + 0.5, 1.0) - 0.5
-            point_limit = pi_tensor - 32.0 * torch.finfo(real_dtype).eps
-            r_in = torch.clamp(
-                2.0 * pi_tensor * r_frac,
-                min=-point_limit,
-                max=point_limit,
-            ).contiguous()
-            nufft_points = r_in.transpose(0, 1).contiguous()
+        norms_all = torch.norm(box, dim=2)
+        nk_per_frame = [
+            tuple(max(1, int(v.item() / n_dl)) for v in norms_all[ff]) for ff in range(nf)
+        ]
+        frame_groups: dict[tuple[int, int, int], list[int]] = {}
+        for ff, nk in enumerate(nk_per_frame):
+            frame_groups.setdefault(nk, []).append(ff)
 
-            norms = torch.norm(box_frame, dim=1)
-            nk = tuple(max(1, int(n.item() / n_dl)) for n in norms)
+        bw2 = bandwidth.square().view(1, 1, 1, -1)
+        for nk, frame_ids in frame_groups.items():
             k_grid_int, zero_mask, output_shape = self._get_cached_kgrid_base(
                 nk,
                 runtime_device,
                 real_dtype,
             )
-            g_cart = two_pi * torch.einsum("ik,k...->i...", cell_inv, k_grid_int)
-            k_sq = torch.sum(g_cart**2, dim=0)
+            zero_mask_expand = zero_mask.unsqueeze(0)
 
-            bw2 = bandwidth.square().view(1, 1, 1, -1)
-            kfac = amp * bw2 * torch.exp(-0.5 * bw2 * k_sq.unsqueeze(-1))
-            kfac = kfac.sum(dim=-1)
-            kfac[zero_mask] = 0.0
+            cell_inv_group = cell_inv_all[frame_ids]
+            g_cart_group = two_pi * torch.einsum("bik,k...->bi...", cell_inv_group, k_grid_int)
+            k_sq_group = torch.sum(g_cart_group**2, dim=1)
 
-            q_t = q.transpose(0, 1).contiguous()
-            charge = (
-                torch.complex(q_t, torch.zeros_like(q_t))
-                .to(dtype=complex_dtype)
-                .contiguous()
-            )
-            recon = pytorch_finufft.functional.finufft_type1(
-                nufft_points,
-                charge,
-                output_shape=output_shape,
-                eps=1e-4,
-                isign=-1,
-            )
+            kfac_group = amp * bw2 * torch.exp(-0.5 * bw2 * k_sq_group.unsqueeze(-1))
+            kfac_group = kfac_group.sum(dim=-1).masked_fill(zero_mask_expand, 0.0)
 
-            rho_sq = recon.real.square() + recon.imag.square()
-            corr[ff, 0] = (kfac.unsqueeze(0) * rho_sq).sum() / (2.0 * volume)
+            for local_idx, ff in enumerate(frame_ids):
+                r_raw = coord[ff]
+                q_t = q_all[ff]
+                volume = volume_all[ff]
+                nufft_points = nufft_points_all[ff]
+                g_cart = g_cart_group[local_idx]
+                kfac = kfac_group[local_idx]
 
-            conv = None
-            if need_force:
-                conv = kfac.unsqueeze(0).to(dtype=complex_dtype) * recon
-
-            if need_force:
-                assert conv is not None
-                grad_conv = (
-                    1j * g_cart.unsqueeze(1).to(dtype=complex_dtype)
-                ) * conv.unsqueeze(0)
-                grad_field = pytorch_finufft.functional.finufft_type2(
+                charge = (
+                    torch.complex(q_t, torch.zeros_like(q_t))
+                    .to(dtype=complex_dtype)
+                    .contiguous()
+                )
+                recon = pytorch_finufft.functional.finufft_type1(
                     nufft_points,
-                    grad_conv,
+                    charge,
+                    output_shape=output_shape,
                     eps=1e-4,
-                    isign=1,
+                    isign=-1,
                 )
-                force_frame = (
-                    -(q_t.unsqueeze(0) * grad_field.real.to(dtype=real_dtype))
-                    .sum(dim=1)
-                    .transpose(0, 1)
-                )
-                force_frame = force_frame / volume
-                force_local[ff] = force_frame
 
-                if need_virial:
-                    virial_local[ff] = torch.einsum(
-                        "ai,aj->aij",
-                        force_frame,
-                        r_raw,
-                    ).reshape(nloc, 1, 9)
+                rho_sq = recon.real.square() + recon.imag.square()
+                corr[ff, 0] = (kfac.unsqueeze(0) * rho_sq).sum() / (2.0 * volume)
 
-            if remove_self_interaction:
-                diag_sum = kfac.sum() / (2.0 * volume)
-                corr[ff, 0] -= torch.sum(q**2) * diag_sum
+                conv = None
+                if need_force:
+                    conv = kfac.unsqueeze(0).to(dtype=complex_dtype) * recon
+
+                if need_force:
+                    assert conv is not None
+                    grad_conv = (
+                        1j * g_cart.unsqueeze(1).to(dtype=complex_dtype)
+                    ) * conv.unsqueeze(0)
+                    grad_field = pytorch_finufft.functional.finufft_type2(
+                        nufft_points,
+                        grad_conv,
+                        eps=1e-4,
+                        isign=1,
+                    )
+                    force_frame = (
+                        -(q_t.unsqueeze(0) * grad_field.real.to(dtype=real_dtype))
+                        .sum(dim=1)
+                        .transpose(0, 1)
+                    )
+                    force_frame = force_frame / volume
+                    force_local[ff] = force_frame
+
+                    if need_virial:
+                        virial_local[ff] = torch.einsum(
+                            "ai,aj->aij",
+                            force_frame,
+                            r_raw,
+                        ).reshape(nloc, 1, 9)
+
+                if remove_self_interaction:
+                    diag_sum = kfac.sum() / (2.0 * volume)
+                    corr[ff, 0] -= torch.sum(latent_charge[ff] ** 2) * diag_sum
 
         out: dict[str, torch.Tensor] = {"corr_redu": corr}
         if force_local is not None:
