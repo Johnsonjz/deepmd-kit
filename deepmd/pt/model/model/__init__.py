@@ -75,6 +75,9 @@ from .property_model import (
 from .sog_model import (
     SOGEnergyModel,
 )
+# from .sog_model_profiled import (
+#     SOGEnergyModel,
+# )
 from .spin_model import (
     SpinEnergyModel,
     SpinModel,
