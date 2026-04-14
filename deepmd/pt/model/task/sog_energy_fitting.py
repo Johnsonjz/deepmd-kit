@@ -101,7 +101,7 @@ class SOGEnergyFittingNet(LRFittingNet):
         Base bandwidth used by SOG parameterization.
     M : int
         Number of geometric bandwidth levels.
-    n_dl : int
+    n_dl : float
         NUFFT long-range grid density control factor.
     remove_self_interaction : bool
         If True, remove self interaction term in long-range correction.
@@ -138,7 +138,7 @@ class SOGEnergyFittingNet(LRFittingNet):
         b: float | torch.Tensor | None = None,
         sigma: float | torch.Tensor | None = None,
         M: int | None = None,
-        n_dl: int = 1,
+        n_dl: float | int = 1.0,
         remove_self_interaction: bool = False,
         **kwargs: Any,
     ) -> None:
@@ -217,7 +217,11 @@ class SOGEnergyFittingNet(LRFittingNet):
         if torch.any(bandwidth_tensor <= 0.0):
             raise ValueError("`bandwidth` values should be positive.")
 
-        self.n_dl = max(1, int(n_dl))
+        n_dl_value = float(n_dl)
+        if (not np.isfinite(n_dl_value)) or n_dl_value <= 0.0:
+            raise ValueError("`n_dl` should be a positive finite number.")
+
+        self.n_dl = n_dl_value
         self.amp = torch.nn.Parameter(
             torch.tensor([amp_value], dtype=dtype, device=device),
             requires_grad=bool(self.trainable),

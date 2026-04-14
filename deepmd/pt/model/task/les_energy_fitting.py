@@ -93,7 +93,7 @@ class LESEnergyFittingNet(LRFittingNet):
     default_fparam: list[float], optional
         The default frame parameter. If set, when `fparam.npy` files are not included in the data system,
         this value will be used as the default value for the frame parameter in the fitting net.
-    n_dl : int
+    n_dl : float
         NUFFT long-range grid density control factor.
     remove_self_interaction : bool
         If True, remove self interaction term in long-range correction.
@@ -126,7 +126,7 @@ class LESEnergyFittingNet(LRFittingNet):
         use_aparam_as_mask: bool = False,
         default_fparam: list[float] | None = None,
         sigma: float | list[float] | torch.Tensor | None = None,
-        n_dl: int = 1,
+        n_dl: float | int = 1.0,
         remove_self_interaction: bool = False,
         **kwargs: Any,
     ) -> None:
@@ -169,7 +169,11 @@ class LESEnergyFittingNet(LRFittingNet):
             min=torch.finfo(sigma_tensor.dtype).eps,
         )
 
-        self.n_dl = max(1, int(n_dl))
+        n_dl_value = float(n_dl)
+        if (not np.isfinite(n_dl_value)) or n_dl_value <= 0.0:
+            raise ValueError("`n_dl` should be a positive finite number.")
+
+        self.n_dl = n_dl_value
         self.sigma = torch.nn.Parameter(
             sigma_tensor,
             requires_grad=bool(self.trainable),

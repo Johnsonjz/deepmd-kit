@@ -3,6 +3,7 @@ from typing import (
     Any,
 )
 
+import math
 import pytorch_finufft
 import torch
 
@@ -28,6 +29,8 @@ from .make_hessian_model import (
 from .make_model import (
     make_model,
 )
+
+E2_PER_ANGSTROM_TO_EV = 14.3996454784255
 
 SOGEnergyModel_ = make_model(SOGEnergyAtomicModel)
 
@@ -189,9 +192,18 @@ class SOGEnergyModel(DPModelCommon, SOGEnergyModel_):
             raise ValueError("Invalid SOG `amp` value in fitting net.")
         if bandwidth.ndim != 1 or bandwidth.numel() == 0:
             raise ValueError("Invalid SOG `bandwidth` in fitting net.")
-        n_dl = int(fitting.n_dl)
+        n_dl = float(fitting.n_dl)
+        if (not math.isfinite(n_dl)) or n_dl <= 0.0:
+            raise ValueError("`n_dl` should be a positive finite number.")
         pi_tensor = torch.tensor(torch.pi, dtype=real_dtype, device=runtime_device)
         two_pi = 2.0 * pi_tensor
+        n_dl_tensor = torch.as_tensor(n_dl, dtype=real_dtype, device=runtime_device)
+        k_sq_max = (two_pi / n_dl_tensor) ** 2
+        coulomb_to_ev = torch.as_tensor(
+            E2_PER_ANGSTROM_TO_EV,
+            dtype=real_dtype,
+            device=runtime_device,
+        )
 
         nf, nloc, _ = coord.shape
         corr = torch.zeros((nf, 1), dtype=real_dtype, device=runtime_device)
@@ -242,9 +254,12 @@ class SOGEnergyModel(DPModelCommon, SOGEnergyModel_):
             cell_inv_group = cell_inv_all[frame_ids]
             g_cart_group = two_pi * torch.einsum("bik,k...->bi...", cell_inv_group, k_grid_int)
             k_sq_group = torch.sum(g_cart_group**2, dim=1)
+            k_in_cutoff = k_sq_group <= k_sq_max
 
             kfac_group = amp * bw2 * torch.exp(-0.5 * bw2 * k_sq_group.unsqueeze(-1))
-            kfac_group = kfac_group.sum(dim=-1).masked_fill(zero_mask_expand, 0.0)
+            kfac_group = kfac_group.sum(dim=-1).masked_fill(
+                zero_mask_expand | (~k_in_cutoff), 0.0
+            )
 
             for local_idx, ff in enumerate(frame_ids):
                 r_raw = coord[ff]
@@ -266,6 +281,9 @@ class SOGEnergyModel(DPModelCommon, SOGEnergyModel_):
                     eps=1e-4,
                     isign=-1,
                 )
+                # FINUFFT coefficients are returned in FFT order; align to centered
+                # mode ordering (-nk..nk) used by k_grid_int/kfac/g_cart.
+                recon = torch.fft.fftshift(recon, dim=(1, 2, 3))
 
                 rho_sq = recon.real.square() + recon.imag.square()
                 corr[ff, 0] = (kfac.unsqueeze(0) * rho_sq).sum() / (2.0 * volume)
@@ -279,6 +297,8 @@ class SOGEnergyModel(DPModelCommon, SOGEnergyModel_):
                     grad_conv = (
                         1j * g_cart.unsqueeze(1).to(dtype=complex_dtype)
                     ) * conv.unsqueeze(0)
+                    # Convert back to FINUFFT FFT order before type-2 evaluation.
+                    grad_conv = torch.fft.ifftshift(grad_conv, dim=(2, 3, 4))
                     grad_field = pytorch_finufft.functional.finufft_type2(
                         nufft_points,
                         grad_conv,
@@ -303,6 +323,13 @@ class SOGEnergyModel(DPModelCommon, SOGEnergyModel_):
                 if remove_self_interaction:
                     diag_sum = kfac.sum() / (2.0 * volume)
                     corr[ff, 0] -= torch.sum(latent_charge[ff] ** 2) * diag_sum
+
+        # Convert electrostatic unit from e^2/A to eV.
+        corr = corr * coulomb_to_ev
+        if force_local is not None:
+            force_local = force_local * coulomb_to_ev
+        if virial_local is not None:
+            virial_local = virial_local * coulomb_to_ev
 
         out: dict[str, torch.Tensor] = {"corr_redu": corr}
         if force_local is not None:

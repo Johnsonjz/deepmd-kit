@@ -2263,9 +2263,9 @@ def fitting_sog_energy() -> list[Argument]:
         ),
         Argument(
             "n_dl",
-            int,
+            [float, int],
             optional=True,
-            default=1,
+            default=1.0,
             doc=doc_only_pt_supported + doc_n_dl,
         ),
         Argument(
@@ -2426,9 +2426,9 @@ def fitting_les_energy() -> list[Argument]:
         ),
         Argument(
             "n_dl",
-            int,
+            [float, int],
             optional=True,
-            default=1,
+            default=1.0,
             doc=doc_only_pt_supported + doc_n_dl,
         ),
         Argument(
