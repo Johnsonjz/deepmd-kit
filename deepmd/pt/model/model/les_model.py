@@ -3,6 +3,7 @@ from typing import (
     Any,
 )
 
+import math
 import pytorch_finufft
 import torch
 
@@ -28,6 +29,8 @@ from .make_hessian_model import (
 from .make_model import (
     make_model,
 )
+
+E2_PER_ANGSTROM_TO_EV = 14.3996454784255
 
 LESEnergyModel_ = make_model(LESEnergyAtomicModel)
 
@@ -172,9 +175,18 @@ class LESEnergyModel(DPModelCommon, LESEnergyModel_):
         ).reshape(-1)[0]
         sigma = torch.clamp(sigma, min=torch.finfo(real_dtype).eps)
         remove_self_interaction = bool(fitting.remove_self_interaction)
-        n_dl = int(fitting.n_dl)
+        n_dl = float(fitting.n_dl)
+        if (not math.isfinite(n_dl)) or n_dl <= 0.0:
+            raise ValueError("`n_dl` should be a positive finite number.")
         pi_tensor = torch.tensor(torch.pi, dtype=real_dtype, device=runtime_device)
         two_pi = torch.tensor(2.0 * torch.pi, dtype=real_dtype, device=runtime_device)
+        n_dl_tensor = torch.as_tensor(n_dl, dtype=real_dtype, device=runtime_device)
+        k_sq_max = (two_pi / n_dl_tensor) ** 2
+        coulomb_to_ev = torch.as_tensor(
+            E2_PER_ANGSTROM_TO_EV,
+            dtype=real_dtype,
+            device=runtime_device,
+        )
 
         nf, nloc, _ = coord.shape
         corr = torch.zeros((nf, 1), dtype=real_dtype, device=runtime_device)
@@ -224,14 +236,17 @@ class LESEnergyModel(DPModelCommon, LESEnergyModel_):
             cell_inv_group = cell_inv_all[frame_ids]
             g_cart_group = two_pi * torch.einsum("bik,k...->bi...", cell_inv_group, k_grid_int)
             k_sq_group = torch.sum(g_cart_group**2, dim=1)
+            k_in_cutoff = k_sq_group <= k_sq_max
 
             k_sq_safe_group = torch.where(
-                zero_mask_expand,
+                zero_mask_expand | (~k_in_cutoff),
                 torch.ones_like(k_sq_group),
                 k_sq_group,
             )
             kfac_group = torch.exp(-0.5 * (sigma**2) * k_sq_safe_group) / k_sq_safe_group
-            kfac_group = kfac_group.to(dtype=real_dtype).masked_fill(zero_mask_expand, 0.0)
+            kfac_group = kfac_group.to(dtype=real_dtype).masked_fill(
+                zero_mask_expand | (~k_in_cutoff), 0.0
+            )
 
             for local_idx, ff in enumerate(frame_ids):
                 r_raw = coord[ff]
@@ -253,6 +268,9 @@ class LESEnergyModel(DPModelCommon, LESEnergyModel_):
                     eps=1e-4,
                     isign=-1,
                 )
+                # FINUFFT coefficients are returned in FFT order; align to centered
+                # mode ordering (-nk..nk) used by k_grid_int/kfac/g_cart.
+                recon = torch.fft.fftshift(recon, dim=(1, 2, 3))
 
                 rho_sq = recon.real.square() + recon.imag.square()
                 corr[ff, 0] = (kfac.unsqueeze(0) * rho_sq).sum() * two_pi / volume
@@ -266,6 +284,8 @@ class LESEnergyModel(DPModelCommon, LESEnergyModel_):
                     grad_conv = (
                         1j * g_cart.unsqueeze(1).to(dtype=complex_dtype)
                     ) * conv.unsqueeze(0)
+                    # Convert back to FINUFFT FFT order before type-2 evaluation.
+                    grad_conv = torch.fft.ifftshift(grad_conv, dim=(2, 3, 4))
                     grad_field = pytorch_finufft.functional.finufft_type2(
                         nufft_points,
                         grad_conv,
@@ -288,8 +308,17 @@ class LESEnergyModel(DPModelCommon, LESEnergyModel_):
                         ).reshape(nloc, 1, 9)
 
                 if remove_self_interaction:
-                    diag_sum = kfac.sum() * two_pi / volume
-                    corr[ff, 0] -= torch.sum(latent_charge[ff] ** 2) * diag_sum
+                    self_corr = torch.sum(latent_charge[ff] ** 2) / (
+                        sigma * torch.sqrt(two_pi)
+                    )
+                    corr[ff, 0] -= self_corr
+
+        # Convert electrostatic unit from e^2/A to eV.
+        corr = corr * coulomb_to_ev
+        if force_local is not None:
+            force_local = force_local * coulomb_to_ev
+        if virial_local is not None:
+            virial_local = virial_local * coulomb_to_ev
 
         out: dict[str, torch.Tensor] = {"corr_redu": corr}
         if force_local is not None:
