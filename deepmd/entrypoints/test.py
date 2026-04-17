@@ -160,7 +160,7 @@ def test(
         dp_random.seed(rand_seed % (2**32))
 
     # init model
-    dp = DeepEval(model, head=head)
+    dp = DeepEval(model, head=head, no_jit=kwargs.get("no_jit", False))
 
     for cc, system in enumerate(all_sys):
         log.info("# ---------------output of dp test--------------- ")
@@ -469,6 +469,16 @@ def test_ener(
     mae_f = mae(diff_f)
     rmse_f = rmse(diff_f)
     size_f = diff_f.size
+    nrmse_e = (
+        (rmse_e / np.sqrt(np.mean(test_data["energy"][:numb_test].reshape([-1, 1]) ** 2))) * 100
+        if find_energy == 1
+        else None
+    )
+    nrmse_f = (
+        (rmse_f / np.sqrt(np.mean(test_data["force"][:numb_test] ** 2))) * 100
+        if not out_put_spin and find_force == 1
+        else None
+    )
     if find_atom_pref == 1:
         atom_weight = test_data["atom_pref"][:numb_test]
         weight_sum = np.sum(atom_weight)
@@ -505,15 +515,19 @@ def test_ener(
         log.info(f"Energy RMSE        : {rmse_e:e} eV")
         log.info(f"Energy MAE/Natoms  : {mae_ea:e} eV")
         log.info(f"Energy RMSE/Natoms : {rmse_ea:e} eV")
+        log.info(f"Energy NRMSE       : {nrmse_e:.4f} %")
         dict_to_return["mae_e"] = (mae_e, energy.size)
         dict_to_return["mae_ea"] = (mae_ea, energy.size)
         dict_to_return["rmse_e"] = (rmse_e, energy.size)
         dict_to_return["rmse_ea"] = (rmse_ea, energy.size)
+        dict_to_return["nrmse_e"] = (nrmse_e, energy.size)
     if not out_put_spin and find_force == 1:
         log.info(f"Force  MAE         : {mae_f:e} eV/Å")
         log.info(f"Force  RMSE        : {rmse_f:e} eV/Å")
+        log.info(f"Force  NRMSE       : {nrmse_f:.4f} %")
         dict_to_return["mae_f"] = (mae_f, size_f)
         dict_to_return["rmse_f"] = (rmse_f, size_f)
+        dict_to_return["nrmse_f"] = (nrmse_f, size_f)
         if find_atom_pref == 1:
             log.info(f"Force weighted MAE : {mae_fw:e} eV/Å")
             log.info(f"Force weighted RMSE: {rmse_fw:e} eV/Å")
@@ -661,9 +675,11 @@ def print_ener_sys_avg(avg: dict[str, float]) -> None:
     log.info(f"Energy RMSE        : {avg['rmse_e']:e} eV")
     log.info(f"Energy MAE/Natoms  : {avg['mae_ea']:e} eV")
     log.info(f"Energy RMSE/Natoms : {avg['rmse_ea']:e} eV")
+    log.info(f"Energy NRMSE       : {avg['nrmse_e']:.4f} %")
     if "rmse_f" in avg:
         log.info(f"Force  MAE         : {avg['mae_f']:e} eV/Å")
         log.info(f"Force  RMSE        : {avg['rmse_f']:e} eV/Å")
+        log.info(f"Force  NRMSE       : {avg['nrmse_f']:.4f} %")
         if "rmse_fw" in avg:
             log.info(f"Force weighted MAE : {avg['mae_fw']:e} eV/Å")
             log.info(f"Force weighted RMSE: {avg['rmse_fw']:e} eV/Å")
