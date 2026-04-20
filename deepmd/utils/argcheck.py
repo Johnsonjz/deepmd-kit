@@ -2825,6 +2825,91 @@ def standard_model_args() -> Argument:
     return ca
 
 
+def _restricted_lr_vmap_fitting_variant(fitting_type: str) -> Variant:
+    doc_fitting_type = "The type of the fitting."
+    if fitting_type == "sog_energy":
+        fitting_args = [Argument("sog_energy", dict, fitting_sog_energy())]
+    elif fitting_type == "les_energy":
+        fitting_args = [Argument("les_energy", dict, fitting_les_energy())]
+    else:
+        raise RuntimeError(f"Unsupported LR vmap fitting type: {fitting_type}")
+
+    return Variant(
+        "type",
+        fitting_args,
+        optional=True,
+        default_tag=fitting_type,
+        doc=doc_fitting_type,
+    )
+
+
+def _lr_vmap_model_args(model_name: str, fitting_type: str, doc_model: str) -> Argument:
+    doc_descrpt = "The descriptor of atomic environment."
+    doc_fitting = "The fitting of physical properties."
+    doc_model_branch_alias = (
+        "List of aliases for this model branch. "
+        "Multiple aliases can be defined, and any alias can reference this branch throughout the model usage. "
+        "Used only in multi-task models."
+    )
+    doc_info = (
+        "Dictionary of metadata for this model or model branch. "
+        "Store arbitrary key-value pairs with model- or branch-specific information. "
+        "Used in both single- and multi-task models."
+    )
+
+    return Argument(
+        model_name,
+        dict,
+        [
+            Argument(
+                "descriptor", dict, [], [descrpt_variant_type_args()], doc=doc_descrpt
+            ),
+            Argument(
+                "fitting_net",
+                dict,
+                [],
+                [_restricted_lr_vmap_fitting_variant(fitting_type)],
+                doc=doc_fitting,
+            ),
+            Argument(
+                "model_branch_alias",
+                list[str],
+                optional=True,
+                default=[],
+                doc=doc_only_pt_supported + doc_model_branch_alias,
+            ),
+            Argument(
+                "info",
+                dict,
+                optional=True,
+                default={},
+                doc=doc_only_pt_supported + doc_info,
+            ),
+        ],
+        doc=doc_model,
+    )
+
+
+@model_args_plugin.register("sog_vmap")
+def sog_vmap_model_args() -> Argument:
+    return _lr_vmap_model_args(
+        "sog_vmap",
+        "sog_energy",
+        doc_only_pt_supported
+        + "SOG long-range model with grouped-vmap acceleration for large batch sizes.",
+    )
+
+
+@model_args_plugin.register("les_vmap")
+def les_vmap_model_args() -> Argument:
+    return _lr_vmap_model_args(
+        "les_vmap",
+        "les_energy",
+        doc_only_pt_supported
+        + "LES long-range model with grouped-vmap acceleration for large batch sizes.",
+    )
+
+
 @hybrid_model_args_plugin.register("pairwise_dprc")
 def pairwise_dprc() -> Argument:
     qm_model_args = model_args(exclude_hybrid=True)

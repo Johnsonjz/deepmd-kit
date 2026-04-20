@@ -57,6 +57,9 @@ from .frozen import (
 from .les_model import (
     LESEnergyModel,
 )
+from .les_vmap_model import (
+    LESVmapModel,
+)
 from .make_hessian_model import (
     make_hessian_model,
 )
@@ -74,6 +77,9 @@ from .property_model import (
 )
 from .sog_model import (
     SOGEnergyModel,
+)
+from .sog_vmap_model import (
+    SOGVmapModel,
 )
 from .spin_model import (
     SpinEnergyModel,
@@ -298,6 +304,62 @@ def get_standard_model(model_params: dict) -> BaseModel:
     return model
 
 
+def _get_lr_vmap_model(
+    model_params: dict,
+    modelcls: type[BaseModel],
+    expected_fitting_type: str,
+) -> BaseModel:
+    model_params_old = model_params
+    model_params = copy.deepcopy(model_params)
+    ntypes = len(model_params["type_map"])
+    descriptor, fitting, fitting_net_type = _get_standard_model_components(
+        model_params, ntypes
+    )
+    if fitting_net_type != expected_fitting_type:
+        raise RuntimeError(
+            f"{modelcls.__name__} requires fitting_net.type='{expected_fitting_type}', "
+            f"got '{fitting_net_type}'."
+        )
+
+    atom_exclude_types = model_params.get("atom_exclude_types", [])
+    pair_exclude_types = model_params.get("pair_exclude_types", [])
+    preset_out_bias = model_params.get("preset_out_bias")
+    preset_out_bias = _convert_preset_out_bias_to_array(
+        preset_out_bias, model_params["type_map"]
+    )
+    data_stat_protect = model_params.get("data_stat_protect", 1e-2)
+
+    model = modelcls(
+        descriptor=descriptor,
+        fitting=fitting,
+        type_map=model_params["type_map"],
+        atom_exclude_types=atom_exclude_types,
+        pair_exclude_types=pair_exclude_types,
+        preset_out_bias=preset_out_bias,
+        data_stat_protect=data_stat_protect,
+    )
+    if model_params.get("hessian_mode"):
+        model.enable_hessian()
+    model.model_def_script = json.dumps(model_params_old)
+    return model
+
+
+def get_sog_vmap_model(model_params: dict) -> BaseModel:
+    return _get_lr_vmap_model(
+        model_params,
+        modelcls=SOGVmapModel,
+        expected_fitting_type="sog_energy",
+    )
+
+
+def get_les_vmap_model(model_params: dict) -> BaseModel:
+    return _get_lr_vmap_model(
+        model_params,
+        modelcls=LESVmapModel,
+        expected_fitting_type="les_energy",
+    )
+
+
 def get_model(model_params: dict) -> Any:
     model_type = model_params.get("type", "standard")
     if model_type == "standard":
@@ -307,6 +369,10 @@ def get_model(model_params: dict) -> Any:
             return get_zbl_model(model_params)
         else:
             return get_standard_model(model_params)
+    elif model_type == "sog_vmap":
+        return get_sog_vmap_model(model_params)
+    elif model_type == "les_vmap":
+        return get_les_vmap_model(model_params)
     elif model_type == "linear_ener":
         return get_linear_model(model_params)
     else:
@@ -322,9 +388,11 @@ __all__ = [
     "EnergyModel",
     "FrozenModel",
     "LESEnergyModel",
+    "LESVmapModel",
     "LinearEnergyModel",
     "PolarModel",
     "SOGEnergyModel",
+    "SOGVmapModel",
     "SpinEnergyModel",
     "SpinModel",
     "get_model",
