@@ -16,7 +16,6 @@ from deepmd.pt.model.network.mlp import (
 )
 from deepmd.pt.model.network.network import (
     TypeEmbedNet,
-    TypeEmbedNetConsistent,
 )
 from deepmd.pt.model.task.fitting import (
     Fitting,
@@ -130,7 +129,6 @@ class LRFittingNet(Fitting):
         type_map: list[str] | None = None,
         use_aparam_as_mask: bool = False,
         default_fparam: list[float] | None = None,
-        use_type_embed_for_bias_q: bool | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__()
@@ -176,17 +174,9 @@ class LRFittingNet(Fitting):
             assert self.ntypes == bias_atom_e.shape[0], "Element count mismatches!"
         self.register_buffer("bias_atom_e", bias_atom_e)
 
-        if bias_atom_q is not None:
-            self.use_type_embed_for_bias_q = False
-        elif use_type_embed_for_bias_q is None:
-            self.use_type_embed_for_bias_q = True
-        else:
-            self.use_type_embed_for_bias_q = use_type_embed_for_bias_q
-        self.bias_atom_q_type_embed: TypeEmbedNet | None = None
-        self.bias_atom_q: torch.nn.Parameter | None = None
-        if self.use_type_embed_for_bias_q:
-            # Build per-type lr bias from a type-only embedding network.
-            self.bias_atom_q_type_embed = TypeEmbedNet(
+        if bias_atom_q is None:
+            # No external bias provided: learn per-type bias via TypeEmbedNet.
+            self.bias_atom_q: torch.nn.Parameter | TypeEmbedNet = TypeEmbedNet(
                 type_nums=self.ntypes,
                 embed_dim=self.lr_net_dim_out,
                 precision=self.precision,
@@ -195,9 +185,6 @@ class LRFittingNet(Fitting):
                 trainable=self.trainable,
             )
         else:
-            if bias_atom_q is None:
-                # small random initialization to break saddle point
-                bias_atom_q = np.random.randn(self.ntypes, self.lr_net_dim_out) * 0.01
             bias_atom_q = torch.tensor(
                 bias_atom_q, dtype=env.GLOBAL_PT_FLOAT_PRECISION, device=device
             )
@@ -340,8 +327,7 @@ class LRFittingNet(Fitting):
             )
             self.bias_atom_e = torch.cat([self.bias_atom_e, extend_bias_atom_e], dim=0)
 
-            if not self.use_type_embed_for_bias_q:
-                assert self.bias_atom_q is not None
+            if isinstance(self.bias_atom_q, torch.nn.Parameter):
                 extend_shape_q = [len(type_map), *list(self.bias_atom_q.shape[1:])]
                 extend_bias_atom_q = torch.zeros(
                     extend_shape_q,
@@ -354,15 +340,13 @@ class LRFittingNet(Fitting):
                 )
 
         self.bias_atom_e = self.bias_atom_e[remap_index]
-        if self.use_type_embed_for_bias_q:
-            assert self.bias_atom_q_type_embed is not None
-            self.bias_atom_q_type_embed.change_type_map(type_map=type_map)
-        else:
-            assert self.bias_atom_q is not None
+        if isinstance(self.bias_atom_q, torch.nn.Parameter):
             self.bias_atom_q = torch.nn.Parameter(
                 self.bias_atom_q.data[remap_index],
                 requires_grad=bool(self.trainable),
             )
+        else:
+            self.bias_atom_q.change_type_map(type_map=type_map)
 
     def serialize(self) -> dict:
         """Serialize the fitting to dict."""
@@ -388,12 +372,6 @@ class LRFittingNet(Fitting):
             "nets_lr": self.filter_layers_lr.serialize(),
             "rcond": self.rcond,
             "exclude_types": self.exclude_types,
-            "use_type_embed_for_bias_q": self.use_type_embed_for_bias_q,
-            "bias_atom_q_type_embed": (
-                self.bias_atom_q_type_embed.embedding.serialize()
-                if self.bias_atom_q_type_embed is not None
-                else None
-            ),
             "@variables": {
                 "bias_atom_e": to_numpy_array(self.bias_atom_e),
                 "bias_atom_q": to_numpy_array(self._get_bias_atom_q_table()),
@@ -421,26 +399,15 @@ class LRFittingNet(Fitting):
     @classmethod
     def deserialize(cls, data: dict) -> "LRFittingNet":
         data = data.copy()
-        use_type_embed_for_bias_q = data.get("use_type_embed_for_bias_q", False)
-        data["use_type_embed_for_bias_q"] = use_type_embed_for_bias_q
-        bias_atom_q_type_embed = data.pop("bias_atom_q_type_embed", None)
+        # Compatibility with old checkpoints.
+        data.pop("use_type_embed_for_bias_q", None)
+        data.pop("bias_atom_q_type_embed", None)
         variables = data.pop("@variables")
         nets_sr = data.pop("nets_sr")
         nets_lr = data.pop("nets_lr")
         obj = cls(**data)
-        if obj.use_type_embed_for_bias_q and bias_atom_q_type_embed is not None:
-            assert obj.bias_atom_q_type_embed is not None
-            obj.bias_atom_q_type_embed.embedding = TypeEmbedNetConsistent.deserialize(
-                bias_atom_q_type_embed
-            )
         for kk in variables.keys():
             if variables[kk] is not None:
-                if (
-                    kk == "bias_atom_q"
-                    and obj.use_type_embed_for_bias_q
-                    and bias_atom_q_type_embed is not None
-                ):
-                    continue
                 obj[kk] = to_torch_tensor(variables[kk])
         obj.filter_layers_sr = NetworkCollection.deserialize(nets_sr)
         obj.filter_layers_lr = NetworkCollection.deserialize(nets_lr)
@@ -500,15 +467,10 @@ class LRFittingNet(Fitting):
             self.bias_atom_e = value
         elif key in ["bias_atom_q"]:
             value = value.view([self.ntypes, self._lr_net_out_dim()])
-            if self.bias_atom_q is None:
-                self.use_type_embed_for_bias_q = False
-                self.bias_atom_q_type_embed = None
-                self.bias_atom_q = torch.nn.Parameter(
-                    value,
-                    requires_grad=bool(self.trainable),
-                )
-            else:
-                self.bias_atom_q.data.copy_(value)
+            self.bias_atom_q = torch.nn.Parameter(
+                value,
+                requires_grad=bool(self.trainable),
+            )
         elif key in ["fparam_avg"]:
             self.fparam_avg = value
         elif key in ["fparam_inv_std"]:
@@ -565,22 +527,20 @@ class LRFittingNet(Fitting):
         return self.bias_atom_q_bound * torch.tanh(bias / self.bias_atom_q_bound)
 
     def _get_bias_atom_q_table(self) -> torch.Tensor:
-        if self.bias_atom_q is not None:
+        if isinstance(self.bias_atom_q, torch.nn.Parameter):
             return self._compress_bias_atom_q(self.bias_atom_q)
-        assert self.bias_atom_q_type_embed is not None
         # `TypeEmbedNet` appends one zero-padding row; keep only real atom types.
-        bias_table = self.bias_atom_q_type_embed.get_full_embedding(self.bias_atom_e.device)[
+        bias_table = self.bias_atom_q.get_full_embedding(self.bias_atom_e.device)[
             : self.ntypes
         ]
         return self._compress_bias_atom_q(bias_table)
 
     def _get_lr_bias(self, atype: torch.Tensor) -> torch.Tensor:
         atype_long = atype.to(torch.long)
-        if self.bias_atom_q is not None:
+        if isinstance(self.bias_atom_q, torch.nn.Parameter):
             return self._compress_bias_atom_q(self.bias_atom_q[atype_long].to(self.prec))
-        assert self.bias_atom_q_type_embed is not None
         return self._compress_bias_atom_q(
-            self.bias_atom_q_type_embed(atype_long).to(self.prec)
+            self.bias_atom_q(atype_long).to(self.prec)
         )
 
     def _extend_f_avg_std(self, xx: torch.Tensor, nb: int) -> torch.Tensor:
