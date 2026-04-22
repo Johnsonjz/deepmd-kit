@@ -165,18 +165,6 @@ class DeepEval(DeepEvalBackend):
         # Read metadata from the .pt2 ZIP archive
         with zipfile.ZipFile(model_file, "r") as zf:
             names = zf.namelist()
-<<<<<<< HEAD
-            for required in ("extra/model_def_script.json", "extra/output_keys.json"):
-                if required not in names:
-                    raise ValueError(
-                        f"Invalid .pt2 file '{model_file}': missing '{required}'"
-                    )
-            self.metadata = json.loads(zf.read("extra/model_def_script.json"))
-            self._output_keys = json.loads(zf.read("extra/output_keys.json"))
-
-        self.rcut = self.metadata["rcut"]
-        self.type_map = self.metadata["type_map"]
-=======
             if "extra/model.json" not in names:
                 raise ValueError(
                     f"Invalid .pt2 file '{model_file}': missing 'extra/model.json'"
@@ -192,7 +180,6 @@ class DeepEval(DeepEvalBackend):
         self._init_from_model_json(model_json_str)
         self._model_def_script = json.loads(mds) if mds else {}
         self.metadata = json.loads(md) if md else {}
->>>>>>> f131d457... test(pt_expt): add .pt2 (AOTInductor) unit tests and bug fixes (#5334)
 
         # Load the AOTInductor model package (.pt2 ZIP archive).
         # Uses torch._inductor.aoti_load_package (private API, stable since PyTorch 2.6).
