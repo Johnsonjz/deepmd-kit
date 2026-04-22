@@ -16,6 +16,7 @@ from deepmd.dpmodel.model.transform_output import (
     communicate_extended_output,
 )
 from deepmd.dpmodel.output_def import (
+    FittingOutputDef,
     ModelOutputDef,
     OutputVariableCategory,
     OutputVariableDef,
@@ -56,6 +57,28 @@ from deepmd.pt.utils.auto_batch_size import (
 
 if TYPE_CHECKING:
     import ase.neighborlist
+
+
+def _reconstruct_model_output_def(metadata: dict) -> ModelOutputDef:
+    """Reconstruct ModelOutputDef from stored fitting_output_defs metadata."""
+    var_defs = []
+    for vd in metadata["fitting_output_defs"]:
+        var_defs.append(
+            OutputVariableDef(
+                name=vd["name"],
+                shape=vd["shape"],
+                reducible=vd["reducible"],
+                r_differentiable=vd["r_differentiable"],
+                c_differentiable=vd["c_differentiable"],
+                atomic=vd["atomic"],
+                category=vd["category"],
+                r_hessian=vd["r_hessian"],
+                magnetic=vd["magnetic"],
+                intensive=vd["intensive"],
+            )
+        )
+    fitting_output_def = FittingOutputDef(var_defs)
+    return ModelOutputDef(fitting_output_def)
 
 
 class DeepEval(DeepEvalBackend):
@@ -101,6 +124,9 @@ class DeepEval(DeepEvalBackend):
         else:
             self._load_pte(model_file)
 
+        # Reconstruct the model output def from stored fitting output defs
+        self._model_output_def = _reconstruct_model_output_def(self.metadata)
+
         if isinstance(auto_batch_size, bool):
             if auto_batch_size:
                 self.auto_batch_size = AutoBatchSize()
@@ -112,22 +138,6 @@ class DeepEval(DeepEvalBackend):
             self.auto_batch_size = auto_batch_size
         else:
             raise TypeError("auto_batch_size should be bool, int, or AutoBatchSize")
-
-    def _init_from_model_json(self, model_json_str: str) -> None:
-        """Deserialize model.json and derive model API from the dpmodel instance."""
-        from deepmd.pt_expt.model.model import (
-            BaseModel,
-        )
-        from deepmd.pt_expt.utils.serialization import (
-            _json_to_numpy,
-        )
-
-        model_dict = json.loads(model_json_str)
-        model_dict = _json_to_numpy(model_dict)
-        self._dpmodel = BaseModel.deserialize(model_dict["model"])
-        self.rcut = self._dpmodel.get_rcut()
-        self.type_map = self._dpmodel.get_type_map()
-        self._model_output_def = ModelOutputDef(self._dpmodel.atomic_output_def())
 
     def _load_pte(self, model_file: str) -> None:
         """Load a .pte (torch.export) model file."""
@@ -155,6 +165,18 @@ class DeepEval(DeepEvalBackend):
         # Read metadata from the .pt2 ZIP archive
         with zipfile.ZipFile(model_file, "r") as zf:
             names = zf.namelist()
+<<<<<<< HEAD
+            for required in ("extra/model_def_script.json", "extra/output_keys.json"):
+                if required not in names:
+                    raise ValueError(
+                        f"Invalid .pt2 file '{model_file}': missing '{required}'"
+                    )
+            self.metadata = json.loads(zf.read("extra/model_def_script.json"))
+            self._output_keys = json.loads(zf.read("extra/output_keys.json"))
+
+        self.rcut = self.metadata["rcut"]
+        self.type_map = self.metadata["type_map"]
+=======
             if "extra/model.json" not in names:
                 raise ValueError(
                     f"Invalid .pt2 file '{model_file}': missing 'extra/model.json'"
@@ -170,6 +192,7 @@ class DeepEval(DeepEvalBackend):
         self._init_from_model_json(model_json_str)
         self._model_def_script = json.loads(mds) if mds else {}
         self.metadata = json.loads(md) if md else {}
+>>>>>>> f131d457... test(pt_expt): add .pt2 (AOTInductor) unit tests and bug fixes (#5334)
 
         # Load the AOTInductor model package (.pt2 ZIP archive).
         # Uses torch._inductor.aoti_load_package (private API, stable since PyTorch 2.6).
@@ -190,16 +213,16 @@ class DeepEval(DeepEvalBackend):
 
     def get_dim_fparam(self) -> int:
         """Get the number (dimension) of frame parameters of this DP."""
-        return self._dpmodel.get_dim_fparam()
+        return self.metadata["dim_fparam"]
 
     def get_dim_aparam(self) -> int:
         """Get the number (dimension) of atomic parameters of this DP."""
-        return self._dpmodel.get_dim_aparam()
+        return self.metadata["dim_aparam"]
 
     @property
     def model_type(self) -> type["DeepEvalWrapper"]:
         """The the evaluator of the model type."""
-        model_output_type = self._dpmodel.model_output_type()
+        model_output_type = self.metadata["model_output_type"]
         if "energy" in model_output_type:
             return DeepPot
         elif "dos" in model_output_type:
@@ -220,7 +243,7 @@ class DeepEval(DeepEvalBackend):
         to the result of the model.
         If returning an empty list, all atom types are selected.
         """
-        return self._dpmodel.get_sel_type()
+        return self.metadata["sel_type"]
 
     def get_numb_dos(self) -> int:
         """Get the number of DOS."""
@@ -365,8 +388,8 @@ class DeepEval(DeepEvalBackend):
         nframes = coords.shape[0]
         natoms = coords.shape[1]
         rcut = self.rcut
-        sel = self._dpmodel.get_sel()
-        mixed_types = self._dpmodel.mixed_types()
+        sel = self.metadata["sel"]
+        mixed_types = self.metadata["mixed_types"]
 
         if cells is not None:
             box_input = cells.reshape(nframes, 3, 3)
@@ -477,8 +500,8 @@ class DeepEval(DeepEvalBackend):
         nlist : np.ndarray, shape (nloc, nsel)
         mapping : np.ndarray, shape (nall,)
         """
-        sel = self._dpmodel.get_sel()
-        mixed_types = self._dpmodel.mixed_types()
+        sel = self.metadata["sel"]
+        mixed_types = self.metadata["mixed_types"]
         nsel = sum(sel)
 
         natoms = positions.shape[0]
@@ -720,8 +743,8 @@ class DeepEval(DeepEvalBackend):
             raise RuntimeError("unknown category")
 
     def get_model_def_script(self) -> dict:
-        """Get model definition script (training config)."""
-        return self._model_def_script
+        """Get model definition script."""
+        return self.metadata
 
     def get_model(self) -> torch.nn.Module:
         """Get the exported model module.

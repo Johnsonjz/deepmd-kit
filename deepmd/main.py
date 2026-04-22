@@ -448,6 +448,12 @@ def main_parser() -> argparse.ArgumentParser:
         type=str,
         help="(Supported backend: PyTorch) Task head (alias: model branch) to test if in multi-task mode.",
     )
+    parser_tst.add_argument(
+        "--no-jit",
+        action="store_true",
+        default=False,
+        help="(Supported backend: PyTorch) Disable JIT compilation when loading the model.",
+    )
 
     # * eval_desc script ***************************************************************
     parser_eval_desc = subparsers.add_parser(

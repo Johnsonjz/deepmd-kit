@@ -26,7 +26,7 @@ def weighted_average(errors: list[dict[str, tuple[float, float]]]) -> dict:
     sum_siz = defaultdict(int)
     for err in errors:
         for kk, (ee, ss) in err.items():
-            if kk.startswith("mae"):
+            if kk.startswith("mae") or kk.startswith("nrmse"):
                 sum_err[kk] += ee * ss
             elif kk.startswith("rmse"):
                 sum_err[kk] += ee * ee * ss
@@ -34,7 +34,7 @@ def weighted_average(errors: list[dict[str, tuple[float, float]]]) -> dict:
                 raise RuntimeError("unknown error type")
             sum_siz[kk] += ss
     for kk in sum_err.keys():
-        if kk.startswith("mae"):
+        if kk.startswith("mae") or kk.startswith("nrmse"):
             sum_err[kk] = sum_err[kk] / sum_siz[kk]
         elif kk.startswith("rmse"):
             sum_err[kk] = np.sqrt(sum_err[kk] / sum_siz[kk])
