@@ -107,7 +107,7 @@ class SOGVmapModel(SOGEnergyModel):
             device=runtime_device,
         )
 
-        nf, nloc, _ = coord.shape
+        nf, nloc, nq = coord.shape[0], coord.shape[1], latent_charge.shape[2]
         corr = torch.zeros((nf, 1), dtype=real_dtype, device=runtime_device)
         force_local = (
             torch.zeros((nf, nloc, 3), dtype=real_dtype, device=runtime_device)
@@ -117,6 +117,11 @@ class SOGVmapModel(SOGEnergyModel):
         virial_local = (
             torch.zeros((nf, nloc, 1, 9), dtype=real_dtype, device=runtime_device)
             if need_virial
+            else None
+        )
+        dE_dq_local = (
+            torch.zeros((nf, nloc, nq), dtype=real_dtype, device=runtime_device)
+            if need_force
             else None
         )
 
@@ -219,6 +224,18 @@ class SOGVmapModel(SOGEnergyModel):
                     force_group = force_group / volume_group.view(-1, 1, 1)
                     force_local[frame_ids] = force_group
 
+                    # dE/dq for implicit force backprop
+                    dE_dq_complex_group = vmap_op(
+                        self._finufft_type2_single,
+                        in_dims=(0, 0),
+                        out_dims=0,
+                    )(
+                        nufft_points_group,
+                        conv_group,
+                    )
+                    dE_dq_group = dE_dq_complex_group.real / volume_group.view(-1, 1, 1)
+                    dE_dq_local[frame_ids] = dE_dq_group.transpose(1, 2)
+
                     if need_virial:
                         virial_local[frame_ids] = torch.einsum(
                             "bai,baj->baij",
@@ -301,10 +318,14 @@ class SOGVmapModel(SOGEnergyModel):
             force_local = force_local * coulomb_to_ev
         if virial_local is not None:
             virial_local = virial_local * coulomb_to_ev
+        if dE_dq_local is not None:
+            dE_dq_local = dE_dq_local * coulomb_to_ev
 
         out: dict[str, torch.Tensor] = {"corr_redu": corr}
         if force_local is not None:
             out["force_local"] = force_local
         if virial_local is not None:
             out["virial_local"] = virial_local
+        if dE_dq_local is not None:
+            out["dE_dq"] = dE_dq_local
         return out
