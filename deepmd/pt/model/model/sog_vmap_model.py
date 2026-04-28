@@ -52,9 +52,6 @@ class SOGVmapModel(SOGEnergyModel):
         coord: torch.Tensor,
         latent_charge: torch.Tensor,
         box: torch.Tensor,
-        *,
-        need_force: bool,
-        need_virial: bool,
     ) -> dict[str, torch.Tensor]:
         if coord.dim() != 3:
             raise ValueError(
@@ -109,16 +106,6 @@ class SOGVmapModel(SOGEnergyModel):
 
         nf, nloc, _ = coord.shape
         corr = torch.zeros((nf, 1), dtype=real_dtype, device=runtime_device)
-        force_local = (
-            torch.zeros((nf, nloc, 3), dtype=real_dtype, device=runtime_device)
-            if need_force
-            else None
-        )
-        virial_local = (
-            torch.zeros((nf, nloc, 1, 9), dtype=real_dtype, device=runtime_device)
-            if need_virial
-            else None
-        )
 
         volume_all = torch.det(box)
         if torch.any(torch.abs(volume_all) <= torch.finfo(real_dtype).eps):
@@ -194,38 +181,6 @@ class SOGVmapModel(SOGEnergyModel):
                 )
                 corr[frame_ids, 0] = corr_group
 
-                if need_force:
-                    conv_group = kfac_group.unsqueeze(1).to(dtype=complex_dtype) * recon_group
-                    grad_conv_group = (
-                        1j * g_cart_group.unsqueeze(2).to(dtype=complex_dtype)
-                    ) * conv_group.unsqueeze(1)
-                    # Convert back to FINUFFT FFT order before type-2 evaluation.
-                    grad_conv_group = torch.fft.ifftshift(grad_conv_group, dim=(3, 4, 5))
-
-                    grad_field_group = vmap_op(
-                        self._finufft_type2_single,
-                        in_dims=(0, 0),
-                        out_dims=0,
-                    )(
-                        nufft_points_group,
-                        grad_conv_group,
-                    )
-
-                    force_group = (
-                        -(q_t_group.unsqueeze(1) * grad_field_group.real.to(dtype=real_dtype))
-                        .sum(dim=2)
-                        .transpose(1, 2)
-                    )
-                    force_group = force_group / volume_group.view(-1, 1, 1)
-                    force_local[frame_ids] = force_group
-
-                    if need_virial:
-                        virial_local[frame_ids] = torch.einsum(
-                            "bai,baj->baij",
-                            force_group,
-                            coord_group,
-                        ).reshape(len(frame_ids), nloc, 1, 9)
-
                 if remove_self_interaction:
                     diag_sum_group = kfac_group.sum(dim=(1, 2, 3)) / (2.0 * volume_group)
                     corr[frame_ids, 0] -= (
@@ -259,52 +214,11 @@ class SOGVmapModel(SOGEnergyModel):
                     rho_sq = recon.real.square() + recon.imag.square()
                     corr[ff, 0] = (kfac.unsqueeze(0) * rho_sq).sum() / (2.0 * volume)
 
-                    conv = None
-                    if need_force:
-                        conv = kfac.unsqueeze(0).to(dtype=complex_dtype) * recon
-
-                    if need_force:
-                        assert conv is not None
-                        grad_conv = (
-                            1j * g_cart.unsqueeze(1).to(dtype=complex_dtype)
-                        ) * conv.unsqueeze(0)
-                        # Convert back to FINUFFT FFT order before type-2 evaluation.
-                        grad_conv = torch.fft.ifftshift(grad_conv, dim=(2, 3, 4))
-                        grad_field = pytorch_finufft.functional.finufft_type2(
-                            nufft_points,
-                            grad_conv,
-                            eps=1e-4,
-                            isign=1,
-                        )
-                        force_frame = (
-                            -(q_t.unsqueeze(0) * grad_field.real.to(dtype=real_dtype))
-                            .sum(dim=1)
-                            .transpose(0, 1)
-                        )
-                        force_frame = force_frame / volume
-                        force_local[ff] = force_frame
-
-                        if need_virial:
-                            virial_local[ff] = torch.einsum(
-                                "ai,aj->aij",
-                                force_frame,
-                                r_raw,
-                            ).reshape(nloc, 1, 9)
-
                     if remove_self_interaction:
                         diag_sum = kfac.sum() / (2.0 * volume)
                         corr[ff, 0] -= torch.sum(latent_charge[ff] ** 2) * diag_sum
 
         # Convert electrostatic unit from e^2/A to eV.
         corr = corr * coulomb_to_ev
-        if force_local is not None:
-            force_local = force_local * coulomb_to_ev
-        if virial_local is not None:
-            virial_local = virial_local * coulomb_to_ev
 
-        out: dict[str, torch.Tensor] = {"corr_redu": corr}
-        if force_local is not None:
-            out["force_local"] = force_local
-        if virial_local is not None:
-            out["virial_local"] = virial_local
-        return out
+        return {"corr_redu": corr}
