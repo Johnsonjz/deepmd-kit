@@ -15,6 +15,7 @@ from deepmd.pt.model.model.model import (
 )
 from deepmd.pt.model.model.transform_output import (
     communicate_extended_output,
+    fit_output_to_model_output,
 )
 from deepmd.pt.utils.nlist import (
     extend_input_and_build_neighbor_list,
@@ -138,7 +139,7 @@ class SOGEnergyModel(DPModelCommon, SOGEnergyModel_):
             output_def["virial"] = out_def_data["energy_derv_c_redu"]
             output_def["virial"].squeeze(-2)
             output_def["atom_virial"] = out_def_data["energy_derv_c"]
-            output_def["atom_virial"].squeeze(-3)
+            output_def["atom_virial"].squeeze(-2)
         if "mask" in out_def_data:
             output_def["mask"] = out_def_data["mask"]
         if self._hessian_enabled:
@@ -182,16 +183,33 @@ class SOGEnergyModel(DPModelCommon, SOGEnergyModel_):
             )
 
         remove_self_interaction = bool(fitting.remove_self_interaction)
-        amp = torch.as_tensor(fitting.amp, dtype=real_dtype, device=runtime_device)
+        amp = torch.as_tensor(
+            fitting.amp,
+            dtype=real_dtype,
+            device=runtime_device,
+        ).reshape(-1)
         bandwidth = torch.as_tensor(
             fitting.bandwidth,
             dtype=real_dtype,
             device=runtime_device,
         )
-        if not torch.isfinite(amp):
+        if amp.numel() == 0:
+            raise ValueError("Invalid SOG `amp` value in fitting net.")
+        if not torch.isfinite(amp).all():
             raise ValueError("Invalid SOG `amp` value in fitting net.")
         if bandwidth.ndim != 1 or bandwidth.numel() == 0:
             raise ValueError("Invalid SOG `bandwidth` in fitting net.")
+        if not torch.isfinite(bandwidth).all():
+            raise ValueError("Invalid SOG `bandwidth` in fitting net.")
+        if torch.any(bandwidth <= 0.0):
+            raise ValueError("SOG `bandwidth` should be positive.")
+
+        if amp.numel() == 1 and bandwidth.numel() > 1:
+            amp = amp.expand_as(bandwidth)
+        elif amp.numel() != bandwidth.numel():
+            raise ValueError(
+                "SOG `amp` should be scalar or have the same length as `bandwidth`."
+            )
         n_dl = float(fitting.n_dl)
         if (not math.isfinite(n_dl)) or n_dl <= 0.0:
             raise ValueError("`n_dl` should be a positive finite number.")
@@ -243,6 +261,7 @@ class SOGEnergyModel(DPModelCommon, SOGEnergyModel_):
             frame_groups.setdefault(nk, []).append(ff)
 
         bw2 = bandwidth.square().view(1, 1, 1, -1)
+        amp = amp.view(1, 1, 1, -1)
         for nk, frame_ids in frame_groups.items():
             k_grid_int, zero_mask, output_shape = self._get_cached_kgrid_base(
                 nk,
@@ -256,7 +275,7 @@ class SOGEnergyModel(DPModelCommon, SOGEnergyModel_):
             k_sq_group = torch.sum(g_cart_group**2, dim=1)
             k_in_cutoff = k_sq_group <= k_sq_max
 
-            kfac_group = amp * bw2 * torch.exp(-0.5 * bw2 * k_sq_group.unsqueeze(-1))
+            kfac_group = amp * torch.exp(-0.5 * bw2 * k_sq_group.unsqueeze(-1))
             kfac_group = kfac_group.sum(dim=-1).masked_fill(
                 zero_mask_expand | (~k_in_cutoff), 0.0
             )
@@ -338,20 +357,20 @@ class SOGEnergyModel(DPModelCommon, SOGEnergyModel_):
             out["virial_local"] = virial_local
         return out
 
-    def _compute_sog_frame_correction(
-        self,
-        coord: torch.Tensor,
-        latent_charge: torch.Tensor,
-        box: torch.Tensor,
-    ) -> torch.Tensor:
-        out = self._compute_sog_frame_correction_bundle(
-            coord,
-            latent_charge,
-            box,
-            need_force=False,
-            need_virial=False,
-        )
-        return out["corr_redu"]
+    # def _compute_sog_frame_correction(
+    #     self,
+    #     coord: torch.Tensor,
+    #     latent_charge: torch.Tensor,
+    #     box: torch.Tensor,
+    # ) -> torch.Tensor:
+    #     out = self._compute_sog_frame_correction_bundle(
+    #         coord,
+    #         latent_charge,
+    #         box,
+    #         need_force=False,
+    #         need_virial=False,
+    #     )
+    #     return out["corr_redu"]
 
     def _apply_frame_correction_lower(
         self,
@@ -361,7 +380,7 @@ class SOGEnergyModel(DPModelCommon, SOGEnergyModel_):
         box: torch.Tensor | None,
         do_atomic_virial: bool,
     ) -> dict[str, torch.Tensor]:
-        if box is None or "latent_charge" not in model_ret:
+        if self.training or box is None or "latent_charge" not in model_ret:
             return model_ret
 
         nf, nloc, _ = nlist.shape
@@ -371,9 +390,8 @@ class SOGEnergyModel(DPModelCommon, SOGEnergyModel_):
         latent_charge = model_ret["latent_charge"]
         need_force = self.do_grad_r("energy") or self.do_grad_c("energy")
         need_virial = self.do_grad_c("energy")
-        
+
         latent_charge_runtime = latent_charge[:, :nloc, :]
-        
         corr_bundle = self._compute_sog_frame_correction_bundle(
             coord_local,
             latent_charge_runtime,
@@ -382,14 +400,19 @@ class SOGEnergyModel(DPModelCommon, SOGEnergyModel_):
             need_virial=need_virial,
         )
         corr_redu = corr_bundle["corr_redu"]
-
         model_ret["energy_redu"] = model_ret["energy_redu"] + corr_redu.to(
             model_ret["energy_redu"].dtype
         ).view_as(model_ret["energy_redu"])
 
+        corr_virial_local: torch.Tensor | None = None
         if need_force:
             corr_force_local = corr_bundle["force_local"].to(coord_local.dtype)
+            if need_virial:
+                corr_virial_local = corr_bundle["virial_local"].to(
+                    corr_force_local.dtype
+                )
 
+        if need_force:
             corr_force_ext = torch.zeros(
                 (nf, nall, 3),
                 dtype=corr_force_local.dtype,
@@ -404,9 +427,7 @@ class SOGEnergyModel(DPModelCommon, SOGEnergyModel_):
                 )
 
             if need_virial:
-                corr_virial_local = corr_bundle["virial_local"].to(
-                    corr_force_local.dtype
-                )
+                assert corr_virial_local is not None
                 corr_virial_redu = corr_virial_local.sum(dim=1)
                 if "energy_derv_c_redu" in model_ret:
                     model_ret["energy_derv_c_redu"] = model_ret[
@@ -442,29 +463,74 @@ class SOGEnergyModel(DPModelCommon, SOGEnergyModel_):
         comm_dict: dict[str, torch.Tensor] | None = None,
         extra_nlist_sort: bool = False,
         extended_coord_corr: torch.Tensor | None = None,
+        box: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         if self.do_grad_r("energy") or self.do_grad_c("energy"):
             extended_coord = extended_coord.requires_grad_(True)
-        model_ret = super().forward_common_lower(
+
+        nframes, _ = extended_atype.shape[:2]
+        extended_coord = extended_coord.view(nframes, -1, 3)
+        nlist = self.format_nlist(
             extended_coord,
             extended_atype,
             nlist,
-            mapping,
+            extra_nlist_sort=extra_nlist_sort,
+        )
+        cc_ext, _, fp, ap, input_prec = self._input_type_cast(
+            extended_coord,
             fparam=fparam,
             aparam=aparam,
-            do_atomic_virial=do_atomic_virial,
+        )
+
+        atomic_ret = self.atomic_model.forward_common_atomic(
+            cc_ext,
+            extended_atype,
+            nlist,
+            mapping=mapping,
+            fparam=fp,
+            aparam=ap,
             comm_dict=comm_dict,
-            extra_nlist_sort=extra_nlist_sort,
+        )
+
+        runtime_box = box
+        if runtime_box is None and comm_dict is not None and "box" in comm_dict:
+            runtime_box = comm_dict["box"]
+
+        if self.training and runtime_box is not None:
+            if "latent_charge" in atomic_ret and "energy" in atomic_ret:
+                nloc = nlist.shape[1]
+                box_local = runtime_box.view(nframes, 3, 3)
+                coord_local = cc_ext[:, :nloc, :]
+                latent_charge_runtime = atomic_ret["latent_charge"][:, :nloc, :]
+                corr_redu = self._compute_sog_frame_correction_bundle(
+                    coord_local,
+                    latent_charge_runtime,
+                    box_local,
+                    need_force=False,
+                    need_virial=False,
+                )["corr_redu"]
+                per_atom_corr = (corr_redu / float(nloc)).unsqueeze(1)
+                atomic_ret["energy"] = atomic_ret["energy"] + per_atom_corr.to(
+                    atomic_ret["energy"].dtype
+                )
+
+        model_ret = fit_output_to_model_output(
+            atomic_ret,
+            self.atomic_output_def(),
+            cc_ext,
+            do_atomic_virial=do_atomic_virial,
+            create_graph=self.training,
+            mask=atomic_ret["mask"] if "mask" in atomic_ret else None,
             extended_coord_corr=extended_coord_corr,
         )
-        box = None
-        if comm_dict is not None and "box" in comm_dict:
-            box = comm_dict["box"]
+        model_ret = self._output_type_cast(model_ret, input_prec)
+        if self.training:
+            return model_ret
         return self._apply_frame_correction_lower(
             model_ret,
-            extended_coord,
+            cc_ext,
             nlist,
-            box,
+            runtime_box,
             do_atomic_virial,
         )
 
@@ -505,6 +571,7 @@ class SOGEnergyModel(DPModelCommon, SOGEnergyModel_):
             aparam=ap,
             do_atomic_virial=do_atomic_virial,
             comm_dict=comm_dict,
+            box=bb,
         )
         model_ret = communicate_extended_output(
             model_predict_lower,
@@ -523,14 +590,14 @@ class SOGEnergyModel(DPModelCommon, SOGEnergyModel_):
                 model_predict["virial"] = model_ret["energy_derv_c_redu"].squeeze(-2)
                 if do_atomic_virial:
                     model_predict["atom_virial"] = model_ret["energy_derv_c"].squeeze(
-                        -3
+                        -2
                     )
             else:
                 model_predict["force"] = model_ret["dforce"]
             if "mask" in model_ret:
                 model_predict["mask"] = model_ret["mask"]
             if self._hessian_enabled:
-                model_predict["hessian"] = model_ret["energy_derv_r_derv_r"].squeeze(-2)
+                model_predict["hessian"] = model_ret["energy_derv_r_derv_r"].squeeze(-3)
         else:
             model_predict = model_ret
             model_predict["updated_coord"] += coord
@@ -547,6 +614,7 @@ class SOGEnergyModel(DPModelCommon, SOGEnergyModel_):
         aparam: torch.Tensor | None = None,
         do_atomic_virial: bool = False,
         comm_dict: dict[str, torch.Tensor] | None = None,
+        box: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         model_ret = self.forward_common_lower(
             extended_coord,
@@ -558,6 +626,7 @@ class SOGEnergyModel(DPModelCommon, SOGEnergyModel_):
             do_atomic_virial=do_atomic_virial,
             comm_dict=comm_dict,
             extra_nlist_sort=self.need_sorted_nlist_for_lower(),
+            box=box,
         )
         if self.get_fitting_net() is not None:
             model_predict = {}
@@ -570,7 +639,7 @@ class SOGEnergyModel(DPModelCommon, SOGEnergyModel_):
                 if do_atomic_virial:
                     model_predict["extended_virial"] = model_ret[
                         "energy_derv_c"
-                    ].squeeze(-3)
+                    ].squeeze(-2)
             else:
                 assert model_ret["dforce"] is not None
                 model_predict["dforce"] = model_ret["dforce"]

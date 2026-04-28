@@ -431,6 +431,7 @@ class LESEnergyModel(DPModelCommon, LESEnergyModel_):
         comm_dict: dict[str, torch.Tensor] | None = None,
         extra_nlist_sort: bool = False,
         extended_coord_corr: torch.Tensor | None = None,
+        box: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         if self.do_grad_r("energy") or self.do_grad_c("energy"):
             extended_coord = extended_coord.requires_grad_(True)
@@ -446,14 +447,14 @@ class LESEnergyModel(DPModelCommon, LESEnergyModel_):
             extra_nlist_sort=extra_nlist_sort,
             extended_coord_corr=extended_coord_corr,
         )
-        box = None
-        if comm_dict is not None and "box" in comm_dict:
-            box = comm_dict["box"]
+        runtime_box = box
+        if runtime_box is None and comm_dict is not None and "box" in comm_dict:
+            runtime_box = comm_dict["box"]
         return self._apply_frame_correction_lower(
             model_ret,
             extended_coord,
             nlist,
-            box,
+            runtime_box,
             do_atomic_virial,
         )
 
@@ -494,6 +495,7 @@ class LESEnergyModel(DPModelCommon, LESEnergyModel_):
             aparam=ap,
             do_atomic_virial=do_atomic_virial,
             comm_dict=comm_dict,
+            box=bb,
         )
         model_ret = communicate_extended_output(
             model_predict_lower,
@@ -536,6 +538,7 @@ class LESEnergyModel(DPModelCommon, LESEnergyModel_):
         aparam: torch.Tensor | None = None,
         do_atomic_virial: bool = False,
         comm_dict: dict[str, torch.Tensor] | None = None,
+        box: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         model_ret = self.forward_common_lower(
             extended_coord,
@@ -547,6 +550,7 @@ class LESEnergyModel(DPModelCommon, LESEnergyModel_):
             do_atomic_virial=do_atomic_virial,
             comm_dict=comm_dict,
             extra_nlist_sort=self.need_sorted_nlist_for_lower(),
+            box=box,
         )
         if self.get_fitting_net() is not None:
             model_predict = {}
