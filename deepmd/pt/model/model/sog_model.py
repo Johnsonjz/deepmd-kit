@@ -315,9 +315,9 @@ class SOGEnergyModel(DPModelCommon, SOGEnergyModel_):
         latent_charge = model_ret["latent_charge"]
         need_force = self.do_grad_r("energy") or self.do_grad_c("energy")
         need_virial = self.do_grad_c("energy")
-        
+
         latent_charge_runtime = latent_charge[:, :nloc, :]
-        
+
         corr_bundle = self._compute_sog_frame_correction_bundle(
             coord_local,
             latent_charge_runtime,
@@ -330,35 +330,55 @@ class SOGEnergyModel(DPModelCommon, SOGEnergyModel_):
         ).view_as(model_ret["energy_redu"])
 
         if need_force:
-            total_force = torch.autograd.grad(
-                model_ret["energy_redu"].sum(),
-                extended_coord,
+            # Only differentiate the correction energy, then add to the base
+            # force that was already computed in fit_output_to_model_output.
+            # This avoids re-computing the base force and lets us drop the
+            # correction graph immediately (retain_graph=False).
+            corr_force_local = -torch.autograd.grad(
+                corr_redu.sum(),
+                coord_local,
                 create_graph=torch.is_grad_enabled(),
                 retain_graph=True,
-            )[0]
-            model_ret["energy_derv_r"] = (-total_force).unsqueeze(-2).to(
-                model_ret["energy_derv_r"].dtype
-            ).view_as(model_ret["energy_derv_r"])
+            )[0].view(nf, nloc, 3)
+
+            corr_force_ext = torch.zeros(
+                (nf, nall, 3),
+                dtype=corr_force_local.dtype,
+                device=corr_force_local.device,
+            )
+            corr_force_ext[:, :nloc, :] = corr_force_local
+
+            if "energy_derv_r" in model_ret:
+                model_ret["energy_derv_r"] = model_ret[
+                    "energy_derv_r"
+                ] + corr_force_ext.unsqueeze(-2).to(model_ret["energy_derv_r"].dtype)
 
             if need_virial:
-                virial_ext = torch.einsum(
-                    "bik,bij->bikj",
-                    -total_force,
-                    extended_coord,
-                ).view(nf, nall, 1, 9).to(model_ret["energy_derv_c"].dtype)
-                if "energy_derv_c" in model_ret:
-                    model_ret["energy_derv_c"] = model_ret[
-                        "energy_derv_c"
-                    ] + virial_ext.to(model_ret["energy_derv_c"].dtype).view_as(
-                        model_ret["energy_derv_c"]
-                    )
+                corr_virial_local = torch.einsum(
+                    "fai,faj->faij",
+                    corr_force_local,
+                    coord_local,
+                ).reshape(nf, nloc, 1, 9)
+                corr_virial_redu = corr_virial_local.sum(dim=1)
                 if "energy_derv_c_redu" in model_ret:
                     model_ret["energy_derv_c_redu"] = model_ret[
                         "energy_derv_c_redu"
-                    ] + virial_ext.sum(dim=1).to(
+                    ] + corr_virial_redu.to(
                         model_ret["energy_derv_c_redu"].dtype
                     ).view_as(
                         model_ret["energy_derv_c_redu"]
+                    )
+                if do_atomic_virial and "energy_derv_c" in model_ret:
+                    corr_atom_virial = torch.zeros(
+                        (nf, nall, 1, 9),
+                        dtype=corr_virial_local.dtype,
+                        device=corr_virial_local.device,
+                    )
+                    corr_atom_virial[:, :nloc, :, :] = corr_virial_local
+                    model_ret["energy_derv_c"] = model_ret[
+                        "energy_derv_c"
+                    ] + corr_atom_virial.to(model_ret["energy_derv_c"].dtype).view_as(
+                        model_ret["energy_derv_c"]
                     )
 
         return model_ret
