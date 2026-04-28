@@ -84,16 +84,33 @@ class SOGVmapModel(SOGEnergyModel):
             )
 
         remove_self_interaction = bool(fitting.remove_self_interaction)
-        amp = torch.as_tensor(fitting.amp, dtype=real_dtype, device=runtime_device)
+        amp = torch.as_tensor(
+            fitting.amp,
+            dtype=real_dtype,
+            device=runtime_device,
+        ).reshape(-1)
         bandwidth = torch.as_tensor(
             fitting.bandwidth,
             dtype=real_dtype,
             device=runtime_device,
         )
-        if not torch.isfinite(amp):
+        if amp.numel() == 0:
+            raise ValueError("Invalid SOG `amp` value in fitting net.")
+        if not torch.isfinite(amp).all():
             raise ValueError("Invalid SOG `amp` value in fitting net.")
         if bandwidth.ndim != 1 or bandwidth.numel() == 0:
             raise ValueError("Invalid SOG `bandwidth` in fitting net.")
+        if not torch.isfinite(bandwidth).all():
+            raise ValueError("Invalid SOG `bandwidth` in fitting net.")
+        if torch.any(bandwidth <= 0.0):
+            raise ValueError("SOG `bandwidth` should be positive.")
+
+        if amp.numel() == 1 and bandwidth.numel() > 1:
+            amp = amp.expand_as(bandwidth)
+        elif amp.numel() != bandwidth.numel():
+            raise ValueError(
+                "SOG `amp` should be scalar or have the same length as `bandwidth`."
+            )
         n_dl = float(fitting.n_dl)
         if (not math.isfinite(n_dl)) or n_dl <= 0.0:
             raise ValueError("`n_dl` should be a positive finite number.")
@@ -147,6 +164,7 @@ class SOGVmapModel(SOGEnergyModel):
         vmap_op = getattr(torch, "vmap", None)
         can_use_vmap = (vmap_op is not None) and (not torch.jit.is_scripting())
         bw2 = bandwidth.square().view(1, 1, 1, -1)
+        amp = amp.view(1, 1, 1, -1)
         for nk, frame_ids in frame_groups.items():
             k_grid_int, zero_mask, output_shape = self._get_cached_kgrid_base(
                 nk,
@@ -160,7 +178,7 @@ class SOGVmapModel(SOGEnergyModel):
             k_sq_group = torch.sum(g_cart_group**2, dim=1)
             k_in_cutoff = k_sq_group <= k_sq_max
 
-            kfac_group = amp * bw2 * torch.exp(-0.5 * bw2 * k_sq_group.unsqueeze(-1))
+            kfac_group = amp * torch.exp(-0.5 * bw2 * k_sq_group.unsqueeze(-1))
             kfac_group = kfac_group.sum(dim=-1).masked_fill(
                 zero_mask_expand | (~k_in_cutoff), 0.0
             )

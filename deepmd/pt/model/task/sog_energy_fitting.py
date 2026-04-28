@@ -133,7 +133,7 @@ class SOGEnergyFittingNet(LRFittingNet):
         type_map: list[str] | None = None,
         use_aparam_as_mask: bool = False,
         default_fparam: list[float] | None = None,
-        amp: float | torch.Tensor | None = None,
+        amp: float | list[float] | torch.Tensor | None = None,
         bandwidth: list[float] | torch.Tensor | None = None,
         b: float | torch.Tensor | None = None,
         sigma: float | torch.Tensor | None = None,
@@ -192,16 +192,6 @@ class SOGEnergyFittingNet(LRFittingNet):
         m_value = SOG_DEFAULT_M if M is None else int(M)
         m_value = max(1, m_value)
 
-        if amp is None:
-            amp_value = float(4.0 * np.pi * np.log(b_value))
-        else:
-            amp_tensor = torch.as_tensor(amp, dtype=dtype, device=device)
-            if amp_tensor.numel() == 0:
-                raise ValueError("`amp` should not be empty.")
-            amp_value = float(amp_tensor.reshape(-1)[0].item())
-        if not np.isfinite(amp_value):
-            raise ValueError("`amp` should be finite.")
-
         if bandwidth is None:
             b_base = torch.tensor(b_value, dtype=dtype, device=device)
             bandwidth_tensor = sigma_value * torch.pow(
@@ -217,13 +207,30 @@ class SOGEnergyFittingNet(LRFittingNet):
         if torch.any(bandwidth_tensor <= 0.0):
             raise ValueError("`bandwidth` values should be positive.")
 
+        if amp is None:
+            coef1 = float(4.0 * np.pi * np.log(b_value))
+            amp_tensor = coef1 * bandwidth_tensor.square()
+        else:
+            amp_tensor = torch.as_tensor(amp, dtype=dtype, device=device).reshape(-1)
+        if amp_tensor.numel() == 0:
+            raise ValueError("`amp` should not be empty.")
+        if not torch.isfinite(amp_tensor).all():
+            raise ValueError("`amp` should be finite.")
+
+        if amp_tensor.numel() == 1 and bandwidth_tensor.numel() > 1:
+            amp_tensor = amp_tensor.expand_as(bandwidth_tensor).clone()
+        elif amp_tensor.numel() != bandwidth_tensor.numel():
+            raise ValueError(
+                "`amp` should be scalar or have the same length as `bandwidth`."
+            )
+
         n_dl_value = float(n_dl)
         if (not np.isfinite(n_dl_value)) or n_dl_value <= 0.0:
             raise ValueError("`n_dl` should be a positive finite number.")
 
         self.n_dl = n_dl_value
         self.amp = torch.nn.Parameter(
-            torch.tensor([amp_value], dtype=dtype, device=device),
+            amp_tensor,
             requires_grad=bool(self.trainable),
         )
         self.bandwidth = torch.nn.Parameter(
@@ -282,12 +289,18 @@ class SOGEnergyFittingNet(LRFittingNet):
         obj = super().deserialize(data)
 
         with torch.no_grad():
-            if amp_tensor is not None:
-                obj.amp.copy_(
-                    amp_tensor.to(dtype=obj.amp.dtype, device=obj.amp.device).reshape(-1)[:1]
-                )
             if bandwidth_tensor is not None:
-                bw = bandwidth_tensor.to(dtype=obj.bandwidth.dtype, device=obj.bandwidth.device).reshape(-1)
+                bw = bandwidth_tensor.to(
+                    dtype=obj.bandwidth.dtype,
+                    device=obj.bandwidth.device,
+                ).reshape(-1)
+                if bw.numel() == 0:
+                    raise ValueError("`bandwidth` should not be empty.")
+                if not torch.isfinite(bw).all():
+                    raise ValueError("`bandwidth` should be finite.")
+                if torch.any(bw <= 0.0):
+                    raise ValueError("`bandwidth` values should be positive.")
+
                 if obj.bandwidth.shape != bw.shape:
                     obj.bandwidth = torch.nn.Parameter(
                         bw,
@@ -296,6 +309,33 @@ class SOGEnergyFittingNet(LRFittingNet):
                 else:
                     obj.bandwidth.copy_(bw)
                 obj.M = int(obj.bandwidth.numel())
+
+            if amp_tensor is not None:
+                amp_new = amp_tensor.to(dtype=obj.amp.dtype, device=obj.amp.device).reshape(-1)
+                if amp_new.numel() == 0:
+                    raise ValueError("`amp` should not be empty.")
+                if not torch.isfinite(amp_new).all():
+                    raise ValueError("`amp` should be finite.")
+
+                if amp_new.numel() == 1 and obj.bandwidth.numel() > 1:
+                    amp_new = amp_new.expand_as(obj.bandwidth).clone()
+                elif amp_new.numel() != obj.bandwidth.numel():
+                    raise ValueError(
+                        "`amp` should be scalar or have the same length as `bandwidth`."
+                    )
+
+                if obj.amp.shape != amp_new.shape:
+                    obj.amp = torch.nn.Parameter(
+                        amp_new,
+                        requires_grad=bool(obj.trainable),
+                    )
+                else:
+                    obj.amp.copy_(amp_new)
+            elif obj.amp.numel() == 1 and obj.bandwidth.numel() > 1:
+                obj.amp = torch.nn.Parameter(
+                    obj.amp.detach().expand_as(obj.bandwidth).clone(),
+                    requires_grad=bool(obj.trainable),
+                )
         return obj
 
     def _kernel_params(self) -> tuple[torch.Tensor, torch.Tensor]:
