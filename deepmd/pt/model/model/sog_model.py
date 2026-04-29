@@ -260,7 +260,7 @@ class SOGEnergyModel(DPModelCommon, SOGEnergyModel_):
         for ff, nk in enumerate(nk_per_frame):
             frame_groups.setdefault(nk, []).append(ff)
 
-        bw2 = bandwidth.square().view(1, 1, 1, -1)
+        bw2 = bandwidth.view(1, 1, 1, -1)
         amp = amp.view(1, 1, 1, -1)
         for nk, frame_ids in frame_groups.items():
             k_grid_int, zero_mask, output_shape = self._get_cached_kgrid_base(
@@ -275,7 +275,7 @@ class SOGEnergyModel(DPModelCommon, SOGEnergyModel_):
             k_sq_group = torch.sum(g_cart_group**2, dim=1)
             k_in_cutoff = k_sq_group <= k_sq_max
 
-            kfac_group = amp * torch.exp(-0.5 * bw2 * k_sq_group.unsqueeze(-1))
+            kfac_group = amp * bw2 * torch.exp(-0.5 * bw2 * k_sq_group.unsqueeze(-1))
             kfac_group = kfac_group.sum(dim=-1).masked_fill(
                 zero_mask_expand | (~k_in_cutoff), 0.0
             )

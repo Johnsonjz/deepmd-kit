@@ -194,10 +194,13 @@ class SOGEnergyFittingNet(LRFittingNet):
 
         if bandwidth is None:
             b_base = torch.tensor(b_value, dtype=dtype, device=device)
-            bandwidth_tensor = sigma_value * torch.pow(
+            bw_tensor = sigma_value * torch.pow(
                 b_base,
                 torch.arange(m_value, dtype=dtype, device=device),
             )
+            # Keep bandwidth as bw^2 so the kernel uses
+            # amp_m * bandwidth_m * exp(-0.5 * bandwidth_m * k^2).
+            bandwidth_tensor = bw_tensor.square()
         else:
             bandwidth_tensor = torch.as_tensor(bandwidth, dtype=dtype, device=device).reshape(-1)
         if bandwidth_tensor.numel() == 0:
@@ -209,7 +212,7 @@ class SOGEnergyFittingNet(LRFittingNet):
 
         if amp is None:
             coef1 = float(4.0 * np.pi * np.log(b_value))
-            amp_tensor = coef1 * bandwidth_tensor.square()
+            amp_tensor = torch.full_like(bandwidth_tensor, coef1)
         else:
             amp_tensor = torch.as_tensor(amp, dtype=dtype, device=device).reshape(-1)
         if amp_tensor.numel() == 0:
