@@ -58,6 +58,7 @@ dependencies = [
     'finufft>=2.5.0',
     'cufinufft @ git+https://github.com/Johnsonjz/finufft.git@feature/cufinufft-simple-plan-cache#subdirectory=python/cufinufft',
     'pytorch-finufft',
+    'sog @ git+https://github.com/Johnsonjz/sog.git',
 ]
 requires-python = ">=3.10"
 keywords = ["deepmd"]
