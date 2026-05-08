@@ -91,6 +91,7 @@ class DP(Calculator):
         type_dict: dict[str, int] | None = None,
         neighbor_list: Optional["NeighborList"] = None,
         head: str | None = None,
+        no_jit: bool = False,
         **kwargs: Any,
     ) -> None:
         Calculator.__init__(self, label=label, **kwargs)
@@ -98,6 +99,7 @@ class DP(Calculator):
             str(Path(model).resolve()),
             neighbor_list=neighbor_list,
             head=head,
+            no_jit=no_jit,
         )
         if type_dict:
             self.type_dict = type_dict
