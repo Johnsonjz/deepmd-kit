@@ -203,6 +203,26 @@ class DeepPot(DeepEval):
             nframes,
             natoms,
         ) = self._standard_input(coords, cells, atom_types, fparam, aparam, mixed_type)
+        output_latent_charge = kwargs.pop("output_latent_charge", False)
+        extra_request_defs = []
+        if output_latent_charge:
+            # Try to get dim_out_lr from the model fitting net
+            dim_out_lr = 1
+            model = self.deep_eval.get_model()
+            if hasattr(model, "atomic_model") and hasattr(
+                model.atomic_model, "fitting_net"
+            ):
+                dim_out_lr = getattr(model.atomic_model.fitting_net, "dim_out_lr", 1)
+            extra_request_defs.append(
+                OutputVariableDef(
+                    "latent_charge",
+                    shape=[dim_out_lr],
+                    reducible=False,
+                    r_differentiable=False,
+                    c_differentiable=False,
+                    atomic=True,
+                )
+            )
         results = self.deep_eval.eval(
             coords,
             cells,
@@ -210,6 +230,7 @@ class DeepPot(DeepEval):
             atomic,
             fparam=fparam,
             aparam=aparam,
+            extra_request_defs=extra_request_defs,
             **kwargs,
         )
         energy = results["energy_redu"].reshape(nframes, 1)
@@ -251,6 +272,9 @@ class DeepPot(DeepEval):
                 nframes, 3 * natoms, 3 * natoms
             )
             result = (*list(result), hessian)
+        if output_latent_charge and "latent_charge" in results:
+            latent_charge = results["latent_charge"].reshape(nframes, natoms, -1)
+            result = (*result, latent_charge)
         return result
 
 

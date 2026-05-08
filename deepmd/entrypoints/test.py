@@ -75,6 +75,7 @@ def test(
     detail_file: str,
     atomic: bool,
     head: str | None = None,
+    output_latent_charge: bool = False,
     **kwargs: Any,
 ) -> None:
     """Test model predictions.
@@ -185,6 +186,7 @@ def test(
                 detail_file,
                 atomic,
                 append_detail=(cc != 0),
+                output_latent_charge=output_latent_charge,
             )
         elif isinstance(dp, DeepDOS):
             err = test_dos(
@@ -305,6 +307,7 @@ def test_ener(
     detail_file: str | None,
     has_atom_ener: bool,
     append_detail: bool = False,
+    output_latent_charge: bool = False,
 ) -> tuple[list[np.ndarray], list[int]]:
     """Test energy type model.
 
@@ -402,6 +405,7 @@ def test_ener(
         efield=efield,
         mixed_type=mixed_type,
         spin=spin,
+        output_latent_charge=output_latent_charge,
     )
     energy = ret[0]
     force = ret[1]
@@ -409,25 +413,38 @@ def test_ener(
     energy = energy.reshape([numb_test, 1])
     force = force.reshape([numb_test, -1])
     virial = virial.reshape([numb_test, 9])
-    if dp.has_hessian:
-        hessian = ret[3]
-        hessian = hessian.reshape([numb_test, -1])
+    idx = 3
     if has_atom_ener:
-        ae = ret[3]
-        av = ret[4]
+        ae = ret[idx]
+        idx += 1
+        av = ret[idx]
+        idx += 1
         ae = ae.reshape([numb_test, -1])
         av = av.reshape([numb_test, -1])
         if dp.has_spin:
-            force_m = ret[5]
+            force_m = ret[idx]
+            idx += 1
+            mask_mag = ret[idx]
+            idx += 1
             force_m = force_m.reshape([numb_test, -1])
-            mask_mag = ret[6]
             mask_mag = mask_mag.reshape([numb_test, -1])
     else:
         if dp.has_spin:
-            force_m = ret[3]
+            force_m = ret[idx]
+            idx += 1
+            mask_mag = ret[idx]
+            idx += 1
             force_m = force_m.reshape([numb_test, -1])
-            mask_mag = ret[4]
             mask_mag = mask_mag.reshape([numb_test, -1])
+    if dp.has_hessian:
+        hessian = ret[idx]
+        idx += 1
+        hessian = hessian.reshape([numb_test, -1])
+    latent_charge = None
+    if output_latent_charge:
+        latent_charge = ret[idx]
+        idx += 1
+        latent_charge = latent_charge.reshape([numb_test, -1])
     out_put_spin = dp.get_ntypes_spin() != 0 or dp.has_spin
     if out_put_spin:
         if dp.get_ntypes_spin() != 0:  # old tf support for spin
@@ -657,6 +674,13 @@ def test_ener(
                 detail_path.with_suffix(".h.out"),
                 h,
                 header=f"{system}: data_h pred_h (3Na*3Na matrix in row-major order)",
+                append=append_detail,
+            )
+        if output_latent_charge and latent_charge is not None:
+            save_txt_file(
+                detail_path.with_suffix(".q.out"),
+                latent_charge,
+                header=f"{system}: pred_q (latent charge per atom)",
                 append=append_detail,
             )
 

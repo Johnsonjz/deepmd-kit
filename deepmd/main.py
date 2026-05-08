@@ -454,6 +454,12 @@ def main_parser() -> argparse.ArgumentParser:
         default=False,
         help="(Supported backend: PyTorch) Disable JIT compilation when loading the model.",
     )
+    parser_tst.add_argument(
+        "--output-latent-charge",
+        action="store_true",
+        default=False,
+        help="Output latent charge predicted by SOG models to the detail file.",
+    )
 
     # * eval_desc script ***************************************************************
     parser_eval_desc = subparsers.add_parser(
