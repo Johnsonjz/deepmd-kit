@@ -569,6 +569,15 @@ class LRFittingNet(Fitting):
         fparam = fparam.to(self.prec) if fparam is not None else None
         aparam = aparam.to(self.prec) if aparam is not None else None
 
+        # Save target total charge from fparam (column 0) before normalization.
+        # Assumes fparam[:, 0] stores the total charge of each frame.
+        # If no fparam is provided, default to neutral (total charge = 0).
+        if self.numb_fparam > 0 and fparam is not None:
+            fparam_raw = fparam.view([nf, self.numb_fparam])
+            target_total_charge = fparam_raw[:, 0]  # [nf]
+        else:
+            target_total_charge = torch.zeros(nf, dtype=self.prec, device=xx.device)
+
         if self.remove_vaccum_contribution is not None:
             xx_zeros = torch.zeros_like(xx)
         else:
@@ -646,6 +655,19 @@ class LRFittingNet(Fitting):
             bias_tensor=None,
         )
         lr_out = lr_out + self._get_lr_bias(atype)
+
+        # Hard charge constraint: enforce sum of latent charges equals target total charge.
+        q_mean = lr_out.mean(dim=1)  # [nf, lr_net_dim_out]
+        q_target_per_atom = target_total_charge / float(nloc)  # [nf]
+        if lr_out.shape[-1] > 1:
+            correction = torch.zeros_like(lr_out)
+            correction[:, :, 0] = q_mean[:, 0] - q_target_per_atom
+            lr_out = lr_out - correction
+        else:
+            q_mean = q_mean.unsqueeze(1)  # [nf, 1, 1]
+            target = q_target_per_atom.view(nf, 1, 1)
+            lr_out = lr_out - (q_mean - target)
+
         mask = self.emask(atype).to(torch.bool)
         sr_out = torch.where(mask[:, :, None], sr_out, 0.0)
         lr_out = torch.where(mask[:, :, None], lr_out, 0.0)
