@@ -72,6 +72,23 @@ class DeepPotPTExpt : public DeepPotBackend {
                const std::vector<VALUETYPE>& fparam,
                const std::vector<VALUETYPE>& aparam,
                const bool atomic);
+
+  template <typename VALUETYPE, typename ENERGYVTYPE>
+  void compute_with_charge(ENERGYVTYPE& ener,
+                           std::vector<VALUETYPE>& force,
+                           std::vector<VALUETYPE>& virial,
+                           std::vector<VALUETYPE>& atom_energy,
+                           std::vector<VALUETYPE>& atom_virial,
+                           std::vector<VALUETYPE>& atom_charge,
+                           const std::vector<VALUETYPE>& coord,
+                           const std::vector<int>& atype,
+                           const std::vector<VALUETYPE>& box,
+                           const int nghost,
+                           const InputNlist& lmp_list,
+                           const int& ago,
+                           const std::vector<VALUETYPE>& fparam,
+                           const std::vector<VALUETYPE>& aparam,
+                           const bool atomic);
   /**
    * @brief Evaluate without nlist (standalone — builds nlist, folds back).
    **/
@@ -170,6 +187,37 @@ class DeepPotPTExpt : public DeepPotBackend {
                 const std::vector<float>& fparam,
                 const std::vector<float>& aparam,
                 const bool atomic);
+
+  void computew_with_charge(std::vector<double>& ener,
+                            std::vector<double>& force,
+                            std::vector<double>& virial,
+                            std::vector<double>& atom_energy,
+                            std::vector<double>& atom_virial,
+                            std::vector<double>& atom_charge,
+                            const std::vector<double>& coord,
+                            const std::vector<int>& atype,
+                            const std::vector<double>& box,
+                            const int nghost,
+                            const InputNlist& inlist,
+                            const int& ago,
+                            const std::vector<double>& fparam,
+                            const std::vector<double>& aparam,
+                            const bool atomic);
+  void computew_with_charge(std::vector<double>& ener,
+                            std::vector<float>& force,
+                            std::vector<float>& virial,
+                            std::vector<float>& atom_energy,
+                            std::vector<float>& atom_virial,
+                            std::vector<float>& atom_charge,
+                            const std::vector<float>& coord,
+                            const std::vector<int>& atype,
+                            const std::vector<float>& box,
+                            const int nghost,
+                            const InputNlist& inlist,
+                            const int& ago,
+                            const std::vector<float>& fparam,
+                            const std::vector<float>& aparam,
+                            const bool atomic);
   void computew_mixed_type(std::vector<double>& ener,
                            std::vector<double>& force,
                            std::vector<double>& virial,
@@ -207,6 +255,7 @@ class DeepPotPTExpt : public DeepPotBackend {
   int gpu_id;
   bool gpu_enabled;
   std::vector<std::string> type_map;
+  std::vector<std::string> input_keys;   // model input key order
   std::vector<std::string> output_keys;  // sorted internal output key names
   bool mixed_types;
   std::vector<int> sel;
@@ -253,6 +302,7 @@ class DeepPotPTExpt : public DeepPotBackend {
    * @param[in] atype Extended atom types tensor.
    * @param[in] nlist Neighbor list tensor.
    * @param[in] mapping Mapping tensor.
+  * @param[in] box Box tensor (or empty when unused by model).
    * @param[in] fparam Frame parameter tensor (or empty).
    * @param[in] aparam Atomic parameter tensor (or empty).
    * @return Vector of output tensors in sorted key order.
@@ -261,6 +311,7 @@ class DeepPotPTExpt : public DeepPotBackend {
                                        const torch::Tensor& atype,
                                        const torch::Tensor& nlist,
                                        const torch::Tensor& mapping,
+                                       const torch::Tensor& box,
                                        const torch::Tensor& fparam,
                                        const torch::Tensor& aparam);
 

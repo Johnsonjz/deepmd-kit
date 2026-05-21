@@ -10,7 +10,9 @@
 #include "pair_deepspin.h"
 #include "version.h"
 #if LAMMPS_VERSION_NUMBER >= 20220328
+#include "les.h"
 #include "pppm_dplr.h"
+#include "sog.h"
 #endif
 
 using namespace LAMMPS_NS;
@@ -28,6 +30,8 @@ static Fix* fixdplr(LAMMPS* lmp, int narg, char** arg) {
 
 #if LAMMPS_VERSION_NUMBER >= 20220328
 static KSpace* pppmdplr(LAMMPS* lmp) { return new PPPMDPLR(lmp); }
+static KSpace* leskspace(LAMMPS* lmp) { return new LESKSpace(lmp); }
+static KSpace* sogkspace(LAMMPS* lmp) { return new SOGKSpace(lmp); }
 #endif
 
 extern "C" void lammpsplugin_init(void* lmp, void* handle, void* regfunc) {
@@ -73,6 +77,20 @@ extern "C" void lammpsplugin_init(void* lmp, void* handle, void* regfunc) {
   plugin.info = "kspace pppm/dplr " STR_GIT_SUMM;
   plugin.author = "Han Wang";
   plugin.creator.v1 = (lammpsplugin_factory1*)&pppmdplr;
+  (*register_plugin)(&plugin, lmp);
+
+  plugin.style = "kspace";
+  plugin.name = "les";
+  plugin.info = "kspace les " STR_GIT_SUMM;
+  plugin.author = "DeepMD contributors";
+  plugin.creator.v1 = (lammpsplugin_factory1*)&leskspace;
+  (*register_plugin)(&plugin, lmp);
+
+  plugin.style = "kspace";
+  plugin.name = "sog";
+  plugin.info = "kspace sog " STR_GIT_SUMM;
+  plugin.author = "DeepMD contributors";
+  plugin.creator.v1 = (lammpsplugin_factory1*)&sogkspace;
   (*register_plugin)(&plugin, lmp);
 #endif
 }

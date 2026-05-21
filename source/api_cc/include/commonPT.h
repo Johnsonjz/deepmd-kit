@@ -66,6 +66,34 @@ inline void build_comm_dict(torch::Dict<std::string, torch::Tensor>& comm_dict,
 }
 
 /**
+ * @brief Insert/update simulation box tensor in comm_dict.
+ *
+ * The tensor is created as shape (1, 9) for one-frame inference.
+ * It is used by lower-level correction models (e.g. SOG/LES) that
+ * read periodic box information from comm_dict during forward_lower.
+ *
+ * @param[out] comm_dict The communication dictionary to update.
+ * @param[in] box Flat box vector (length 9).
+ * @param[in] options Tensor options for dtype.
+ * @param[in] device Target device.
+ */
+template <typename VALUETYPE>
+inline void insert_box_to_comm_dict(
+        torch::Dict<std::string, torch::Tensor>& comm_dict,
+        const std::vector<VALUETYPE>& box,
+        const torch::TensorOptions& options,
+        const torch::Device& device) {
+    if (box.empty()) {
+        return;
+    }
+    torch::Tensor box_tensor =
+            torch::from_blob(const_cast<VALUETYPE*>(box.data()),
+                                             {1, static_cast<std::int64_t>(box.size())}, options)
+                    .to(device);
+    comm_dict.insert_or_assign("box", box_tensor);
+}
+
+/**
  * @brief Build comm_dict with sendlist remapping for virtual (NULL-type) atoms.
  *
  * Calls remap_comm_sendlist() to remap indices through fwd_map, then

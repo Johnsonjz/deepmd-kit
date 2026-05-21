@@ -663,6 +663,23 @@ void DeepPotPTExpt::init(const std::string& model,
     sel.push_back(v.as_int());
   }
 
+  // Parse input keys from metadata (optional).
+  // Backward compatibility: older .pt2 models do not store input_keys.
+  input_keys.clear();
+  if (metadata.obj_val.count("input_keys")) {
+    for (const auto& v : metadata["input_keys"].as_array()) {
+      input_keys.push_back(v.as_string());
+    }
+  } else {
+    input_keys = {"coord", "atype", "nlist", "mapping"};
+    if (dfparam > 0) {
+      input_keys.push_back("fparam");
+    }
+    if (daparam > 0) {
+      input_keys.push_back("aparam");
+    }
+  }
+
   // Parse output keys from metadata
   output_keys.clear();
   for (const auto& v : metadata["output_keys"].as_array()) {
@@ -700,17 +717,42 @@ std::vector<torch::Tensor> DeepPotPTExpt::run_model(
     const torch::Tensor& atype,
     const torch::Tensor& nlist,
     const torch::Tensor& mapping,
+    const torch::Tensor& box,
     const torch::Tensor& fparam,
     const torch::Tensor& aparam) {
-  // Only include fparam/aparam if the model was exported with them.
-  // When fparam/aparam are None at export time, AOTInductor compiles
-  // the model with fewer inputs (e.g. 4 instead of 6).
-  std::vector<torch::Tensor> inputs = {coord, atype, nlist, mapping};
-  if (dfparam > 0) {
-    inputs.push_back(fparam);
-  }
-  if (daparam > 0) {
-    inputs.push_back(aparam);
+  std::vector<torch::Tensor> inputs;
+  inputs.reserve(input_keys.size());
+  for (const auto& key : input_keys) {
+    if (key == "coord" || key == "extended_coord") {
+      inputs.push_back(coord);
+    } else if (key == "atype" || key == "extended_atype") {
+      inputs.push_back(atype);
+    } else if (key == "nlist") {
+      inputs.push_back(nlist);
+    } else if (key == "mapping") {
+      inputs.push_back(mapping);
+    } else if (key == "box") {
+      if (!box.defined() || box.numel() == 0) {
+        throw deepmd::deepmd_exception(
+            "Model expects input key 'box' but no box tensor was provided.");
+      }
+      inputs.push_back(box);
+    } else if (key == "fparam") {
+      if (dfparam <= 0) {
+        throw deepmd::deepmd_exception(
+            "Model metadata requests 'fparam' but dim_fparam == 0.");
+      }
+      inputs.push_back(fparam);
+    } else if (key == "aparam") {
+      if (daparam <= 0) {
+        throw deepmd::deepmd_exception(
+            "Model metadata requests 'aparam' but dim_aparam == 0.");
+      }
+      inputs.push_back(aparam);
+    } else {
+      throw deepmd::deepmd_exception("Unsupported input key in metadata: " +
+                                     key);
+    }
   }
   return loader->run(inputs);
 }
@@ -825,6 +867,18 @@ void DeepPotPTExpt::compute(ENERGYVTYPE& ener,
   auto valuetype_options = std::is_same<VALUETYPE, float>::value
                                ? torch::TensorOptions().dtype(torch::kFloat32)
                                : torch::TensorOptions().dtype(torch::kFloat64);
+  at::Tensor box_tensor;
+  if (!box.empty()) {
+    box_tensor =
+        torch::from_blob(const_cast<VALUETYPE*>(box.data()),
+                         {1, static_cast<std::int64_t>(box.size())},
+                         valuetype_options)
+            .to(torch::kFloat64)
+            .to(device);
+  } else {
+    box_tensor = torch::zeros({0}, options).to(device);
+  }
+
   at::Tensor fparam_tensor;
   if (!fparam.empty()) {
     fparam_tensor =
@@ -863,7 +917,8 @@ void DeepPotPTExpt::compute(ENERGYVTYPE& ener,
 
   // Run the .pt2 model
   auto flat_outputs = run_model(coord_Tensor, atype_Tensor, firstneigh_tensor,
-                                mapping_tensor, fparam_tensor, aparam_tensor);
+                                mapping_tensor, box_tensor, fparam_tensor,
+                                aparam_tensor);
 
   // Map flat outputs to internal keys
   std::map<std::string, torch::Tensor> output_map;
@@ -1074,6 +1129,11 @@ void DeepPotPTExpt::compute(ENERGYVTYPE& ener,
       torch::from_blob(mapping_64.data(), {1, nall}, int_options)
           .clone()
           .to(device);
+  at::Tensor box_tensor =
+      torch::from_blob(box_d.data(), {1, static_cast<std::int64_t>(box_d.size())},
+               options)
+        .clone()
+        .to(device);
 
   // Build fparam/aparam tensors (cast to float64 for the model)
   auto valuetype_options = std::is_same<VALUETYPE, float>::value
@@ -1117,7 +1177,8 @@ void DeepPotPTExpt::compute(ENERGYVTYPE& ener,
 
   // 5. Run the .pt2 model
   auto flat_outputs = run_model(coord_Tensor, atype_Tensor, nlist_tensor,
-                                mapping_tensor, fparam_tensor, aparam_tensor);
+                                mapping_tensor, box_tensor, fparam_tensor,
+                                aparam_tensor);
 
   // 6. Map flat outputs to internal keys
   std::map<std::string, torch::Tensor> output_map;
@@ -1331,6 +1392,90 @@ void DeepPotPTExpt::computew(std::vector<double>& ener,
             nghost, inlist, ago, fparam, aparam, atomic);
   });
 }
+
+template <typename VALUETYPE, typename ENERGYVTYPE>
+void DeepPotPTExpt::compute_with_charge(
+    ENERGYVTYPE& ener,
+    std::vector<VALUETYPE>& force,
+    std::vector<VALUETYPE>& virial,
+    std::vector<VALUETYPE>& atom_energy,
+    std::vector<VALUETYPE>& atom_virial,
+    std::vector<VALUETYPE>& atom_charge,
+    const std::vector<VALUETYPE>& coord,
+    const std::vector<int>& atype,
+    const std::vector<VALUETYPE>& box,
+    const int nghost,
+    const InputNlist& lmp_list,
+    const int& ago,
+    const std::vector<VALUETYPE>& fparam,
+    const std::vector<VALUETYPE>& aparam,
+    const bool atomic) {
+  (void)ener;
+  (void)force;
+  (void)virial;
+  (void)atom_energy;
+  (void)atom_virial;
+  (void)atom_charge;
+  (void)coord;
+  (void)atype;
+  (void)box;
+  (void)nghost;
+  (void)lmp_list;
+  (void)ago;
+  (void)fparam;
+  (void)aparam;
+  (void)atomic;
+  throw deepmd::deepmd_exception(
+      "compute_with_charge is not implemented for PyTorch exportable (.pt2) "
+      "backend yet.");
+}
+
+void DeepPotPTExpt::computew_with_charge(
+    std::vector<double>& ener,
+    std::vector<double>& force,
+    std::vector<double>& virial,
+    std::vector<double>& atom_energy,
+    std::vector<double>& atom_virial,
+    std::vector<double>& atom_charge,
+    const std::vector<double>& coord,
+    const std::vector<int>& atype,
+    const std::vector<double>& box,
+    const int nghost,
+    const InputNlist& inlist,
+    const int& ago,
+    const std::vector<double>& fparam,
+    const std::vector<double>& aparam,
+    const bool atomic) {
+  translate_error([&] {
+    compute_with_charge(ener, force, virial, atom_energy, atom_virial,
+                        atom_charge, coord, atype, box, nghost, inlist, ago,
+                        fparam, aparam, atomic);
+  });
+}
+
+void DeepPotPTExpt::computew_with_charge(
+    std::vector<double>& ener,
+    std::vector<float>& force,
+    std::vector<float>& virial,
+    std::vector<float>& atom_energy,
+    std::vector<float>& atom_virial,
+    std::vector<float>& atom_charge,
+    const std::vector<float>& coord,
+    const std::vector<int>& atype,
+    const std::vector<float>& box,
+    const int nghost,
+    const InputNlist& inlist,
+    const int& ago,
+    const std::vector<float>& fparam,
+    const std::vector<float>& aparam,
+    const bool atomic) {
+  translate_error([&] {
+    compute_with_charge(ener, force, virial, atom_energy, atom_virial,
+                        atom_charge, coord, atype, box, nghost, inlist, ago,
+                        fparam, aparam, atomic);
+  });
+}
+
 template <typename VALUETYPE>
 void DeepPotPTExpt::compute_mixed_type_impl(
     std::vector<double>& ener,

@@ -304,7 +304,7 @@ def _trace_and_export(
 ) -> tuple:
     """Common logic: build model, trace, export.
 
-    Returns (exported, metadata, data_for_json, output_keys).
+    Returns (exported, metadata, data_for_json, input_keys, output_keys).
     """
     from copy import (
         deepcopy,
@@ -358,6 +358,11 @@ def _trace_and_export(
     # 5. Extract output keys from the CPU-traced module.
     sample_out = traced(ext_coord, ext_atype, nlist_t, mapping_t, fparam, aparam)
     output_keys = list(sample_out.keys())
+    input_keys = ["coord", "atype", "nlist", "mapping"]
+    if fparam is not None:
+        input_keys.append("fparam")
+    if aparam is not None:
+        input_keys.append("aparam")
 
     # 6. Export on CPU.
     # make_fx on CPU bakes device='cpu' into tensor-creation ops in the
@@ -388,7 +393,7 @@ def _trace_and_export(
     data_for_json = deepcopy(json_source)
     data_for_json = _numpy_to_json_serializable(data_for_json)
 
-    return exported, metadata, data_for_json, output_keys
+    return exported, metadata, data_for_json, input_keys, output_keys
 
 
 def _deserialize_to_file_pte(
@@ -397,11 +402,12 @@ def _deserialize_to_file_pte(
     model_json_override: dict | None = None,
 ) -> None:
     """Deserialize a dictionary to a .pte model file."""
-    exported, metadata, data_for_json, output_keys = _trace_and_export(
+    exported, metadata, data_for_json, input_keys, output_keys = _trace_and_export(
         data, model_json_override
     )
 
     model_def_script = data.get("model_def_script") or {}
+    metadata["input_keys"] = input_keys
     metadata["output_keys"] = output_keys
     extra_files = {
         "metadata.json": json.dumps(metadata),
@@ -429,7 +435,7 @@ def _deserialize_to_file_pt2(
         aoti_compile_and_package,
     )
 
-    exported, metadata, data_for_json, output_keys = _trace_and_export(
+    exported, metadata, data_for_json, input_keys, output_keys = _trace_and_export(
         data, model_json_override
     )
 
@@ -438,6 +444,7 @@ def _deserialize_to_file_pt2(
 
     # Embed metadata into the .pt2 ZIP archive
     model_def_script = data.get("model_def_script") or {}
+    metadata["input_keys"] = input_keys
     metadata["output_keys"] = output_keys
     with zipfile.ZipFile(model_file, "a") as zf:
         zf.writestr("extra/metadata.json", json.dumps(metadata))

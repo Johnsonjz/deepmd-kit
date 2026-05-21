@@ -270,6 +270,43 @@ class DeepPot : public DeepBaseModel {
                const std::vector<VALUETYPE>& fparam = std::vector<VALUETYPE>(),
                const std::vector<VALUETYPE>& aparam = std::vector<VALUETYPE>());
   /** @} */
+
+    /**
+     * @brief Evaluate DP with nlist and optionally extract latent atomic charge
+     *        (e.g. SOG latent_charge) for local atoms.
+     * @param[out] ener The system energy.
+     * @param[out] force The force on each atom.
+     * @param[out] virial The virial.
+     * @param[out] atom_energy The atomic energy (when atomic=true).
+     * @param[out] atom_virial The atomic virial (when atomic=true).
+     * @param[out] atom_charge The latent atomic charge mapped to nall ordering.
+     * @param[in] coord The coordinates of atoms.
+     * @param[in] atype The atom types.
+     * @param[in] box The cell of the region.
+     * @param[in] nghost The number of ghost atoms.
+     * @param[in] lmp_list The input neighbour list.
+     * @param[in] ago Update the internal neighbour list if ago is 0.
+     * @param[in] fparam Optional frame parameters.
+     * @param[in] aparam Optional atomic parameters.
+     * @param[in] atomic Whether to request atomic energy/virial.
+     */
+    template <typename VALUETYPE>
+    void compute_with_charge(
+            ENERGYTYPE& ener,
+            std::vector<VALUETYPE>& force,
+            std::vector<VALUETYPE>& virial,
+            std::vector<VALUETYPE>& atom_energy,
+            std::vector<VALUETYPE>& atom_virial,
+            std::vector<VALUETYPE>& atom_charge,
+            const std::vector<VALUETYPE>& coord,
+            const std::vector<int>& atype,
+            const std::vector<VALUETYPE>& box,
+            const int nghost,
+            const InputNlist& lmp_list,
+            const int& ago,
+            const std::vector<VALUETYPE>& fparam = std::vector<VALUETYPE>(),
+            const std::vector<VALUETYPE>& aparam = std::vector<VALUETYPE>(),
+            const bool atomic = false);
   /**
    * @brief Evaluate the energy, force and virial by using this DP.
    * @param[out] ener The system energy.

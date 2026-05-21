@@ -105,6 +105,9 @@ class SOGEnergyFittingNet(LRFittingNet):
         NUFFT long-range grid density control factor.
     remove_self_interaction : bool
         If True, remove self interaction term in long-range correction.
+    external_kspace : bool
+        If True, long-range correction is handled externally (e.g. kspace),
+        and the model only provides latent charges.
     """
 
     def __init__(
@@ -140,6 +143,7 @@ class SOGEnergyFittingNet(LRFittingNet):
         M: int | None = None,
         n_dl: float | int = 1.0,
         remove_self_interaction: bool = False,
+        external_kspace: bool = False,
         **kwargs: Any,
     ) -> None:
         super().__init__(
@@ -226,6 +230,8 @@ class SOGEnergyFittingNet(LRFittingNet):
             raise ValueError(
                 "`amp` should be scalar or have the same length as `bandwidth`."
             )
+        # Store amp as sog-lib internal amplitude (already includes bw^2 factor).
+        amp_tensor *= bandwidth_tensor
 
         n_dl_value = float(n_dl)
         if (not np.isfinite(n_dl_value)) or n_dl_value <= 0.0:
@@ -244,6 +250,7 @@ class SOGEnergyFittingNet(LRFittingNet):
         self.sigma = sigma_value
         self.M = m_value
         self.remove_self_interaction = bool(remove_self_interaction)
+        self.external_kspace = bool(external_kspace)
         self._nufft_fallback_warned = False
 
     def output_def(self) -> FittingOutputDef:
@@ -277,6 +284,7 @@ class SOGEnergyFittingNet(LRFittingNet):
         data["M"] = int(self.M)
         data["n_dl"] = self.n_dl
         data["remove_self_interaction"] = bool(self.remove_self_interaction)
+        data["external_kspace"] = bool(self.external_kspace)
         return data
 
     @classmethod

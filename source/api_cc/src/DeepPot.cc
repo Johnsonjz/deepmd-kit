@@ -403,6 +403,84 @@ template void DeepPot::compute<float>(std::vector<ENERGYTYPE>& dener,
                                       const std::vector<float>& fparam,
                                       const std::vector<float>& aparam_);
 
+template <typename VALUETYPE>
+void DeepPot::compute_with_charge(
+    ENERGYTYPE& dener,
+    std::vector<VALUETYPE>& dforce_,
+    std::vector<VALUETYPE>& dvirial,
+    std::vector<VALUETYPE>& datom_energy_,
+    std::vector<VALUETYPE>& datom_virial_,
+    std::vector<VALUETYPE>& datom_charge_,
+    const std::vector<VALUETYPE>& dcoord_,
+    const std::vector<int>& datype_,
+    const std::vector<VALUETYPE>& dbox,
+    const int nghost,
+    const InputNlist& lmp_list,
+    const int& ago,
+    const std::vector<VALUETYPE>& fparam,
+    const std::vector<VALUETYPE>& aparam,
+    const bool atomic) {
+  std::vector<ENERGYTYPE> dener_vec;
+
+#ifdef BUILD_PYTORCH
+  if (auto dp_pt = std::dynamic_pointer_cast<deepmd::DeepPotPT>(dp)) {
+    dp_pt->computew_with_charge(dener_vec, dforce_, dvirial, datom_energy_,
+                                datom_virial_, datom_charge_, dcoord_, datype_,
+                                dbox, nghost, lmp_list, ago, fparam, aparam,
+                                atomic);
+    dener = dener_vec[0];
+    return;
+  }
+#if BUILD_PT_EXPT
+  if (auto dp_pt_expt = std::dynamic_pointer_cast<deepmd::DeepPotPTExpt>(dp)) {
+    dp_pt_expt->computew_with_charge(
+        dener_vec, dforce_, dvirial, datom_energy_, datom_virial_,
+        datom_charge_, dcoord_, datype_, dbox, nghost, lmp_list, ago, fparam,
+        aparam, atomic);
+    dener = dener_vec[0];
+    return;
+  }
+#endif
+#endif
+
+  throw deepmd::deepmd_exception(
+      "compute_with_charge is only supported for PyTorch backends.");
+}
+
+template void DeepPot::compute_with_charge<double>(
+    ENERGYTYPE& dener,
+    std::vector<double>& dforce_,
+    std::vector<double>& dvirial,
+    std::vector<double>& datom_energy_,
+    std::vector<double>& datom_virial_,
+    std::vector<double>& datom_charge_,
+    const std::vector<double>& dcoord_,
+    const std::vector<int>& datype_,
+    const std::vector<double>& dbox,
+    const int nghost,
+    const InputNlist& lmp_list,
+    const int& ago,
+    const std::vector<double>& fparam,
+    const std::vector<double>& aparam,
+    const bool atomic);
+
+template void DeepPot::compute_with_charge<float>(
+    ENERGYTYPE& dener,
+    std::vector<float>& dforce_,
+    std::vector<float>& dvirial,
+    std::vector<float>& datom_energy_,
+    std::vector<float>& datom_virial_,
+    std::vector<float>& datom_charge_,
+    const std::vector<float>& dcoord_,
+    const std::vector<int>& datype_,
+    const std::vector<float>& dbox,
+    const int nghost,
+    const InputNlist& lmp_list,
+    const int& ago,
+    const std::vector<float>& fparam,
+    const std::vector<float>& aparam,
+    const bool atomic);
+
 // mixed type
 template <typename VALUETYPE>
 void DeepPot::compute_mixed_type(ENERGYTYPE& dener,

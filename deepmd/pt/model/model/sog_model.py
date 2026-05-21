@@ -107,19 +107,20 @@ class SOGEnergyModel(DPModelCommon, SOGEnergyModel_):
         runtime_device: torch.device,
         real_dtype: torch.dtype,
     ) -> Any:
-        bw_init = torch.sqrt(
-            torch.clamp(
-                fitting.bandwidth.detach().to(device=runtime_device, dtype=real_dtype),
-                min=torch.finfo(real_dtype).tiny,
-            )
+        bw2_runtime = fitting.bandwidth.to(device=runtime_device, dtype=real_dtype)
+        amp_internal_runtime = fitting.amp.to(
+            device=runtime_device,
+            dtype=real_dtype,
         )
 
         kernel = sog_lib.Sog(
             sog_arguments={
                 "use_atomwise": False,
                 "n_dl": float(fitting.n_dl),
-                "amp": fitting.amp.detach().to(device=runtime_device, dtype=real_dtype),
-                "bandwidth": bw_init,
+                "amp": amp_internal_runtime,
+                "bandwidth": bw2_runtime,
+                "kernel_param_mode": "internal",
+                "kernel_tensor_mode": "external",
                 "remove_self_interaction": bool(fitting.remove_self_interaction),
                 "nufft": False,
                 "use_nufft": False,
@@ -128,9 +129,6 @@ class SOGEnergyModel(DPModelCommon, SOGEnergyModel_):
             },
             r_cut=float(self.get_rcut()),
         )
-
-        kernel.gaussian.amp = fitting.amp
-        kernel.gaussian.bandwidth = fitting.bandwidth
         return kernel
 
     def _compute_sog_frame_correction_bundle(
@@ -206,6 +204,10 @@ class SOGEnergyModel(DPModelCommon, SOGEnergyModel_):
         box: torch.Tensor | None,
         do_atomic_virial: bool,
     ) -> dict[str, torch.Tensor]:
+        fitting = self.get_fitting_net()
+        if fitting is not None and bool(fitting.external_kspace):
+            return model_ret
+
         if box is None or "latent_charge" not in model_ret:
             return model_ret
 
@@ -390,6 +392,8 @@ class SOGEnergyModel(DPModelCommon, SOGEnergyModel_):
             model_predict = {}
             model_predict["atom_energy"] = model_ret["energy"]
             model_predict["energy"] = model_ret["energy_redu"]
+            if "latent_charge" in model_ret:
+                model_predict["latent_charge"] = model_ret["latent_charge"]
             if self.do_grad_r("energy"):
                 model_predict["force"] = model_ret["energy_derv_r"].squeeze(-2)
             if self.do_grad_c("energy"):
@@ -438,6 +442,8 @@ class SOGEnergyModel(DPModelCommon, SOGEnergyModel_):
             model_predict = {}
             model_predict["atom_energy"] = model_ret["energy"]
             model_predict["energy"] = model_ret["energy_redu"]
+            if "latent_charge" in model_ret:
+                model_predict["latent_charge"] = model_ret["latent_charge"]
             if self.do_grad_r("energy"):
                 model_predict["extended_force"] = model_ret["energy_derv_r"].squeeze(-2)
             if self.do_grad_c("energy"):

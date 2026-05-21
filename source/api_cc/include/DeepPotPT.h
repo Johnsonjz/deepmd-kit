@@ -115,6 +115,23 @@ class DeepPotPT : public DeepPotBackend {
                const std::vector<VALUETYPE>& fparam,
                const std::vector<VALUETYPE>& aparam,
                const bool atomic);
+
+  template <typename VALUETYPE, typename ENERGYVTYPE>
+  void compute_with_charge(ENERGYVTYPE& ener,
+                           std::vector<VALUETYPE>& force,
+                           std::vector<VALUETYPE>& virial,
+                           std::vector<VALUETYPE>& atom_energy,
+                           std::vector<VALUETYPE>& atom_virial,
+                           std::vector<VALUETYPE>& atom_charge,
+                           const std::vector<VALUETYPE>& coord,
+                           const std::vector<int>& atype,
+                           const std::vector<VALUETYPE>& box,
+                           const int nghost,
+                           const InputNlist& lmp_list,
+                           const int& ago,
+                           const std::vector<VALUETYPE>& fparam,
+                           const std::vector<VALUETYPE>& aparam,
+                           const bool atomic);
   /**
    * @brief Evaluate the energy, force, and virial with the mixed type
    *by using this DP.
@@ -304,6 +321,37 @@ class DeepPotPT : public DeepPotBackend {
                 const std::vector<float>& fparam,
                 const std::vector<float>& aparam,
                 const bool atomic);
+
+  void computew_with_charge(std::vector<double>& ener,
+                            std::vector<double>& force,
+                            std::vector<double>& virial,
+                            std::vector<double>& atom_energy,
+                            std::vector<double>& atom_virial,
+                            std::vector<double>& atom_charge,
+                            const std::vector<double>& coord,
+                            const std::vector<int>& atype,
+                            const std::vector<double>& box,
+                            const int nghost,
+                            const InputNlist& inlist,
+                            const int& ago,
+                            const std::vector<double>& fparam,
+                            const std::vector<double>& aparam,
+                            const bool atomic);
+  void computew_with_charge(std::vector<double>& ener,
+                            std::vector<float>& force,
+                            std::vector<float>& virial,
+                            std::vector<float>& atom_energy,
+                            std::vector<float>& atom_virial,
+                            std::vector<float>& atom_charge,
+                            const std::vector<float>& coord,
+                            const std::vector<int>& atype,
+                            const std::vector<float>& box,
+                            const int nghost,
+                            const InputNlist& inlist,
+                            const int& ago,
+                            const std::vector<float>& fparam,
+                            const std::vector<float>& aparam,
+                            const bool atomic);
   void computew_mixed_type(std::vector<double>& ener,
                            std::vector<double>& force,
                            std::vector<double>& virial,

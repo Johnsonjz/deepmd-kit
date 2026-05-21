@@ -56,6 +56,7 @@ class PairDeepMD : public PairDeepBaseModel {
 
  private:
   CommBrickDeepMD* commdata_;
+  bool latent_charge_to_q;
 };
 
 }  // namespace LAMMPS_NS

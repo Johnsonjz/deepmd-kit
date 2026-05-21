@@ -120,7 +120,7 @@ static const char cite_user_deepmd_package[] =
 PairDeepMD::PairDeepMD(LAMMPS* lmp)
     : PairDeepBaseModel(
           lmp, cite_user_deepmd_package, deep_pot, deep_pot_model_devi) {
-  // Constructor body can be empty
+  latent_charge_to_q = false;
 }
 
 PairDeepMD::~PairDeepMD() {
@@ -168,6 +168,7 @@ void PairDeepMD::compute(int eflag, int vflag) {
   double dener(0);
   vector<double> dforce(nall * 3);
   vector<double> dvirial(9, 0);
+  vector<double> dcharge;
   vector<double> dcoord(nall * 3, 0.);
   vector<double> dbox(9, 0);
   vector<double> daparam;
@@ -247,8 +248,22 @@ void PairDeepMD::compute(int eflag, int vflag) {
       // cvflag_atom is the right flag for the cvatom matrix
       if (!(eflag_atom || cvflag_atom)) {
         try {
-          deep_pot.compute(dener, dforce, dvirial, dcoord, dtype, dbox, nghost,
-                           lmp_list, ago, fparam, daparam);
+          if (latent_charge_to_q) {
+#ifdef DP_USE_CXX_API
+            vector<double> deatom_dummy;
+            vector<double> dvatom_dummy;
+            deep_pot.compute_with_charge(
+                dener, dforce, dvirial, deatom_dummy, dvatom_dummy, dcharge,
+                dcoord, dtype, dbox, nghost, lmp_list, ago, fparam, daparam,
+                false);
+#else
+            error->all(FLERR,
+                       "latent_charge_to_q requires DP_USE_CXX_API build");
+#endif
+          } else {
+            deep_pot.compute(dener, dforce, dvirial, dcoord, dtype, dbox,
+                             nghost, lmp_list, ago, fparam, daparam);
+          }
         } catch (deepmd_compat::deepmd_exception& e) {
           error->one(FLERR, e.what());
         }
@@ -258,8 +273,20 @@ void PairDeepMD::compute(int eflag, int vflag) {
         vector<double> deatom(nall * 1, 0);
         vector<double> dvatom(nall * 9, 0);
         try {
-          deep_pot.compute(dener, dforce, dvirial, deatom, dvatom, dcoord,
-                           dtype, dbox, nghost, lmp_list, ago, fparam, daparam);
+          if (latent_charge_to_q) {
+#ifdef DP_USE_CXX_API
+            deep_pot.compute_with_charge(
+                dener, dforce, dvirial, deatom, dvatom, dcharge, dcoord, dtype,
+                dbox, nghost, lmp_list, ago, fparam, daparam, true);
+#else
+            error->all(FLERR,
+                       "latent_charge_to_q requires DP_USE_CXX_API build");
+#endif
+          } else {
+            deep_pot.compute(dener, dforce, dvirial, deatom, dvatom, dcoord,
+                             dtype, dbox, nghost, lmp_list, ago, fparam,
+                             daparam);
+          }
         } catch (deepmd_compat::deepmd_exception& e) {
           error->one(FLERR, e.what());
         }
@@ -504,6 +531,29 @@ void PairDeepMD::compute(int eflag, int vflag) {
     }
   }
 
+  if (latent_charge_to_q) {
+#ifndef DP_USE_CXX_API
+    error->all(FLERR, "latent_charge_to_q requires DP_USE_CXX_API build");
+#endif
+    if (!atom->q) {
+      error->all(FLERR,
+                 "latent_charge_to_q requires an atom style with charge");
+    }
+    if (dcharge.empty()) {
+      error->all(FLERR,
+                 "latent_charge_to_q is enabled but model output has no "
+                 "latent_charge");
+    }
+    if (dcharge.size() < static_cast<size_t>(nlocal)) {
+      error->all(FLERR,
+                 "latent_charge size is smaller than local atom count");
+    }
+    double* q = atom->q;
+    for (int ii = 0; ii < nlocal; ++ii) {
+      q[ii] = dcharge[ii];
+    }
+  }
+
   // get force
   for (int ii = 0; ii < nall; ++ii) {
     for (int dd = 0; dd < 3; ++dd) {
@@ -539,6 +589,7 @@ static bool is_key(const string& input) {
   keys.push_back("relative_v");
   keys.push_back("virtual_len");
   keys.push_back("spin_norm");
+  keys.push_back("latent_charge_to_q");
 
   for (int ii = 0; ii < keys.size(); ++ii) {
     if (input == keys[ii]) {
@@ -601,6 +652,7 @@ void PairDeepMD::settings(int narg, char** arg) {
   out_each = 0;
   out_rel = 0;
   eps = 0.;
+  latent_charge_to_q = false;
   fparam.clear();
   aparam.clear();
   while (iarg < narg) {
@@ -708,6 +760,22 @@ void PairDeepMD::settings(int narg, char** arg) {
         spin_norm[ii] = atof(arg[iarg + ii + 1]);
       }
       iarg += numb_types_spin + 1;
+    } else if (string(arg[iarg]) == string("latent_charge_to_q")) {
+      if (iarg + 1 >= narg) {
+        error->all(FLERR,
+                   "Illegal latent_charge_to_q, expected one bool token");
+      }
+      std::string opt = arg[iarg + 1];
+      if (opt == "1" || opt == "yes" || opt == "on" || opt == "true") {
+        latent_charge_to_q = true;
+      } else if (opt == "0" || opt == "no" || opt == "off" ||
+                 opt == "false") {
+        latent_charge_to_q = false;
+      } else {
+        error->all(FLERR,
+                   "Illegal latent_charge_to_q value, expected yes/no");
+      }
+      iarg += 2;
     }
   }
 
@@ -723,6 +791,10 @@ void PairDeepMD::settings(int narg, char** arg) {
     error->all(
         FLERR,
         "fparam and fparam_from_compute should NOT be set simultaneously");
+  }
+  if (latent_charge_to_q && numb_models > 1) {
+    error->all(FLERR,
+               "latent_charge_to_q only supports single-model deepmd now");
   }
 
   if (comm->me == 0) {
@@ -787,6 +859,11 @@ void PairDeepMD::settings(int narg, char** arg) {
       } else if (dim_aparam > 0) {
         cout << "(aparam)" << endl;
       }
+    }
+    if (latent_charge_to_q) {
+      cout << pre
+           << "latent_charge_to_q:   enabled (write latent_charge to atom->q)"
+           << endl;
     }
   }
 
