@@ -57,6 +57,14 @@ if (test $1 = 1); then
 		sed -i -e "s|^PKG_LIB =[ \t].*|& $NNP_LIB|" ../Makefile.package
 	fi
 
+	echo ""
+	echo "USER-DEEPMD package installed."
+	echo "For SOG FINUFFT backend, build FINUFFT explicitly with:"
+	echo "  ./build_finufft.sh"
+	echo "Then configure one of:"
+	echo "  export DP_SOG_FINUFFT_LIBRARY=/abs/path/to/libfinufft.so"
+	echo "  kspace_style sog ... finufft_library /abs/path/to/libfinufft.so"
+
 elif (test $mode = 0); then
 
 	if (test -e ../Makefile.package); then
