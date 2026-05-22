@@ -140,6 +140,7 @@ class SOGEnergyFittingNet(LRFittingNet):
         M: int | None = None,
         n_dl: float | int = 1.0,
         remove_self_interaction: bool = False,
+        use_charge_constraint: bool = False,
         **kwargs: Any,
     ) -> None:
         super().__init__(
@@ -167,6 +168,7 @@ class SOGEnergyFittingNet(LRFittingNet):
             type_map=type_map,
             use_aparam_as_mask=use_aparam_as_mask,
             default_fparam=default_fparam,
+            use_charge_constraint=use_charge_constraint,
             **kwargs,
         )
         if b is None:

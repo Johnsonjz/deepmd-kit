@@ -2131,6 +2131,9 @@ def fitting_sog_energy() -> list[Argument]:
     doc_remove_self_interaction = (
         "Whether to remove self interaction term in long-range correction."
     )
+    doc_use_charge_constraint = (
+        "Whether to enforce the sum of latent charges equals the target total charge (from fparam column 0)."
+    )
 
     return [
         Argument(
@@ -2288,6 +2291,13 @@ def fitting_sog_energy() -> list[Argument]:
             optional=True,
             default=False,
             doc=doc_only_pt_supported + doc_remove_self_interaction,
+        ),
+        Argument(
+            "use_charge_constraint",
+            bool,
+            optional=True,
+            default=False,
+            doc=doc_only_pt_supported + doc_use_charge_constraint,
         ),
     ]
 

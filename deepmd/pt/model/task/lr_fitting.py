@@ -129,6 +129,7 @@ class LRFittingNet(Fitting):
         type_map: list[str] | None = None,
         use_aparam_as_mask: bool = False,
         default_fparam: list[float] | None = None,
+        use_charge_constraint: bool = False,
         **kwargs: Any,
     ) -> None:
         super().__init__()
@@ -159,6 +160,7 @@ class LRFittingNet(Fitting):
             all(self.trainable) if isinstance(self.trainable, list) else self.trainable
         )
         self.remove_vaccum_contribution = remove_vaccum_contribution
+        self.use_charge_constraint = bool(use_charge_constraint)
         self.bias_atom_q_bound = 3.0
 
         self.sr_net_dim_out = self._sr_net_out_dim()
@@ -393,6 +395,7 @@ class LRFittingNet(Fitting):
             "trainable_lr": [self.trainable] * (len(self.neuron_lr) + 1),
             "layer_name": None,
             "use_aparam_as_mask": self.use_aparam_as_mask,
+            "use_charge_constraint": self.use_charge_constraint,
             "spin": None,
         }
 
@@ -402,6 +405,8 @@ class LRFittingNet(Fitting):
         # Compatibility with old checkpoints.
         data.pop("use_type_embed_for_bias_q", None)
         data.pop("bias_atom_q_type_embed", None)
+        if "use_charge_constraint" not in data:
+            data["use_charge_constraint"] = False
         variables = data.pop("@variables")
         nets_sr = data.pop("nets_sr")
         nets_lr = data.pop("nets_lr")
@@ -657,16 +662,17 @@ class LRFittingNet(Fitting):
         lr_out = lr_out + self._get_lr_bias(atype)
 
         # Hard charge constraint: enforce sum of latent charges equals target total charge.
-        q_mean = lr_out.mean(dim=1)  # [nf, lr_net_dim_out]
-        q_target_per_atom = target_total_charge / float(nloc)  # [nf]
-        if lr_out.shape[-1] > 1:
-            correction = torch.zeros_like(lr_out)
-            correction[:, :, 0] = q_mean[:, 0] - q_target_per_atom
-            lr_out = lr_out - correction
-        else:
-            q_mean = q_mean.unsqueeze(1)  # [nf, 1, 1]
-            target = q_target_per_atom.view(nf, 1, 1)
-            lr_out = lr_out - (q_mean - target)
+        if self.use_charge_constraint:
+            q_mean = lr_out.mean(dim=1)  # [nf, lr_net_dim_out]
+            q_target_per_atom = target_total_charge / float(nloc)  # [nf]
+            if lr_out.shape[-1] > 1:
+                correction = torch.zeros_like(lr_out)
+                correction[:, :, 0] = q_mean[:, 0] - q_target_per_atom
+                lr_out = lr_out - correction
+            else:
+                q_mean = q_mean.unsqueeze(1)  # [nf, 1, 1]
+                target = q_target_per_atom.view(nf, 1, 1)
+                lr_out = lr_out - (q_mean - target)
 
         mask = self.emask(atype).to(torch.bool)
         sr_out = torch.where(mask[:, :, None], sr_out, 0.0)

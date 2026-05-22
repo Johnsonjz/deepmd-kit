@@ -180,13 +180,19 @@ class SOGEnergyModel(DPModelCommon, SOGEnergyModel_):
             )
             corr_redu = _corr_redu(coord_for_grad, latent_charge)
 
-            force_local = -torch.autograd.grad(
+            grad_result = torch.autograd.grad(
                 [corr_redu],
                 [coord_for_grad],
                 grad_outputs=[torch.ones_like(corr_redu)],
                 create_graph=self.training,
                 retain_graph=True,
+                allow_unused=True,
             )[0]
+            force_local = (
+                -grad_result
+                if grad_result is not None
+                else torch.zeros_like(coord_for_grad)
+            )
             out: dict[str, torch.Tensor] = {"corr_redu": corr_redu}
             out["force_local"] = force_local
             if need_virial:
