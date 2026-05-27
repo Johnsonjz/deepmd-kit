@@ -38,6 +38,7 @@ LESEnergyModel_ = make_model(LESEnergyAtomicModel)
 @BaseModel.register("les_ener")
 class LESEnergyModel(DPModelCommon, LESEnergyModel_):
     model_type = "les_ener"
+    fitting_net_type = "les_energy"
 
     def __init__(
         self,

@@ -257,57 +257,9 @@ def _convert_preset_out_bias_to_array(
     return preset_out_bias
 
 
-def get_standard_model(model_params: dict) -> BaseModel:
-    model_params_old = model_params
-    model_params = copy.deepcopy(model_params)
-    ntypes = len(model_params["type_map"])
-    descriptor, fitting, fitting_net_type = _get_standard_model_components(
-        model_params, ntypes
-    )
-    atom_exclude_types = model_params.get("atom_exclude_types", [])
-    pair_exclude_types = model_params.get("pair_exclude_types", [])
-    preset_out_bias = model_params.get("preset_out_bias")
-    preset_out_bias = _convert_preset_out_bias_to_array(
-        preset_out_bias, model_params["type_map"]
-    )
-    data_stat_protect = model_params.get("data_stat_protect", 1e-2)
-
-    if fitting_net_type == "dipole":
-        modelcls = DipoleModel
-    elif fitting_net_type == "polar":
-        modelcls = PolarModel
-    elif fitting_net_type == "dos":
-        modelcls = DOSModel
-    elif fitting_net_type in ["ener", "direct_force_ener"]:
-        modelcls = EnergyModel
-    elif fitting_net_type == "property":
-        modelcls = PropertyModel
-    elif fitting_net_type == "sog_energy":
-        modelcls = SOGEnergyModel
-    elif fitting_net_type == "les_energy":
-        modelcls = LESEnergyModel
-    else:
-        raise RuntimeError(f"Unknown fitting type: {fitting_net_type}")
-
-    model = modelcls(
-        descriptor=descriptor,
-        fitting=fitting,
-        type_map=model_params["type_map"],
-        atom_exclude_types=atom_exclude_types,
-        pair_exclude_types=pair_exclude_types,
-        preset_out_bias=preset_out_bias,
-        data_stat_protect=data_stat_protect,
-    )
-    if model_params.get("hessian_mode"):
-        model.enable_hessian()
-    model.model_def_script = json.dumps(model_params_old)
-    return model
-
-
-def _get_lr_vmap_model(
+def get_standard_model(
     model_params: dict,
-    modelcls: type[BaseModel],
-    expected_fitting_type: str,
+    modelcls: type[BaseModel] | None = None,
 ) -> BaseModel:
     model_params_old = model_params
     model_params = copy.deepcopy(model_params)
@@ -315,12 +267,6 @@ def _get_lr_vmap_model(
     descriptor, fitting, fitting_net_type = _get_standard_model_components(
         model_params, ntypes
     )
-    if fitting_net_type != expected_fitting_type:
-        raise RuntimeError(
-            f"{modelcls.__name__} requires fitting_net.type='{expected_fitting_type}', "
-            f"got '{fitting_net_type}'."
-        )
-
     atom_exclude_types = model_params.get("atom_exclude_types", [])
     pair_exclude_types = model_params.get("pair_exclude_types", [])
     preset_out_bias = model_params.get("preset_out_bias")
@@ -328,6 +274,34 @@ def _get_lr_vmap_model(
         preset_out_bias, model_params["type_map"]
     )
     data_stat_protect = model_params.get("data_stat_protect", 1e-2)
+
+    if modelcls is None:
+        if fitting_net_type == "dipole":
+            modelcls = DipoleModel
+        elif fitting_net_type == "polar":
+            modelcls = PolarModel
+        elif fitting_net_type == "dos":
+            modelcls = DOSModel
+        elif fitting_net_type in ["ener", "direct_force_ener"]:
+            modelcls = EnergyModel
+        elif fitting_net_type == "property":
+            modelcls = PropertyModel
+        else:
+            # Auto-discover from BaseModel plugins
+            for plugin_cls in BaseModel.get_plugins().values():
+                if getattr(plugin_cls, "fitting_net_type", None) == fitting_net_type:
+                    modelcls = plugin_cls
+                    break
+            if modelcls is None:
+                raise RuntimeError(f"Unknown fitting type: {fitting_net_type}")
+
+    # Validate fitting type when modelcls is explicitly provided (e.g. vmap variants)
+    expected_fitting = getattr(modelcls, "fitting_net_type", None)
+    if expected_fitting is not None and fitting_net_type != expected_fitting:
+        raise RuntimeError(
+            f"{modelcls.__name__} requires fitting_net.type='{expected_fitting}', "
+            f"got '{fitting_net_type}'."
+        )
 
     model = modelcls(
         descriptor=descriptor,
@@ -342,22 +316,6 @@ def _get_lr_vmap_model(
         model.enable_hessian()
     model.model_def_script = json.dumps(model_params_old)
     return model
-
-
-def get_sog_vmap_model(model_params: dict) -> BaseModel:
-    return _get_lr_vmap_model(
-        model_params,
-        modelcls=SOGVmapModel,
-        expected_fitting_type="sog_energy",
-    )
-
-
-def get_les_vmap_model(model_params: dict) -> BaseModel:
-    return _get_lr_vmap_model(
-        model_params,
-        modelcls=LESVmapModel,
-        expected_fitting_type="les_energy",
-    )
 
 
 def get_model(model_params: dict) -> Any:
@@ -369,14 +327,14 @@ def get_model(model_params: dict) -> Any:
             return get_zbl_model(model_params)
         else:
             return get_standard_model(model_params)
-    elif model_type == "sog_vmap":
-        return get_sog_vmap_model(model_params)
-    elif model_type == "les_vmap":
-        return get_les_vmap_model(model_params)
     elif model_type == "linear_ener":
         return get_linear_model(model_params)
     else:
-        return BaseModel.get_class_by_type(model_type).get_model(model_params)
+        plugin_cls = BaseModel.get_class_by_type(model_type)
+        if hasattr(plugin_cls, "get_model") and callable(plugin_cls.get_model):
+            return plugin_cls.get_model(model_params)
+        # Fallback: reuse standard model construction logic
+        return get_standard_model(model_params, modelcls=plugin_cls)
 
 
 __all__ = [

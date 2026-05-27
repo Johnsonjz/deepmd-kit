@@ -39,6 +39,7 @@ SOGEnergyModel_ = make_model(SOGEnergyAtomicModel)
 @BaseModel.register("sog_ener")
 class SOGEnergyModel(DPModelCommon, SOGEnergyModel_):
     model_type = "sog_ener"
+    fitting_net_type = "sog_energy"
 
     def __init__(
         self,
