@@ -8,23 +8,17 @@
 #include <array>
 #include <cctype>
 #include <cmath>
-#include <complex>
-#include <cstdint>
-#include <cstdlib>
-#include <limits>
 #include <string>
 #include <vector>
-
-#if !defined(_WIN32)
-#include <dlfcn.h>
-#endif
 
 #include "atom.h"
 #include "comm.h"
 #include "domain.h"
 #include "error.h"
+#include "fft3d_wrap.h"
 #include "force.h"
 #include "math_const.h"
+#include "pair.h"
 
 using namespace LAMMPS_NS;
 using namespace MathConst;
@@ -35,27 +29,8 @@ constexpr double kSOGDefaultB = 1.62976708826776469;
 constexpr double kSOGDefaultSigma = 2.180230445405648;
 constexpr int kSOGDefaultM = 12;
 constexpr double kSOGDefaultFinufftEps = 1e-9;
-
-struct finufft_opts;
-struct finufft_plan_s;
-using finufft_plan = finufft_plan_s *;
-
-struct FinufftApi {
-  using makeplan_fn = int (*)(int, int, const int64_t *, int, int, double,
-                              finufft_plan *, const finufft_opts *);
-  using setpts_fn = int (*)(finufft_plan, int64_t, const double *, const double *,
-                            const double *, int64_t, const double *,
-                            const double *, const double *);
-  using execute_fn = int (*)(finufft_plan, std::complex<double> *,
-                             std::complex<double> *);
-  using destroy_fn = int (*)(finufft_plan);
-
-  void *handle = nullptr;
-  makeplan_fn makeplan = nullptr;
-  setpts_fn setpts = nullptr;
-  execute_fn execute = nullptr;
-  destroy_fn destroy = nullptr;
-};
+constexpr int kSOGMeshAliasExtent = 8;
+constexpr int kPPPMGridOffset = 16384;
 
 std::string to_lower_copy(const std::string &in) {
   std::string out = in;
@@ -65,148 +40,51 @@ std::string to_lower_copy(const std::string &in) {
   return out;
 }
 
-std::string finufft_build_hint() {
-  return "build FINUFFT from https://github.com/flatironinstitute/finufft.git "
-         "(for example: git clone ... && cd finufft && mkdir -p build && cd "
-         "build && cmake .. -DBUILD_SHARED_LIBS=ON -DFINUFFT_STATIC_LINKING=OFF "
-         "&& cmake --build . -j), then set kspace_style sog option "
-         "finufft_library <path-to-libfinufft.so> or env "
-         "DP_SOG_FINUFFT_LIBRARY";
+double sinc(const double x) {
+  if (std::fabs(x) < 1e-14) {
+    return 1.0;
+  }
+  return std::sin(x) / x;
 }
 
-int64_t mode_from_index(const int64_t idx, const int64_t nmode) {
-  return idx - nmode / 2;
+double sinc_pow(const double x, const int p) {
+  const double s = sinc(x);
+  return std::pow(s, static_cast<double>(p));
 }
-
-double to_periodic_angle(const double x, const double xlo, const double prd) {
-  double frac = (x - xlo) / prd;
-  frac -= std::floor(frac);
-  double angle = MY_2PI * frac;
-  if (angle >= MY_PI) {
-    angle -= MY_2PI;
-  }
-  return angle;
-}
-
-#if !defined(_WIN32)
-bool resolve_finufft_symbol(void *handle,
-                            const char *name,
-                            void **symbol,
-                            std::string &error_msg) {
-  dlerror();
-  void *ptr = dlsym(handle, name);
-  const char *err = dlerror();
-  if (err != nullptr || ptr == nullptr) {
-    error_msg = std::string("missing FINUFFT symbol ") + name;
-    if (err != nullptr) {
-      error_msg += std::string(": ") + err;
-    }
-    return false;
-  }
-  *symbol = ptr;
-  return true;
-}
-
-bool try_load_finufft_api(const std::string &preferred,
-                          FinufftApi &api,
-                          std::string &error_msg) {
-  std::string selected_lib;
-  if (!preferred.empty()) {
-    selected_lib = preferred;
-  }
-
-  const char *env_lib = std::getenv("DP_SOG_FINUFFT_LIBRARY");
-  if (selected_lib.empty() && env_lib && std::string(env_lib).size() > 0) {
-    selected_lib = env_lib;
-  }
-
-  if (selected_lib.empty()) {
-    error_msg = "FINUFFT library path is not configured; " + finufft_build_hint();
-    return false;
-  }
-
-  void *handle = dlopen(selected_lib.c_str(), RTLD_NOW | RTLD_LOCAL);
-  if (handle == nullptr) {
-    const char *err = dlerror();
-    error_msg = std::string("failed to load FINUFFT library ") + selected_lib;
-    if (err != nullptr) {
-      error_msg += std::string(": ") + err;
-    }
-    error_msg += "; " + finufft_build_hint();
-    return false;
-  }
-
-  FinufftApi loaded;
-  loaded.handle = handle;
-
-  void *sym = nullptr;
-  std::string local_error;
-
-  if (!resolve_finufft_symbol(handle, "finufft_makeplan", &sym, local_error)) {
-    dlclose(handle);
-    error_msg = local_error;
-    return false;
-  }
-  loaded.makeplan = reinterpret_cast<FinufftApi::makeplan_fn>(sym);
-
-  if (!resolve_finufft_symbol(handle, "finufft_setpts", &sym, local_error)) {
-    dlclose(handle);
-    error_msg = local_error;
-    return false;
-  }
-  loaded.setpts = reinterpret_cast<FinufftApi::setpts_fn>(sym);
-
-  if (!resolve_finufft_symbol(handle, "finufft_execute", &sym, local_error)) {
-    dlclose(handle);
-    error_msg = local_error;
-    return false;
-  }
-  loaded.execute = reinterpret_cast<FinufftApi::execute_fn>(sym);
-
-  if (!resolve_finufft_symbol(handle, "finufft_destroy", &sym, local_error)) {
-    dlclose(handle);
-    error_msg = local_error;
-    return false;
-  }
-  loaded.destroy = reinterpret_cast<FinufftApi::destroy_fn>(sym);
-
-  api = loaded;
-  return true;
-}
-#else
-bool try_load_finufft_api(const std::string &, FinufftApi &, std::string &error_msg) {
-  error_msg = "FINUFFT dynamic loading is only implemented on non-Windows builds";
-  return false;
-}
-#endif
 
 }  // namespace
 
 SOGKSpace::SOGKSpace(LAMMPS *lmp)
-    : PPPM(lmp),
+  : PPPM(lmp),
       accuracy_in(1e-6),
       n_dl(1.0),
+      n_dl_user_specified(false),
+      n_dl_from_model(false),
       remove_self_interaction(false),
-      use_finufft(true),
+      use_finufft(false),
       finufft_eps(kSOGDefaultFinufftEps),
       finufft_library(),
       finufft_warned(false),
+      mesh_oversample(1.5),
+      mesh_alias_extent(kSOGMeshAliasExtent),
       b_param(kSOGDefaultB),
       sigma_param(kSOGDefaultSigma),
       m_param(kSOGDefaultM),
       self_diag_sum(0.0),
       kernel_ready(false) {
-  triclinic_support = 1;
+  triclinic_support = 0;
 }
 
-SOGKSpace::~SOGKSpace() {}
+SOGKSpace::~SOGKSpace() = default;
 
 bool SOGKSpace::is_keyword(const std::string &token) const {
   const std::string key = to_lower_copy(token);
-  return key == "n_dl" || key == "remove_self_interaction" || key == "b" ||
-         key == "sigma" || key == "m" || key == "amp" ||
-         key == "bandwidth" || key == "use_finufft" ||
-         key == "finufft_eps" || key == "finufft_library";
+  return key == "n_dl" || key == "n_dl_from_model" ||
+         key == "remove_self_interaction" || key == "b" || key == "sigma" ||
+         key == "m" || key == "amp" || key == "bandwidth" ||
+         key == "use_finufft" || key == "finufft_eps" ||
+         key == "finufft_library" || key == "mesh_oversample" ||
+         key == "mesh_alias_extent";
 }
 
 bool SOGKSpace::parse_bool_token(const std::string &token, bool &value) const {
@@ -220,6 +98,40 @@ bool SOGKSpace::parse_bool_token(const std::string &token, bool &value) const {
     return true;
   }
   return false;
+}
+
+bool SOGKSpace::try_import_n_dl_from_pair_model(const bool strict_missing) {
+  if (force == nullptr || force->pair == nullptr) {
+    if (strict_missing) {
+      error->all(FLERR,
+                 "kspace style sog n_dl_from_model requires pair_style deepmd");
+    }
+    return false;
+  }
+
+  int dim = 0;
+  void *const raw = force->pair->extract("deepmd_model_n_dl", dim);
+  if (raw == nullptr) {
+    if (strict_missing) {
+      error->all(
+          FLERR,
+          "kspace style sog n_dl_from_model could not find n_dl in model metadata");
+    }
+    return false;
+  }
+
+  const double model_n_dl = *static_cast<double *>(raw);
+  if (!(std::isfinite(model_n_dl) && model_n_dl > 0.0)) {
+    if (strict_missing) {
+      error->all(
+          FLERR,
+          "kspace style sog n_dl_from_model found invalid model n_dl value");
+    }
+    return false;
+  }
+
+  n_dl = model_n_dl;
+  return true;
 }
 
 void SOGKSpace::finalize_kernel_parameters() {
@@ -237,6 +149,12 @@ void SOGKSpace::finalize_kernel_parameters() {
   }
   if (!(std::isfinite(finufft_eps) && finufft_eps > 0.0)) {
     error->all(FLERR, "kspace style sog requires finufft_eps > 0");
+  }
+  if (!(std::isfinite(mesh_oversample) && mesh_oversample >= 1.0)) {
+    error->all(FLERR, "kspace style sog requires mesh_oversample >= 1");
+  }
+  if (mesh_alias_extent < 1) {
+    error->all(FLERR, "kspace style sog requires mesh_alias_extent >= 1");
   }
 
   if (bandwidth.empty()) {
@@ -278,7 +196,7 @@ void SOGKSpace::finalize_kernel_parameters() {
   kernel_ready = true;
 }
 
-double SOGKSpace::kernel_prefactor(const double sqk) const {
+double SOGKSpace::spectral_kernel(const double sqk) const {
   if (!(sqk > 0.0)) {
     return 0.0;
   }
@@ -288,7 +206,7 @@ double SOGKSpace::kernel_prefactor(const double sqk) const {
     coeff += amp[mm] * std::exp(-0.5 * bandwidth[mm] * sqk);
   }
 
-  return (4.0 * MY_PI * coeff / sqk);
+  return coeff;
 }
 
 void SOGKSpace::settings(int narg, char **arg) {
@@ -306,11 +224,15 @@ void SOGKSpace::settings(int narg, char **arg) {
   PPPM::settings(1, base_arg);
 
   n_dl = 1.0;
+  n_dl_user_specified = false;
+  n_dl_from_model = false;
   remove_self_interaction = false;
-  use_finufft = true;
+  use_finufft = false;
   finufft_eps = kSOGDefaultFinufftEps;
   finufft_library.clear();
   finufft_warned = false;
+  mesh_oversample = 1.5;
+  mesh_alias_extent = kSOGMeshAliasExtent;
   b_param = kSOGDefaultB;
   sigma_param = kSOGDefaultSigma;
   m_param = kSOGDefaultM;
@@ -326,6 +248,17 @@ void SOGKSpace::settings(int narg, char **arg) {
         error->all(FLERR, "kspace style sog missing n_dl value");
       }
       n_dl = atof(arg[iarg + 1]);
+      n_dl_user_specified = true;
+      iarg += 2;
+    } else if (key == "n_dl_from_model") {
+      if (iarg + 1 >= narg) {
+        error->all(FLERR, "kspace style sog missing n_dl_from_model value");
+      }
+      bool val = false;
+      if (!parse_bool_token(arg[iarg + 1], val)) {
+        error->all(FLERR, "kspace style sog n_dl_from_model expects yes/no token");
+      }
+      n_dl_from_model = val;
       iarg += 2;
     } else if (key == "remove_self_interaction") {
       if (iarg + 1 >= narg) {
@@ -385,19 +318,49 @@ void SOGKSpace::settings(int narg, char **arg) {
       if (!parse_bool_token(arg[iarg + 1], val)) {
         error->all(FLERR, "kspace style sog use_finufft expects yes/no token");
       }
-      use_finufft = val;
+      use_finufft = false;
+      if (val && comm->me == 0) {
+        error->warning(
+            FLERR,
+            "kspace style sog PPPM path ignores use_finufft=yes; keeping "
+            "mesh-FFT PPPM solver");
+      }
       iarg += 2;
     } else if (key == "finufft_eps") {
       if (iarg + 1 >= narg) {
         error->all(FLERR, "kspace style sog missing finufft_eps value");
       }
       finufft_eps = atof(arg[iarg + 1]);
+      if (comm->me == 0) {
+        error->warning(
+            FLERR,
+            "kspace style sog PPPM path ignores finufft_eps option "
+            "(compatibility parse only)");
+      }
       iarg += 2;
     } else if (key == "finufft_library") {
       if (iarg + 1 >= narg) {
         error->all(FLERR, "kspace style sog missing finufft_library value");
       }
       finufft_library = arg[iarg + 1];
+      if (comm->me == 0) {
+        error->warning(
+            FLERR,
+            "kspace style sog PPPM path ignores finufft_library option "
+            "(compatibility parse only)");
+      }
+      iarg += 2;
+    } else if (key == "mesh_oversample") {
+      if (iarg + 1 >= narg) {
+        error->all(FLERR, "kspace style sog missing mesh_oversample value");
+      }
+      mesh_oversample = atof(arg[iarg + 1]);
+      iarg += 2;
+    } else if (key == "mesh_alias_extent") {
+      if (iarg + 1 >= narg) {
+        error->all(FLERR, "kspace style sog missing mesh_alias_extent value");
+      }
+      mesh_alias_extent = atoi(arg[iarg + 1]);
       iarg += 2;
     } else {
       error->all(FLERR, "Illegal kspace_style sog command");
@@ -408,442 +371,411 @@ void SOGKSpace::settings(int narg, char **arg) {
 }
 
 void SOGKSpace::init() {
+  if (!n_dl_user_specified) {
+    const bool strict = n_dl_from_model;
+    if (try_import_n_dl_from_pair_model(strict)) {
+      kernel_ready = false;
+    }
+  } else if (n_dl_from_model && comm->me == 0) {
+    error->warning(
+        FLERR,
+        "kspace style sog ignores n_dl_from_model because explicit n_dl is set");
+  }
+
+  if (!kernel_ready) {
+    finalize_kernel_parameters();
+  }
+
   if (differentiation_flag != 0) {
     error->all(FLERR,
                "kspace style sog currently supports only kspace_modify diff ik");
   }
-  if (!kernel_ready) {
-    finalize_kernel_parameters();
+  if (domain->triclinic != 0) {
+    error->all(FLERR,
+               "kspace style sog currently supports only orthorhombic boxes");
   }
+  if (slabflag != 0) {
+    error->all(FLERR,
+               "kspace style sog currently requires fully periodic boundaries");
+  }
+
+  if (use_finufft) {
+    if (comm->me == 0) {
+      error->warning(
+          FLERR,
+          "kspace style sog PPPM-level skeleton currently ignores use_finufft and "
+          "uses PPPM mesh path only");
+    }
+    use_finufft = false;
+  }
+
+  // Keep g_ewald finite and fixed. SOG uses custom Green functions and does not
+  // rely on PPPM's Ewald tuning formulas.
+  g_ewald = 1.0;
+  gewaldflag = 1;
+
   PPPM::init();
 }
 
 void SOGKSpace::setup() {
   PPPM::setup();
+}
+
+void SOGKSpace::set_grid_global() {
+  if (!(std::isfinite(n_dl) && n_dl > 0.0)) {
+    error->all(FLERR, "kspace style sog requires n_dl > 0");
+  }
+  if (!(std::isfinite(mesh_oversample) && mesh_oversample >= 1.0)) {
+    error->all(FLERR, "kspace style sog requires mesh_oversample >= 1");
+  }
   if (domain->triclinic != 0) {
-    // PPPM::setup_triclinic() calls non-virtual compute_gf_ik_triclinic().
-    // Rebuild SOG Green's function here to replace Coulomb Green's function.
-    rebuild_sog_greensfn();
-  }
-}
-
-void SOGKSpace::compute_gf_ik() {
-  // For orthorhombic cells PPPM::setup() dispatches here (virtual), so the
-  // SOG kernel is wired directly into the PPPM Green's function build stage.
-  rebuild_sog_greensfn();
-}
-
-void SOGKSpace::rebuild_sog_greensfn() {
-  if (!kernel_ready) {
-    finalize_kernel_parameters();
-  }
-
-  const double k_sq_max = (MY_2PI / n_dl) * (MY_2PI / n_dl);
-
-  const double *const prd = domain->prd;
-  const double xprd = prd[0];
-  const double yprd = prd[1];
-  const double zprd = prd[2];
-  const double zprd_slab = zprd * slab_volfactor;
-  const double unitkx = (MY_2PI / xprd);
-  const double unitky = (MY_2PI / yprd);
-  const double unitkz = (MY_2PI / zprd_slab);
-  const int domain_triclinic = domain->triclinic;
-
-  int n = 0;
-
-  if (domain_triclinic == 0) {
-    for (int m = nzlo_fft; m <= nzhi_fft; ++m) {
-      const int mper = m - nz_pppm * (2 * m / nz_pppm);
-
-      for (int l = nylo_fft; l <= nyhi_fft; ++l) {
-        const int lper = l - ny_pppm * (2 * l / ny_pppm);
-
-        for (int k = nxlo_fft; k <= nxhi_fft; ++k) {
-          const int kper = k - nx_pppm * (2 * k / nx_pppm);
-
-          const double gkx = unitkx * kper;
-          const double gky = unitky * lper;
-          const double gkz = unitkz * mper;
-          const double sqk = gkx * gkx + gky * gky + gkz * gkz;
-
-          if (sqk > 0.0 && sqk <= k_sq_max) {
-            const double kernel = kernel_prefactor(sqk);
-            greensfn[n] = (std::isfinite(kernel) ? kernel : 0.0);
-          } else {
-            greensfn[n] = 0.0;
-          }
-          ++n;
-        }
-      }
-    }
-  } else {
-    for (int m = nzlo_fft; m <= nzhi_fft; ++m) {
-      const int mper = m - nz_pppm * (2 * m / nz_pppm);
-
-      for (int l = nylo_fft; l <= nyhi_fft; ++l) {
-        const int lper = l - ny_pppm * (2 * l / ny_pppm);
-
-        for (int k = nxlo_fft; k <= nxhi_fft; ++k) {
-          const int kper = k - nx_pppm * (2 * k / nx_pppm);
-
-          double unitk_lamda[3];
-          unitk_lamda[0] = MY_2PI * kper;
-          unitk_lamda[1] = MY_2PI * lper;
-          unitk_lamda[2] = MY_2PI * mper;
-          x2lamdaT(&unitk_lamda[0], &unitk_lamda[0]);
-
-          const double sqk = unitk_lamda[0] * unitk_lamda[0] +
-                             unitk_lamda[1] * unitk_lamda[1] +
-                             unitk_lamda[2] * unitk_lamda[2];
-
-          if (sqk > 0.0 && sqk <= k_sq_max) {
-            const double kernel = kernel_prefactor(sqk);
-            greensfn[n] = (std::isfinite(kernel) ? kernel : 0.0);
-          } else {
-            greensfn[n] = 0.0;
-          }
-          ++n;
-        }
-      }
-    }
-  }
-
-  self_diag_sum = 0.0;
-}
-
-bool SOGKSpace::compute_finufft(int eflag, int vflag) {
-  if (!use_finufft) {
-    return false;
-  }
-
-  const bool want_energy_global = (eflag & ENERGY_GLOBAL);
-  const bool want_virial_global =
-      (vflag & (VIRIAL_PAIR | VIRIAL_FDOTR));
-
-  if (domain->triclinic != 0 || comm->nprocs != 1) {
-    if (!finufft_warned) {
-      error->warning(
-          FLERR,
-          "kspace style sog FINUFFT path requires orthorhombic full-3D periodic "
-          "single-rank run; this implementation does not yet support MPI-"
-          "distributed FINUFFT solve. OpenMP threading inside one rank is still "
-          "available via FINUFFT/OMP_NUM_THREADS. Falling back to PPPM path "
-          "(domain->triclinic={}, comm->nprocs={})",
-          domain->triclinic,
-          comm->nprocs);
-      finufft_warned = true;
-    }
-    return false;
-  }
-
-  const int nlocal = atom->nlocal;
-  double qsqsum_local = 0.0;
-  double *q = atom->q;
-  for (int i = 0; i < nlocal; ++i) {
-    qsqsum_local += q[i] * q[i];
-  }
-
-  if (qsqsum_local == 0.0) {
-    energy = 0.0;
-    for (int j = 0; j < 6; ++j) {
-      virial[j] = 0.0;
-    }
-    return true;
-  }
-
-  struct FinufftLoaderState {
-    bool attempted = false;
-    bool available = false;
-    FinufftApi api;
-    std::string error;
-  };
-  static FinufftLoaderState loader;
-
-  if (!loader.attempted) {
-    loader.attempted = true;
-    loader.available = try_load_finufft_api(finufft_library, loader.api, loader.error);
-  }
-
-  if (!loader.available) {
-    if (!finufft_warned) {
-      error->warning(
-          FLERR,
-          "kspace style sog failed to load FINUFFT ({}); falling back to PPPM "
-          "path",
-          loader.error);
-      finufft_warned = true;
-    }
-    return false;
-  }
-
-  if (nlocal <= 0) {
-    energy = 0.0;
-    for (int j = 0; j < 6; ++j) {
-      virial[j] = 0.0;
-    }
-    return true;
+    error->all(FLERR,
+               "kspace style sog currently supports only orthorhombic boxes");
   }
 
   const double xprd = domain->xprd;
   const double yprd = domain->yprd;
   const double zprd = domain->zprd;
-  if (!(xprd > 0.0 && yprd > 0.0 && zprd > 0.0)) {
-    if (!finufft_warned) {
-      error->warning(FLERR,
-                     "kspace style sog encountered non-positive box length in "
-                     "FINUFFT path; falling back to PPPM path");
-      finufft_warned = true;
-    }
-    return false;
+  const double zprd_slab = zprd * slab_volfactor;
+
+  const double mesh_scale = std::max(1.0, mesh_oversample);
+  nx_pppm = std::max(2,
+                     static_cast<int>(std::ceil(mesh_scale * 2.0 * xprd / n_dl)));
+  ny_pppm = std::max(2,
+                     static_cast<int>(std::ceil(mesh_scale * 2.0 * yprd / n_dl)));
+  nz_pppm = std::max(
+      2, static_cast<int>(std::ceil(mesh_scale * 2.0 * zprd_slab / n_dl)));
+
+  if (nx_pppm & 1) {
+    ++nx_pppm;
+  }
+  if (ny_pppm & 1) {
+    ++ny_pppm;
+  }
+  if (nz_pppm & 1) {
+    ++nz_pppm;
   }
 
-  const int nkx = std::max(1, static_cast<int>(xprd / n_dl));
-  const int nky = std::max(1, static_cast<int>(yprd / n_dl));
-  const int nkz = std::max(1, static_cast<int>(zprd / n_dl));
-
-  const int64_t ms = static_cast<int64_t>(2 * nkx + 1);
-  const int64_t mt = static_cast<int64_t>(2 * nky + 1);
-  const int64_t mu = static_cast<int64_t>(2 * nkz + 1);
-  const int64_t nmodes[3] = {ms, mt, mu};
-
-  if (ms <= 0 || mt <= 0 || mu <= 0) {
-    return false;
+  while (!factorable(nx_pppm)) {
+    ++nx_pppm;
+  }
+  while (!factorable(ny_pppm)) {
+    ++ny_pppm;
+  }
+  while (!factorable(nz_pppm)) {
+    ++nz_pppm;
   }
 
-  if (ms > std::numeric_limits<int64_t>::max() / mt ||
-      ms * mt > std::numeric_limits<int64_t>::max() / mu) {
-    if (!finufft_warned) {
-      error->warning(FLERR,
-                     "kspace style sog FINUFFT mode grid is too large; falling "
-                     "back to PPPM path");
-      finufft_warned = true;
-    }
-    return false;
+  h_x = xprd / nx_pppm;
+  h_y = yprd / ny_pppm;
+  h_z = zprd_slab / nz_pppm;
+
+  if (nx_pppm >= kPPPMGridOffset || ny_pppm >= kPPPMGridOffset ||
+      nz_pppm >= kPPPMGridOffset) {
+    error->all(FLERR, "PPPM grid is too large");
   }
-  const size_t ngrid = static_cast<size_t>(ms * mt * mu);
+}
 
-  std::vector<double> xj(static_cast<size_t>(nlocal));
-  std::vector<double> yj(static_cast<size_t>(nlocal));
-  std::vector<double> zj(static_cast<size_t>(nlocal));
-  std::vector<std::complex<double>> q_complex(static_cast<size_t>(nlocal));
+void SOGKSpace::compute_gf_ik() {
+  const double *const prd = domain->prd;
+  const double xprd = prd[0];
+  const double yprd = prd[1];
+  const double zprd = prd[2];
+  const double zprd_slab = zprd * slab_volfactor;
 
-  double **x = atom->x;
-  for (int i = 0; i < nlocal; ++i) {
-    xj[static_cast<size_t>(i)] =
-        to_periodic_angle(x[i][0], domain->boxlo[0], xprd);
-    yj[static_cast<size_t>(i)] =
-        to_periodic_angle(x[i][1], domain->boxlo[1], yprd);
-    zj[static_cast<size_t>(i)] =
-        to_periodic_angle(x[i][2], domain->boxlo[2], zprd);
-    q_complex[static_cast<size_t>(i)] = std::complex<double>(q[i], 0.0);
-  }
-
-  std::vector<std::complex<double>> rho_k(ngrid, std::complex<double>(0.0, 0.0));
-
-  finufft_plan plan1 = nullptr;
-  int ier =
-      loader.api.makeplan(1, 3, nmodes, -1, 1, finufft_eps, &plan1, nullptr);
-  if (ier != 0 || plan1 == nullptr) {
-    if (plan1 != nullptr) {
-      loader.api.destroy(plan1);
-    }
-    if (!finufft_warned) {
-      error->warning(
-          FLERR,
-          "kspace style sog FINUFFT makeplan(type1) failed with code {}; "
-          "falling back to PPPM path",
-          ier);
-      finufft_warned = true;
-    }
-    return false;
-  }
-
-  ier = loader.api.setpts(plan1, static_cast<int64_t>(nlocal), xj.data(), yj.data(),
-                          zj.data(), 0, nullptr, nullptr, nullptr);
-  if (ier == 0) {
-    ier = loader.api.execute(plan1, q_complex.data(), rho_k.data());
-  }
-  loader.api.destroy(plan1);
-  if (ier != 0) {
-    if (!finufft_warned) {
-      error->warning(
-          FLERR,
-          "kspace style sog FINUFFT type1 execution failed with code {}; "
-          "falling back to PPPM path",
-          ier);
-      finufft_warned = true;
-    }
-    return false;
-  }
-
+  const double unitkx = (MY_2PI / xprd);
+  const double unitky = (MY_2PI / yprd);
+  const double unitkz = (MY_2PI / zprd_slab);
   const double k_sq_max = (MY_2PI / n_dl) * (MY_2PI / n_dl);
-  const double twopi_over_x = MY_2PI / xprd;
-  const double twopi_over_y = MY_2PI / yprd;
-  const double twopi_over_z = MY_2PI / zprd;
-  const double volume_local = xprd * yprd * zprd;
+  const int twoorder = 2 * order;
+  const int alias_extent = mesh_alias_extent;
 
-  double energy_local = 0.0;
-  double diag_sum = 0.0;
+  if (greensfn_energy.size() != static_cast<size_t>(nfft)) {
+    greensfn_energy.assign(static_cast<size_t>(nfft), 0.0);
+  }
 
-  std::vector<std::complex<double>> grad_kx(
-      ngrid, std::complex<double>(0.0, 0.0));
-  std::vector<std::complex<double>> grad_ky(
-      ngrid, std::complex<double>(0.0, 0.0));
-  std::vector<std::complex<double>> grad_kz(
-      ngrid, std::complex<double>(0.0, 0.0));
+  int n = 0;
+  double diag_sum_local = 0.0;
 
-  for (int64_t iz = 0; iz < mu; ++iz) {
-    const int64_t kz_mode = mode_from_index(iz, mu);
-    const double kz = twopi_over_z * static_cast<double>(kz_mode);
-    for (int64_t iy = 0; iy < mt; ++iy) {
-      const int64_t ky_mode = mode_from_index(iy, mt);
-      const double ky = twopi_over_y * static_cast<double>(ky_mode);
-      for (int64_t ix = 0; ix < ms; ++ix) {
-        const int64_t kx_mode = mode_from_index(ix, ms);
-        const double kx = twopi_over_x * static_cast<double>(kx_mode);
+  for (int m = nzlo_fft; m <= nzhi_fft; ++m) {
+    const int mper = m - nz_pppm * (2 * m / nz_pppm);
+    const double kz = unitkz * static_cast<double>(mper);
+    const double snz = std::pow(std::sin(0.5 * kz * h_z), 2.0);
+
+    for (int l = nylo_fft; l <= nyhi_fft; ++l) {
+      const int lper = l - ny_pppm * (2 * l / ny_pppm);
+      const double ky = unitky * static_cast<double>(lper);
+      const double sny = std::pow(std::sin(0.5 * ky * h_y), 2.0);
+
+      for (int k = nxlo_fft; k <= nxhi_fft; ++k) {
+        const int kper = k - nx_pppm * (2 * k / nx_pppm);
+        const double kx = unitkx * static_cast<double>(kper);
+        const double snx = std::pow(std::sin(0.5 * kx * h_x), 2.0);
 
         const double sqk = kx * kx + ky * ky + kz * kz;
         if (!(sqk > 0.0 && sqk <= k_sq_max)) {
+          greensfn[n] = 0.0;
+          greensfn_energy[static_cast<size_t>(n)] = 0.0;
+          ++n;
           continue;
         }
 
-        double kfac = 0.0;
-        for (size_t mm = 0; mm < amp.size(); ++mm) {
-          kfac += amp[mm] * std::exp(-0.5 * bandwidth[mm] * sqk);
-        }
-        if (!std::isfinite(kfac) || kfac == 0.0) {
+        const double denominator = gf_denom(snx, sny, snz);
+        if (!(denominator > 1e-24) || !std::isfinite(denominator)) {
+          greensfn[n] = 0.0;
+          greensfn_energy[static_cast<size_t>(n)] = 0.0;
+          ++n;
           continue;
         }
 
-        const size_t idx =
-            static_cast<size_t>(ix + ms * (iy + mt * iz));
-        const std::complex<double> rho = rho_k[idx];
-        energy_local += kfac * std::norm(rho);
-        diag_sum += kfac;
+        double sum0 = 0.0;
+        double sum1 = 0.0;
+        for (int nx_alias = -alias_extent; nx_alias <= alias_extent; ++nx_alias) {
+          const double qx =
+              unitkx * static_cast<double>(kper + nx_pppm * nx_alias);
+          const double wx = sinc_pow(0.5 * qx * h_x, twoorder);
 
-        const std::complex<double> conv = kfac * rho;
-        grad_kx[idx] = std::complex<double>(0.0, kx) * conv;
-        grad_ky[idx] = std::complex<double>(0.0, ky) * conv;
-        grad_kz[idx] = std::complex<double>(0.0, kz) * conv;
+          for (int ny_alias = -alias_extent; ny_alias <= alias_extent;
+               ++ny_alias) {
+            const double qy =
+                unitky * static_cast<double>(lper + ny_pppm * ny_alias);
+            const double wy = sinc_pow(0.5 * qy * h_y, twoorder);
+
+            for (int nz_alias = -alias_extent; nz_alias <= alias_extent;
+                 ++nz_alias) {
+              const double qz =
+                  unitkz * static_cast<double>(mper + nz_pppm * nz_alias);
+              const double wz = sinc_pow(0.5 * qz * h_z, twoorder);
+
+              const double qsq = qx * qx + qy * qy + qz * qz;
+              if (!(qsq > 0.0 && qsq <= k_sq_max)) {
+                continue;
+              }
+
+              const double kfac = spectral_kernel(qsq);
+              if (!std::isfinite(kfac) || kfac == 0.0) {
+                continue;
+              }
+
+              const double w2 = wx * wy * wz;
+              sum0 += kfac * w2;
+              const double dot1 = kx * qx + ky * qy + kz * qz;
+              sum1 += dot1 * kfac * w2;
+            }
+          }
+        }
+
+        const double geff_energy = sum0 / denominator;
+        const double geff_force = sum1 / (sqk * denominator);
+        if (!std::isfinite(geff_energy) || !std::isfinite(geff_force)) {
+          greensfn[n] = 0.0;
+          greensfn_energy[static_cast<size_t>(n)] = 0.0;
+          ++n;
+          continue;
+        }
+
+        const double w2_principal =
+            sinc_pow(0.5 * kx * h_x, twoorder) *
+            sinc_pow(0.5 * ky * h_y, twoorder) *
+            sinc_pow(0.5 * kz * h_z, twoorder);
+        if (w2_principal > 1e-20) {
+          diag_sum_local += sum0 / w2_principal;
+        }
+
+        greensfn[n] = geff_force;
+        greensfn_energy[static_cast<size_t>(n)] = geff_energy;
+        ++n;
       }
     }
   }
 
-  energy_local /= (2.0 * volume_local);
-  if (remove_self_interaction) {
-    energy_local -= qsqsum_local * (diag_sum / (2.0 * volume_local));
+  double diag_sum_all = 0.0;
+  MPI_Allreduce(&diag_sum_local, &diag_sum_all, 1, MPI_DOUBLE, MPI_SUM, world);
+  self_diag_sum = diag_sum_all / (2.0 * volume);
+}
+
+void SOGKSpace::poisson_ik() {
+  int i, j, k, n;
+  double eng;
+
+  n = 0;
+  for (i = 0; i < nfft; i++) {
+    work1[n++] = density_fft[i];
+    work1[n++] = 0.0;
   }
 
-  finufft_plan plan2 = nullptr;
-  ier = loader.api.makeplan(2, 3, nmodes, 1, 1, finufft_eps, &plan2, nullptr);
-  if (ier != 0 || plan2 == nullptr) {
-    if (plan2 != nullptr) {
-      loader.api.destroy(plan2);
-    }
-    if (!finufft_warned) {
-      error->warning(
-          FLERR,
-          "kspace style sog FINUFFT makeplan(type2) failed with code {}; "
-          "falling back to PPPM path",
-          ier);
-      finufft_warned = true;
-    }
-    return false;
-  }
+  fft1->compute(work1, work1, FFT3d::FORWARD);
 
-  ier = loader.api.setpts(plan2, static_cast<int64_t>(nlocal), xj.data(), yj.data(),
-                          zj.data(), 0, nullptr, nullptr, nullptr);
+  const bigint ngridtotal = static_cast<bigint>(nx_pppm) * ny_pppm * nz_pppm;
+  const double scaleinv = 1.0 / static_cast<double>(ngridtotal);
+  const double s2 = scaleinv * scaleinv;
 
-  std::vector<std::complex<double>> grad_x(static_cast<size_t>(nlocal));
-  std::vector<std::complex<double>> grad_y(static_cast<size_t>(nlocal));
-  std::vector<std::complex<double>> grad_z(static_cast<size_t>(nlocal));
-
-  if (ier == 0) {
-    ier = loader.api.execute(plan2, grad_x.data(), grad_kx.data());
-  }
-  if (ier == 0) {
-    ier = loader.api.execute(plan2, grad_y.data(), grad_ky.data());
-  }
-  if (ier == 0) {
-    ier = loader.api.execute(plan2, grad_z.data(), grad_kz.data());
-  }
-  loader.api.destroy(plan2);
-
-  if (ier != 0) {
-    if (!finufft_warned) {
-      error->warning(
-          FLERR,
-          "kspace style sog FINUFFT type2 execution failed with code {}; "
-          "falling back to PPPM path",
-          ier);
-      finufft_warned = true;
-    }
-    return false;
-  }
-
-  const double qscale_local = force->qqrd2e;
-  double **f = atom->f;
-  std::array<double, 6> virial_acc = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
-
-  for (int i = 0; i < nlocal; ++i) {
-    const double qi = q[i];
-    const double fx = -qi * grad_x[static_cast<size_t>(i)].real() / volume_local;
-    const double fy = -qi * grad_y[static_cast<size_t>(i)].real() / volume_local;
-    const double fz = -qi * grad_z[static_cast<size_t>(i)].real() / volume_local;
-
-    const double fxs = qscale_local * fx;
-    const double fys = qscale_local * fy;
-    const double fzs = qscale_local * fz;
-
-    f[i][0] += fxs;
-    f[i][1] += fys;
-    f[i][2] += fzs;
-
-    if (want_virial_global) {
-      const double rx = x[i][0];
-      const double ry = x[i][1];
-      const double rz = x[i][2];
-      virial_acc[0] += rx * fxs;
-      virial_acc[1] += ry * fys;
-      virial_acc[2] += rz * fzs;
-      virial_acc[3] += rx * fys;
-      virial_acc[4] += rx * fzs;
-      virial_acc[5] += ry * fzs;
+  if (eflag_global || vflag_global) {
+    if (vflag_global) {
+      n = 0;
+      for (i = 0; i < nfft; i++) {
+        eng = s2 * greensfn_energy[static_cast<size_t>(i)] *
+              (work1[n] * work1[n] + work1[n + 1] * work1[n + 1]);
+        for (j = 0; j < 6; j++) {
+          virial[j] += eng * vg[i][j];
+        }
+        if (eflag_global) {
+          energy += eng;
+        }
+        n += 2;
+      }
+    } else {
+      n = 0;
+      for (i = 0; i < nfft; i++) {
+        energy += s2 * greensfn_energy[static_cast<size_t>(i)] *
+                  (work1[n] * work1[n] + work1[n + 1] * work1[n + 1]);
+        n += 2;
+      }
     }
   }
 
-  if (want_energy_global) {
-    energy = qscale_local * energy_local;
-  } else {
-    energy = 0.0;
+  n = 0;
+  for (i = 0; i < nfft; i++) {
+    work1[n++] *= scaleinv * greensfn[i];
+    work1[n++] *= scaleinv * greensfn[i];
   }
 
-  if (want_virial_global) {
-    for (int j = 0; j < 6; ++j) {
-      virial[j] = virial_acc[static_cast<size_t>(j)];
-    }
-  } else {
-    for (int j = 0; j < 6; ++j) {
-      virial[j] = 0.0;
-    }
+  if (evflag_atom) {
+    poisson_peratom();
   }
 
-  return true;
+  if (triclinic) {
+    poisson_ik_triclinic();
+    return;
+  }
+
+  n = 0;
+  for (k = nzlo_fft; k <= nzhi_fft; k++)
+    for (j = nylo_fft; j <= nyhi_fft; j++)
+      for (i = nxlo_fft; i <= nxhi_fft; i++) {
+        work2[n] = -fkx[i] * work1[n + 1];
+        work2[n + 1] = fkx[i] * work1[n];
+        n += 2;
+      }
+
+  fft2->compute(work2, work2, FFT3d::BACKWARD);
+
+  n = 0;
+  for (k = nzlo_in; k <= nzhi_in; k++)
+    for (j = nylo_in; j <= nyhi_in; j++)
+      for (i = nxlo_in; i <= nxhi_in; i++) {
+        vdx_brick[k][j][i] = work2[n];
+        n += 2;
+      }
+
+  n = 0;
+  for (k = nzlo_fft; k <= nzhi_fft; k++)
+    for (j = nylo_fft; j <= nyhi_fft; j++)
+      for (i = nxlo_fft; i <= nxhi_fft; i++) {
+        work2[n] = -fky[j] * work1[n + 1];
+        work2[n + 1] = fky[j] * work1[n];
+        n += 2;
+      }
+
+  fft2->compute(work2, work2, FFT3d::BACKWARD);
+
+  n = 0;
+  for (k = nzlo_in; k <= nzhi_in; k++)
+    for (j = nylo_in; j <= nyhi_in; j++)
+      for (i = nxlo_in; i <= nxhi_in; i++) {
+        vdy_brick[k][j][i] = work2[n];
+        n += 2;
+      }
+
+  n = 0;
+  for (k = nzlo_fft; k <= nzhi_fft; k++)
+    for (j = nylo_fft; j <= nyhi_fft; j++)
+      for (i = nxlo_fft; i <= nxhi_fft; i++) {
+        work2[n] = -fkz[k] * work1[n + 1];
+        work2[n + 1] = fkz[k] * work1[n];
+        n += 2;
+      }
+
+  fft2->compute(work2, work2, FFT3d::BACKWARD);
+
+  n = 0;
+  for (k = nzlo_in; k <= nzhi_in; k++)
+    for (j = nylo_in; j <= nyhi_in; j++)
+      for (i = nxlo_in; i <= nxhi_in; i++) {
+        vdz_brick[k][j][i] = work2[n];
+        n += 2;
+      }
 }
 
 void SOGKSpace::compute(int eflag, int vflag) {
-  if (compute_finufft(eflag, vflag)) {
-    return;
+  const bool want_virial_global = (vflag & (VIRIAL_PAIR | VIRIAL_FDOTR));
+  const int nlocal = atom->nlocal;
+  std::vector<double> force_before;
+  if (want_virial_global && nlocal > 0) {
+    force_before.resize(static_cast<size_t>(3 * nlocal), 0.0);
+    for (int i = 0; i < nlocal; ++i) {
+      force_before[static_cast<size_t>(3 * i + 0)] = atom->f[i][0];
+      force_before[static_cast<size_t>(3 * i + 1)] = atom->f[i][1];
+      force_before[static_cast<size_t>(3 * i + 2)] = atom->f[i][2];
+    }
   }
-  PPPM::compute(eflag, vflag);
-}
 
-void SOGKSpace::fieldforce_ik() {
-  PPPM::fieldforce_ik();
+  // Disable PPPM's built-in global virial accumulation (Ewald-form vg).
+  // We reconstruct SOG-consistent global virial from this kspace force increment.
+  const int vflag_pppm = vflag & ~(VIRIAL_PAIR | VIRIAL_FDOTR);
+  PPPM::compute(eflag, vflag_pppm);
+
+  if (!eflag_global || qsqsum == 0.0) {
+    // Still rebuild virial when requested even if energy flag is off.
+    if (!want_virial_global) {
+      return;
+    }
+  }
+
+  if (eflag_global && qsqsum != 0.0) {
+    const double qscale = qqrd2e * scale;
+    // PPPM::compute always applies Ewald self/background terms. Undo them for SOG.
+    energy += qscale *
+              (g_ewald * qsqsum / MY_PIS +
+               MY_PI2 * qsum * qsum / (g_ewald * g_ewald * volume));
+
+    if (remove_self_interaction) {
+      energy -= qscale * qsqsum * self_diag_sum;
+    }
+  }
+
+  if (want_virial_global) {
+    std::array<double, 6> virial_local = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
+    double **x = atom->x;
+    double **f = atom->f;
+    for (int i = 0; i < nlocal; ++i) {
+      const double dfx =
+          f[i][0] - force_before[static_cast<size_t>(3 * i + 0)];
+      const double dfy =
+          f[i][1] - force_before[static_cast<size_t>(3 * i + 1)];
+      const double dfz =
+          f[i][2] - force_before[static_cast<size_t>(3 * i + 2)];
+
+      virial_local[0] += x[i][0] * dfx;
+      virial_local[1] += x[i][1] * dfy;
+      virial_local[2] += x[i][2] * dfz;
+      virial_local[3] += x[i][0] * dfy;
+      virial_local[4] += x[i][0] * dfz;
+      virial_local[5] += x[i][1] * dfz;
+    }
+
+    double virial_all[6] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
+    MPI_Allreduce(virial_local.data(), virial_all, 6, MPI_DOUBLE, MPI_SUM, world);
+    for (int j = 0; j < 6; ++j) {
+      virial[j] = virial_all[j];
+    }
+  }
 }
 
 double SOGKSpace::memory_usage() {
-  return PPPM::memory_usage() +
-         static_cast<double>((amp.size() + bandwidth.size()) * sizeof(double));
+  const double pppm_bytes = PPPM::memory_usage();
+  const size_t param_bytes =
+      (amp.capacity() + bandwidth.capacity() + greensfn_energy.capacity()) *
+      sizeof(double);
+  return pppm_bytes + static_cast<double>(param_bytes);
 }

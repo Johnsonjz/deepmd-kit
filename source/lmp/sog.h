@@ -12,6 +12,7 @@ KSpaceStyle(sog, SOGKSpace)
 #include <vector>
 
 #include "pppm.h"
+#include "lmpfftsettings.h"
 
 namespace LAMMPS_NS {
 
@@ -27,24 +28,29 @@ class SOGKSpace : public PPPM {
   double memory_usage() override;
 
  protected:
+  void set_grid_global() override;
   void compute_gf_ik() override;
-  void fieldforce_ik() override;
+  void poisson_ik() override;
 
  private:
   bool is_keyword(const std::string& token) const;
   bool parse_bool_token(const std::string& token, bool& value) const;
+  bool try_import_n_dl_from_pair_model(bool strict_missing);
   void finalize_kernel_parameters();
-  double kernel_prefactor(const double sqk) const;
-  void rebuild_sog_greensfn();
-  bool compute_finufft(int eflag, int vflag);
+  double spectral_kernel(const double sqk) const;
 
   double accuracy_in;
   double n_dl;
+  bool n_dl_user_specified;
+  bool n_dl_from_model;
   bool remove_self_interaction;
   bool use_finufft;
   double finufft_eps;
   std::string finufft_library;
   bool finufft_warned;
+
+  double mesh_oversample;
+  int mesh_alias_extent;
 
   double b_param;
   double sigma_param;
@@ -52,9 +58,11 @@ class SOGKSpace : public PPPM {
   double self_diag_sum;
 
   bool kernel_ready;
+
+  std::vector<double> greensfn_energy;
+
   std::vector<double> amp;
   std::vector<double> bandwidth;
-  std::vector<double> fele;
 };
 
 }  // namespace LAMMPS_NS
