@@ -1,88 +1,146 @@
 LAMMPS (22 Jul 2025 - Update 4)
-units           metal
-plugin          load /data/zyjin/dp_pt/dp_devel/deepmd-kit-devel/build/sog_lmp_stable/lmp/plugin/libdeepmd_lmp.so
-Loading plugin: deepmd pair style v3.1.3-83-g3cba3c7a-dirty by Han Wang
-Loading plugin: deepspin pair style v3.1.3-83-g3cba3c7a-dirty by Duo Zhang
-Loading plugin: compute deeptensor/atom v3.1.3-83-g3cba3c7a-dirty by Han Wang
-Loading plugin: fix dplr v3.1.3-83-g3cba3c7a-dirty by Han Wang
-Loading plugin: kspace pppm/dplr v3.1.3-83-g3cba3c7a-dirty by Han Wang
-Loading plugin: kspace les v3.1.3-83-g3cba3c7a-dirty by DeepMD contributors
-Loading plugin: kspace sog v3.1.3-83-g3cba3c7a-dirty by DeepMD contributors
-atom_style      charge
-region          box block 0 10 0 10 0 10
-create_box      1 box
-Created orthogonal box = (0 0 0) to (10 10 10)
+units metal
+plugin load /data/zyjin/dp_pt/dp_devel/deepmd-kit-devel/build/sog_lmp_cxxdbg/lmp/plugin/libdeepmd_lmp.so
+Loading plugin: deepmd pair style v3.1.3-86-g12e2fc71-dirty by Han Wang
+Loading plugin: deepspin pair style v3.1.3-86-g12e2fc71-dirty by Duo Zhang
+Loading plugin: compute deeptensor/atom v3.1.3-86-g12e2fc71-dirty by Han Wang
+Loading plugin: fix dplr v3.1.3-86-g12e2fc71-dirty by Han Wang
+Loading plugin: kspace pppm/dplr v3.1.3-86-g12e2fc71-dirty by Han Wang
+Loading plugin: kspace les v3.1.3-86-g12e2fc71-dirty by DeepMD contributors
+Loading plugin: kspace sog v3.1.3-86-g12e2fc71-dirty by DeepMD contributors
+atom_style charge
+boundary p p p
+read_data /data/zyjin/dp_pt/dp_example/au-mgo/lmp/progress_report_20260601/results/lammps_md_20260602/stable.data
+Reading data file ...
+  orthogonal box = (0 0 0) to (9.0474307 9.0474307 26.458861)
   1 by 1 by 1 MPI processor grid
-create_atoms    1 single 5.0 5.0 5.0
-Created 1 atoms
-  using lattice units in orthogonal box = (0 0 0) to (10 10 10)
-  create_atoms CPU = 0.000 seconds
-mass            1 1.0
-set             atom 1 charge 0.1
-Setting atom values ...
-  1 settings made for charge
+  reading atoms ...
+  110 atoms
+  read_data CPU = 0.001 seconds
+mass 1 24.305
+mass 2 15.999
+mass 3 26.9815385
+mass 4 196.96657
+neighbor 1.0 bin
+neigh_modify every 1 delay 0 check yes
+thermo 20
+thermo_style custom step temp press pe ke etotal
+thermo_modify flush yes
+timestep 0.0005
+velocity all create 300.0 20260602 mom yes rot yes dist gaussian
+pair_style deepmd /tmp/sog_model_frozen_try.pth sog_sr yes
+Summary of lammps deepmd module ...
+  >>> Info of deepmd-kit:
+  installed to:       /usr/local
+  source:             v3.1.3-86-g12e2fc71-dirty
+  source branch:      sog-lmp
+  source commit:      12e2fc71
+  source commit at:   2026-05-27 14:06:36 +0800
+  support model ver.: 1.1 
+  build variant:      cpu
+  build with pt lib:  torch;torch_library;/home/zyjin/anaconda3/envs/base_env/lib/python3.13/site-packages/torch/lib/libc10.so;/usr/local/cuda/lib64/libnvrtc.so;/home/zyjin/anaconda3/envs/base_env/lib/python3.13/site-packages/torch/lib/libc10_cuda.so
+  set tf intra_op_parallelism_threads: 16
+  set tf inter_op_parallelism_threads: 1
+  >>> Info of lammps module:
+  use deepmd-kit at:  /usr/local
+  source:             v3.1.3-86-g12e2fc71-dirty
+  source branch:      sog-lmp
+  source commit:      12e2fc71
+  source commit at:   2026-05-27 14:06:36 +0800
+  build with inc:     /home/zyjin/anaconda3/envs/base_env/lib/python3.13/site-packages/torch/include;/home/zyjin/anaconda3/envs/base_env/lib/python3.13/site-packages/torch/include/torch/csrc/api/include
+  build with lib:     /home/zyjin/anaconda3/envs/base_env/lib/python3.13/site-packages/torch/lib
+WARNING: pair_style deepmd sog_sr=yes enables latent_charge_to_q automatically (/data/zyjin/dp_pt/dp_devel/deepmd-kit-devel/source/lmp/pair_deepmd.cpp:919)
+pair_coeff * *
+include /data/zyjin/dp_pt/dp_example/au-mgo/lmp/progress_report_20260601/results/lammps_md_20260602/kspace_sog.inc
+# Auto-generated from sog_model.ckpt; do not edit manually.
+kspace_style sog 9.9999999999999995e-07 n_dl_from_model yes amp_from_model yes bandwidth_from_model yes b 1.6297670882677646 sigma 3.6337174090094129 m 16 remove_self_interaction yes
+run 0
 
-pair_style      coul/long 6.0
-pair_coeff      * *
+CITE-CITE-CITE-CITE-CITE-CITE-CITE-CITE-CITE-CITE-CITE-CITE-CITE
 
-kspace_style    sog 1.0e-6 amp 0.1 bandwidth 0.5
-thermo_style    custom step pe
-thermo          1
-run             0
+Your simulation uses code contributions which should be cited:
+
+- USER-DEEPMD package:
+
+@article{Wang_ComputPhysCommun_2018_v228_p178,
+  author = {Wang, Han and Zhang, Linfeng and Han, Jiequn and E, Weinan},
+  doi = {10.1016/j.cpc.2018.03.016},
+  url = {https://doi.org/10.1016/j.cpc.2018.03.016},
+  year = 2018,
+  month = {jul},
+  publisher = {Elsevier {BV}},
+  volume = 228,
+  journal = {Comput. Phys. Commun.},
+  title = {{DeePMD-kit: A deep learning package for many-body potential energy representation and molecular dynamics}},
+  pages = {178--184}
+}
+@article{Zeng_JChemPhys_2023_v159_p054801,
+  title  = {{DeePMD-kit v2: A software package for deep potential models}},
+  author =   {Jinzhe Zeng and Duo Zhang and Denghui Lu and Pinghui Mo and Zeyu Li
+         and Yixiao Chen and Mari{\'a}n Rynik and Li'ang Huang and Ziyao Li and 
+         Shaochen Shi and Yingze Wang and Haotian Ye and Ping Tuo and Jiabin
+         Yang and Ye Ding and Yifan Li and Davide Tisi and Qiyu Zeng and Han 
+         Bao and Yu Xia and Jiameng Huang and Koki Muraoka and Yibo Wang and 
+         Junhan Chang and Fengbo Yuan and Sigbj{\o}rn L{\o}land Bore and Chun
+         Cai and Yinnian Lin and Bo Wang and Jiayan Xu and Jia-Xin Zhu and 
+         Chenxing Luo and Yuzhi Zhang and Rhys E A Goodall and Wenshuo Liang
+         and Anurag Kumar Singh and Sikai Yao and Jingchao Zhang and Renata
+         Wentzcovitch and Jiequn Han and Jie Liu and Weile Jia and Darrin M
+         York and Weinan E and Roberto Car and Linfeng Zhang and Han Wang},
+  journal =  {J. Chem. Phys.},
+  volume =   159,
+  issue =    5,  
+  year =    2023,
+  pages  =   054801,
+  doi =      {10.1063/5.0155600},
+}
+@Article{Zeng_JChemTheoryComput_2025_v21_p4375,
+  author =   {Jinzhe Zeng and Duo Zhang and Anyang Peng and Xiangyu Zhang and Sensen
+             He and Yan Wang and Xinzijian Liu and Hangrui Bi and Yifan Li and Chun
+             Cai and Chengqian Zhang and Yiming Du and Jia-Xin Zhu and Pinghui Mo
+             and Zhengtao Huang and Qiyu Zeng and Shaochen Shi and Xuejian Qin and
+             Zhaoxi Yu and Chenxing Luo and Ye Ding and Yun-Pei Liu and Ruosong Shi
+             and Zhenyu Wang and Sigbj{\o}rn L{\o}land Bore and Junhan Chang and
+             Zhe Deng and Zhaohan Ding and Siyuan Han and Wanrun Jiang and Guolin
+             Ke and Zhaoqing Liu and Denghui Lu and Koki Muraoka and Hananeh Oliaei
+             and Anurag Kumar Singh and Haohui Que and Weihong Xu and Zhangmancang
+             Xu and Yong-Bin Zhuang and Jiayu Dai and Timothy J. Giese and Weile
+             Jia and Ben Xu and Darrin M. York and Linfeng Zhang and Han Wang},
+    title =    {{DeePMD-kit v3: A Multiple-Backend Framework for Machine Learning
+             Potentials}},
+  journal =  {J. Chem. Theory Comput.},
+  year =     2025,
+  volume =   21,
+  number =   9,
+  pages =    {4375--4385},
+  doi =      {10.1021/acs.jctc.5c00340},
+}
+
+CITE-CITE-CITE-CITE-CITE-CITE-CITE-CITE-CITE-CITE-CITE-CITE-CITE
+
 WARNING: No fixes with time integration, atoms won't move
 For more information see https://docs.lammps.org/err0028 (src/verlet.cpp:60)
 PPPM initialization ...
-WARNING: System is not charge neutral, net charge = 0.1
-For more information see https://docs.lammps.org/err0029 (src/kspace.cpp:335)
   using 12-bit tables for long-range coulomb
 WARNING: For better accuracy use 'pair_modify table 0' (src/kspace.cpp:373)
   G vector (1/distance) = 1
-  grid = 30 30 30
+  grid = 20 20 54
   stencil order = 5
-  estimated absolute RMS force accuracy = 3.4929588e-07
-  estimated relative force accuracy = 2.4257256e-08
+  estimated absolute RMS force accuracy = 1.5438285e-06
+  estimated relative force accuracy = 1.0721295e-07
   using double precision KISS FFT
-  3d grid and FFT values/proc = 68921 27000
-Generated 0 of 0 mixed pair_coeff terms from geometric mixing rule
+  3d grid and FFT values/proc = 44469 21600
+Generated 0 of 6 mixed pair_coeff terms from geometric mixing rule
 Neighbor list info ...
   update: every = 1 steps, delay = 0 steps, check = yes
   max neighbors/atom: 2000, page size: 100000
-  master list distance cutoff = 8
-  ghost atom cutoff = 8
-  binsize = 4, bins = 3 3 3
+  master list distance cutoff = 7
+  ghost atom cutoff = 7
+  binsize = 3.5, bins = 3 3 8
   1 neighbor lists, perpetual/occasional/extra = 1 0 0
-  (1) pair coul/long, perpetual
-      attributes: half, newton on
-      pair build: half/bin/atomonly/newton
-      stencil: half/bin/3d
+  (1) pair deepmd, perpetual
+      attributes: full, newton on
+      pair build: full/bin/atomonly
+      stencil: full/bin/3d
       bin: standard
-Per MPI rank memory allocation (min/avg/max) = 8.426 | 8.426 | 8.426 Mbytes
-   Step         PotEng    
-         0   0.001285803  
-Loop time of 1.302e-06 on 1 procs for 0 steps with 1 atoms
-
-153.6% CPU use with 1 MPI tasks x no OpenMP threads
-
-MPI task timing breakdown:
-Section |  min time  |  avg time  |  max time  |%varavg| %total
----------------------------------------------------------------
-Pair    | 0          | 0          | 0          |   0.0 |  0.00
-Kspace  | 0          | 0          | 0          |   0.0 |  0.00
-Neigh   | 0          | 0          | 0          |   0.0 |  0.00
-Comm    | 0          | 0          | 0          |   0.0 |  0.00
-Output  | 0          | 0          | 0          |   0.0 |  0.00
-Modify  | 0          | 0          | 0          |   0.0 |  0.00
-Other   |            | 1.302e-06  |            |       |100.00
-
-Nlocal:              1 ave           1 max           1 min
-Histogram: 1 0 0 0 0 0 0 0 0 0
-Nghost:             26 ave          26 max          26 min
-Histogram: 1 0 0 0 0 0 0 0 0 0
-Neighs:              0 ave           0 max           0 min
-Histogram: 1 0 0 0 0 0 0 0 0 0
-
-Total # of neighbors = 0
-Ave neighs/atom = 0
-Neighbor list builds = 0
-Dangerous builds = 0
-Total wall time: 0:00:00
+ERROR on proc 0: DeePMD-kit Error: DeePMD-kit PyTorch backend error: DeePMD-kit Error: charge tensor must have last dimension 1 to map to atom->q. (/data/zyjin/dp_pt/dp_devel/deepmd-kit-devel/source/lmp/pair_deepmd.cpp:382)

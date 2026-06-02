@@ -2,14 +2,10 @@
 #include <string.h>
 
 #include <cassert>
-#include <cctype>
-#include <cmath>
-#include <cstdlib>
 #include <iomanip>
 #include <iostream>
 #include <limits>
 #include <map>
-#include <regex>
 #include <sstream>
 
 #include "atom.h"
@@ -38,21 +34,6 @@
 
 using namespace LAMMPS_NS;
 using namespace std;
-
-namespace {
-
-bool has_json_suffix(const std::string& path) {
-  if (path.size() < 5) {
-    return false;
-  }
-  std::string suffix = path.substr(path.size() - 5);
-  for (char& c : suffix) {
-    c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-  }
-  return suffix == ".json";
-}
-
-}  // namespace
 
 static const char cite_user_deepmd_package[] =
     "USER-DEEPMD package:\n\n"
@@ -140,88 +121,10 @@ PairDeepMD::PairDeepMD(LAMMPS* lmp)
     : PairDeepBaseModel(
           lmp, cite_user_deepmd_package, deep_pot, deep_pot_model_devi) {
   latent_charge_to_q = false;
-  model_n_dl = 0.0;
-  has_model_n_dl = 0;
 }
 
 PairDeepMD::~PairDeepMD() {
   // Ensure base class destructor is called
-}
-
-bool PairDeepMD::parse_model_n_dl_from_json(const std::string& model_path,
-                                            double& n_dl_out) const {
-  if (!has_json_suffix(model_path)) {
-    return false;
-  }
-
-  std::string content;
-  try {
-    deepmd_compat::read_file_to_string(model_path, content);
-  } catch (...) {
-    return false;
-  }
-
-  static const std::regex n_dl_pattern(
-      R"("n_dl"\s*:\s*([-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?))");
-
-  std::smatch match;
-  if (!std::regex_search(content, match, n_dl_pattern)) {
-    return false;
-  }
-
-  const double candidate = std::strtod(match[1].str().c_str(), nullptr);
-  if (!(std::isfinite(candidate) && candidate > 0.0)) {
-    return false;
-  }
-
-  n_dl_out = candidate;
-  return true;
-}
-
-void PairDeepMD::detect_model_n_dl(const std::vector<std::string>& models) {
-  has_model_n_dl = 0;
-  model_n_dl = 0.0;
-
-  double first_n_dl = 0.0;
-  bool found = false;
-
-  for (const auto& model_path : models) {
-    double parsed = 0.0;
-    if (!parse_model_n_dl_from_json(model_path, parsed)) {
-      continue;
-    }
-    if (!found) {
-      first_n_dl = parsed;
-      found = true;
-      continue;
-    }
-    if (std::fabs(parsed - first_n_dl) > 1e-12 && comm->me == 0) {
-      error->warning(
-          FLERR,
-          "pair_style deepmd found inconsistent n_dl across model JSON files; "
-          "using the first model value");
-    }
-  }
-
-  if (found) {
-    has_model_n_dl = 1;
-    model_n_dl = first_n_dl;
-  }
-}
-
-void* PairDeepMD::extract(const char* str, int& dim) {
-  if (strcmp(str, "deepmd_model_n_dl") == 0) {
-    dim = 0;
-    if (has_model_n_dl) {
-      return (void*)&model_n_dl;
-    }
-    return nullptr;
-  }
-  if (strcmp(str, "deepmd_model_n_dl_available") == 0) {
-    dim = 0;
-    return (void*)&has_model_n_dl;
-  }
-  return PairDeepBaseModel::extract(str, dim);
 }
 
 void PairDeepMD::compute(int eflag, int vflag) {
@@ -712,7 +615,6 @@ void PairDeepMD::settings(int narg, char** arg) {
   for (int ii = 0; ii < iarg; ++ii) {
     models.push_back(arg[ii]);
   }
-  detect_model_n_dl(models);
   numb_models = models.size();
   if (numb_models == 1) {
     try {

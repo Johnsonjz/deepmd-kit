@@ -11,12 +11,14 @@ KSpaceStyle(sog, SOGKSpace)
 #include <string>
 #include <vector>
 
-#include "pppm.h"
+#include "kspace.h"
 #include "lmpfftsettings.h"
 
 namespace LAMMPS_NS {
 
-class SOGKSpace : public PPPM {
+class FFT3d;
+
+class SOGKSpace : public KSpace {
  public:
   explicit SOGKSpace(class LAMMPS* lmp);
   ~SOGKSpace() override;
@@ -27,22 +29,22 @@ class SOGKSpace : public PPPM {
   void compute(int eflag, int vflag) override;
   double memory_usage() override;
 
- protected:
-  void set_grid_global() override;
-  void compute_gf_ik() override;
-  void poisson_ik() override;
-
  private:
   bool is_keyword(const std::string& token) const;
   bool parse_bool_token(const std::string& token, bool& value) const;
-  bool try_import_n_dl_from_pair_model(bool strict_missing);
   void finalize_kernel_parameters();
   double spectral_kernel(const double sqk) const;
+  bool compute_finufft(int eflag, int vflag);
+  void compute_mesh_fft(int eflag, int vflag);
+
+  void ensure_fft_plan();
+  void destroy_fft_plan();
+
+  size_t mesh_index(int ix, int iy, int iz) const;
+  double periodic_fraction(double x, double xlo, double prd) const;
 
   double accuracy_in;
   double n_dl;
-  bool n_dl_user_specified;
-  bool n_dl_from_model;
   bool remove_self_interaction;
   bool use_finufft;
   double finufft_eps;
@@ -58,8 +60,23 @@ class SOGKSpace : public PPPM {
   double self_diag_sum;
 
   bool kernel_ready;
+  bool mesh_ready;
 
-  std::vector<double> greensfn_energy;
+  int mesh_nx;
+  int mesh_ny;
+  int mesh_nz;
+
+  double mesh_lx;
+  double mesh_ly;
+  double mesh_lz;
+
+  FFT3d* mesh_fft;
+
+  std::vector<FFT_SCALAR> mesh_rho;
+  std::vector<FFT_SCALAR> mesh_fft_work;
+  std::vector<FFT_SCALAR> mesh_gradx;
+  std::vector<FFT_SCALAR> mesh_grady;
+  std::vector<FFT_SCALAR> mesh_gradz;
 
   std::vector<double> amp;
   std::vector<double> bandwidth;

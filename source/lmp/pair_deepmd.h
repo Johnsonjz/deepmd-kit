@@ -44,7 +44,6 @@ class PairDeepMD : public PairDeepBaseModel {
  public:
   PairDeepMD(class LAMMPS*);
   ~PairDeepMD() override;
-  void* extract(const char*, int&) override;
   void settings(int, char**) override;
   void coeff(int, char**) override;
   void compute(int, int) override;
@@ -56,14 +55,8 @@ class PairDeepMD : public PairDeepBaseModel {
   deepmd_compat::DeepPotModelDevi deep_pot_model_devi;
 
  private:
-  bool parse_model_n_dl_from_json(const std::string& model_path,
-                                  double& n_dl_out) const;
-  void detect_model_n_dl(const std::vector<std::string>& models);
-
   CommBrickDeepMD* commdata_;
   bool latent_charge_to_q;
-  double model_n_dl;
-  int has_model_n_dl;
 };
 
 }  // namespace LAMMPS_NS
