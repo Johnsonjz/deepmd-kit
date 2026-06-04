@@ -94,9 +94,17 @@ from torch.distributed.checkpoint.state_dict import (
     get_optimizer_state_dict,
     set_optimizer_state_dict,
 )
-from torch.distributed.fsdp import (
-    fully_shard,
-)
+try:
+    from torch.distributed.fsdp import (
+        fully_shard,
+    )
+except ImportError:
+    # Some torch 2.x builds do not expose fsdp.fully_shard.
+    # Keep module importable for non-training commands (e.g. freeze/show).
+    def fully_shard(*args, **kwargs):  # type: ignore[no-redef]
+        raise ImportError(
+            "torch.distributed.fsdp.fully_shard is not available in this torch build"
+        )
 from torch.distributed.optim import (
     ZeroRedundancyOptimizer,
 )

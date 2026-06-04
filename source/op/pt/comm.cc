@@ -110,6 +110,7 @@ class Border : public torch::autograd::Function<Border> {
 #endif
 #endif
     FPTYPE* recv_g1 = recv_g1_tensor.data_ptr<FPTYPE>() + nlocal * tensor_size;
+    int recv_offset = nlocal;
     auto int32_options = torch::TensorOptions().dtype(torch::kInt32);
     for (int iswap = 0; iswap < nswap; ++iswap) {
       int nrecv = recvnum[iswap];
@@ -138,28 +139,15 @@ class Border : public torch::autograd::Function<Border> {
         }
       } else {
 #endif
-#if defined(GOOGLE_CUDA) || defined(TENSORFLOW_USE_ROCM)
-#ifdef USE_MPI
-        if (cuda_aware == 0) {
-          memcpy(recv_g1, send_g1,
-                 (unsigned long)nsend * tensor_size * sizeof(FPTYPE));
-        } else {
-          gpuMemcpy(recv_g1, send_g1,
-                    (unsigned long)nsend * tensor_size * sizeof(FPTYPE),
-                    gpuMemcpyDeviceToDevice);
-        }
-#else
-        gpuMemcpy(recv_g1, send_g1,
-                  (unsigned long)nsend * tensor_size * sizeof(FPTYPE),
-                  gpuMemcpyDeviceToDevice);
-#endif
-#else
-      memcpy(recv_g1, send_g1,
-             (unsigned long)nsend * tensor_size * sizeof(FPTYPE));
-#endif
+      if (nsend) {
+        // For same-rank communication, use tensor copy_ to support both CPU and
+        // CUDA tensors without relying on backend-specific memcpy guards.
+        recv_g1_tensor.narrow(0, recv_offset, nsend).copy_(send_g1_tensor);
+      }
 #ifdef USE_MPI
       }
 #endif
+      recv_offset += nrecv;
       recv_g1 += nrecv * tensor_size;
     }
 #ifdef USE_MPI

@@ -103,10 +103,10 @@ class SOGEnergyModel(DPModelCommon, SOGEnergyModel_):
 
     def _build_sog_lib_direct_kernel(
         self,
-        fitting: Any,
         runtime_device: torch.device,
         real_dtype: torch.dtype,
     ) -> Any:
+        fitting = self.atomic_model.fitting_net
         bw2_runtime = fitting.bandwidth.to(device=runtime_device, dtype=real_dtype)
         amp_internal_runtime = fitting.amp.to(
             device=runtime_device,
@@ -140,7 +140,6 @@ class SOGEnergyModel(DPModelCommon, SOGEnergyModel_):
         need_force: bool,
         need_virial: bool,
     ) -> dict[str, torch.Tensor]:
-        fitting = self.get_fitting_net()
         runtime_device = coord.device
         real_dtype = coord.dtype
 
@@ -153,22 +152,9 @@ class SOGEnergyModel(DPModelCommon, SOGEnergyModel_):
         batch = torch.arange(nf, device=runtime_device, dtype=torch.int64).repeat_interleave(nloc)
 
         kernel = self._build_sog_lib_direct_kernel(
-            fitting,
             runtime_device,
             real_dtype,
         )
-
-        def _corr_redu(positions: torch.Tensor, charges: torch.Tensor) -> torch.Tensor:
-            corr = kernel(
-                positions=positions.reshape(nf * nloc, 3),
-                cell=box,
-                batch=batch,
-                latent_charges=charges.reshape(nf * nloc, nq),
-                compute_energy=True,
-                compute_bec=False,
-            )["E_lr"]
-            assert corr is not None
-            return corr.reshape(nf, 1)
 
         if need_force or need_virial:
             coord_for_grad = (
@@ -176,7 +162,16 @@ class SOGEnergyModel(DPModelCommon, SOGEnergyModel_):
                 if coord.requires_grad
                 else coord.detach().clone().requires_grad_(True)
             )
-            corr_redu = _corr_redu(coord_for_grad, latent_charge)
+            corr = kernel(
+                positions=coord_for_grad.reshape(nf * nloc, 3),
+                cell=box,
+                batch=batch,
+                latent_charges=latent_charge.reshape(nf * nloc, nq),
+                compute_energy=True,
+                compute_bec=False,
+            )["E_lr"]
+            assert corr is not None
+            corr_redu = corr.reshape(nf, 1)
 
             force_local = -torch.autograd.grad(
                 [corr_redu],
@@ -193,7 +188,16 @@ class SOGEnergyModel(DPModelCommon, SOGEnergyModel_):
                 )
             return out
 
-        out = {"corr_redu": _corr_redu(coord, latent_charge)}
+        corr = kernel(
+            positions=coord.reshape(nf * nloc, 3),
+            cell=box,
+            batch=batch,
+            latent_charges=latent_charge.reshape(nf * nloc, nq),
+            compute_energy=True,
+            compute_bec=False,
+        )["E_lr"]
+        assert corr is not None
+        out = {"corr_redu": corr.reshape(nf, 1)}
         return out
 
     def _apply_frame_correction_lower(
@@ -204,8 +208,13 @@ class SOGEnergyModel(DPModelCommon, SOGEnergyModel_):
         box: torch.Tensor | None,
         do_atomic_virial: bool,
     ) -> dict[str, torch.Tensor]:
-        fitting = self.get_fitting_net()
+        fitting = self.atomic_model.fitting_net
         if fitting is not None and bool(fitting.external_kspace):
+            return model_ret
+
+        # TorchScript export is used for frozen inference models where the
+        # long-range correction is expected to be provided externally.
+        if torch.jit.is_scripting():
             return model_ret
 
         if box is None or "latent_charge" not in model_ret:
@@ -379,6 +388,8 @@ class SOGEnergyModel(DPModelCommon, SOGEnergyModel_):
             aparam=ap,
             do_atomic_virial=do_atomic_virial,
             comm_dict=comm_dict,
+            extra_nlist_sort=False,
+            extended_coord_corr=None,
             box=bb,
         )
         model_ret = communicate_extended_output(
@@ -436,6 +447,7 @@ class SOGEnergyModel(DPModelCommon, SOGEnergyModel_):
             do_atomic_virial=do_atomic_virial,
             comm_dict=comm_dict,
             extra_nlist_sort=self.need_sorted_nlist_for_lower(),
+            extended_coord_corr=None,
             box=box,
         )
         if self.get_fitting_net() is not None:

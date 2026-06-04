@@ -485,10 +485,13 @@ void DeepPotPT::compute_with_charge(
       throw deepmd::deepmd_exception(
           "Unexpected latent_charge shape from model output.");
     }
-    if (latent_tensor.size(2) != 1) {
+    if (latent_tensor.size(2) < 1) {
       throw deepmd::deepmd_exception(
-          "latent_charge must have last dimension 1 to map to atom->q.");
+          "latent_charge must have last dimension >= 1 to map to atom->q.");
     }
+    // Keep LAMMPS q mapping consistent with Python-side validation path:
+    // use the first latent_charge channel as scalar q.
+    latent_tensor = latent_tensor.slice(/*dim=*/2, /*start=*/0, /*end=*/1);
     torch::Tensor flat_latent_ =
         latent_tensor.squeeze(-1).contiguous().view({-1}).to(floatType);
     torch::Tensor cpu_latent_ = flat_latent_.to(torch::kCPU);

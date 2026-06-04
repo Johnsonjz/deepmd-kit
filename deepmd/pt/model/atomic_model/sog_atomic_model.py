@@ -61,8 +61,10 @@ class SOGEnergyAtomicModel(BaseAtomicModel):
 
         self.enable_eval_descriptor_hook = False
         self.enable_eval_fitting_last_layer_hook = False
-        self.eval_descriptor_list: list[torch.Tensor] = []
-        self.eval_fitting_last_layer_list: list[torch.Tensor] = []
+        self.eval_descriptor_list = torch.jit.Attribute([], list[torch.Tensor])
+        self.eval_fitting_last_layer_list = torch.jit.Attribute(
+            [], list[torch.Tensor]
+        )
 
     @torch.jit.export
     def fitting_output_def(self) -> FittingOutputDef:
@@ -163,7 +165,7 @@ class SOGEnergyAtomicModel(BaseAtomicModel):
             comm_dict=descriptor_comm_dict,
         )
         assert descriptor is not None
-        if self.enable_eval_descriptor_hook:
+        if self.enable_eval_descriptor_hook and not torch.jit.is_scripting():
             self.eval_descriptor_list.append(descriptor.detach())
 
         energy_ret = self.fitting_net(
@@ -176,7 +178,11 @@ class SOGEnergyAtomicModel(BaseAtomicModel):
             aparam=aparam,
         )
 
-        if self.enable_eval_fitting_last_layer_hook and "middle_output" in energy_ret:
+        if (
+            self.enable_eval_fitting_last_layer_hook
+            and not torch.jit.is_scripting()
+            and "middle_output" in energy_ret
+        ):
             self.eval_fitting_last_layer_list.append(
                 energy_ret["middle_output"].detach()
             )

@@ -666,51 +666,58 @@ class LRFittingNet(Fitting):
     ) -> torch.Tensor:
         nf, nloc, _ = xx.shape
         outs = torch.zeros((nf, nloc, dim_out), dtype=self.prec, device=xx.device)
+        atom_properties = layers.forward_all(xx)
+        atom_properties_zeros: list[torch.Tensor] = []
+        if xx_zeros is not None:
+            atom_properties_zeros = layers.forward_all(xx_zeros)
+
         if self.mixed_types:
-            atom_property = layers.networks[0](xx)
+            atom_property = atom_properties[0]
             if self.eval_return_middle_output and middle_output is not None:
-                middle_output["middle_output"] = layers.networks[0].call_until_last(xx)
+                middle_output["middle_output"] = layers.call_until_last_all(xx)[0]
             if xx_zeros is not None:
-                atom_property -= layers.networks[0](xx_zeros)
-            
+                atom_property = atom_property - atom_properties_zeros[0]
+
             if bias_tensor is not None:
                 atom_bias = bias_tensor[atype.to(torch.long)].to(self.prec)
                 atom_property = atom_property + atom_bias
-                
+
             outs = outs + atom_property
-        else:
+            return outs
+
+        middle_outputs_all: list[torch.Tensor] = []
+        outs_middle = torch.zeros(
+            (nf, nloc, neuron[-1]),
+            dtype=self.prec,
+            device=xx.device,
+        )
+        if self.eval_return_middle_output and middle_output is not None:
+            middle_outputs_all = layers.call_until_last_all(xx)
+
+        for type_i, atom_property in enumerate(atom_properties):
+            mask = (atype == type_i).unsqueeze(-1)
             if self.eval_return_middle_output and middle_output is not None:
-                outs_middle = torch.zeros(
-                    (nf, nloc, neuron[-1]),
-                    dtype=self.prec,
-                    device=xx.device,
+                middle_mask = torch.tile(mask, (1, 1, neuron[-1]))
+                outs_middle = outs_middle + torch.where(
+                    middle_mask,
+                    middle_outputs_all[type_i],
+                    0.0,
                 )
-                for type_i, ll in enumerate(layers.networks):
-                    mask = (atype == type_i).unsqueeze(-1)
-                    mask = torch.tile(mask, (1, 1, dim_out))
-                    middle_output_type = ll.call_until_last(xx)
-                    middle_output_type = torch.where(
-                        torch.tile(mask, (1, 1, neuron[-1])),
-                        middle_output_type,
-                        0.0,
-                    )
-                    outs_middle = outs_middle + middle_output_type
-                middle_output["middle_output"] = outs_middle
-            for type_i, ll in enumerate(layers.networks):
-                mask = (atype == type_i).unsqueeze(-1)
-                mask = torch.tile(mask, (1, 1, dim_out))
-                atom_property = ll(xx)
-                if xx_zeros is not None:
-                    assert self.remove_vaccum_contribution is not None
-                    if not (
-                        len(self.remove_vaccum_contribution) > type_i
-                        and not self.remove_vaccum_contribution[type_i]
-                    ):
-                        atom_property -= ll(xx_zeros)
-                
-                if bias_tensor is not None:
-                    atom_property = atom_property + bias_tensor[type_i].to(self.prec)
-                
-                atom_property = torch.where(mask, atom_property, 0.0)
-                outs = outs + atom_property
+
+            if xx_zeros is not None:
+                assert self.remove_vaccum_contribution is not None
+                if not (
+                    len(self.remove_vaccum_contribution) > type_i
+                    and not self.remove_vaccum_contribution[type_i]
+                ):
+                    atom_property = atom_property - atom_properties_zeros[type_i]
+
+            if bias_tensor is not None:
+                atom_property = atom_property + bias_tensor[type_i].to(self.prec)
+
+            atom_mask = torch.tile(mask, (1, 1, dim_out))
+            outs = outs + torch.where(atom_mask, atom_property, 0.0)
+
+        if self.eval_return_middle_output and middle_output is not None:
+            middle_output["middle_output"] = outs_middle
         return outs

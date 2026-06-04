@@ -633,7 +633,12 @@ void SOGKSpace::ensure_fft_plan() {
                        0,
                        0,
                        &tmp,
-                       collective_flag);
+                       collective_flag
+#if LAMMPS_VERSION_NUMBER >= 20260330
+                       ,
+                       0
+#endif
+                       );
 
   mesh_ready = true;
 }
@@ -1266,10 +1271,10 @@ void SOGKSpace::compute_mesh_fft(int eflag, int vflag) {
 void SOGKSpace::compute(int eflag, int vflag) {
   ev_init(eflag, vflag, 0);
 
-  if (atom->natoms != natoms_original) {
-    qsum_qsq();
-    natoms_original = atom->natoms;
-  }
+  // atom->q can be updated every step by pair_style deepmd
+  // (latent_charge_to_q), so we must refresh charge moments each compute.
+  qsum_qsq();
+  natoms_original = atom->natoms;
 
   if (qsqsum == 0.0) {
     energy = 0.0;

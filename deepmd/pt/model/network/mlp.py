@@ -307,4 +307,42 @@ class NetworkCollection(DPNetworkCollection, nn.Module):
         # init both two base classes
         DPNetworkCollection.__init__(self, *args, **kwargs)
         nn.Module.__init__(self)
-        self.networks = self._networks = torch.nn.ModuleList(self._networks)
+        self.networks: torch.nn.ModuleList = torch.nn.ModuleList(self._networks)
+        self._networks = self.networks
+
+    @torch.jit.export
+    def forward_network0(self, xx: torch.Tensor) -> torch.Tensor:
+        return self.networks[0](xx)
+
+    @torch.jit.export
+    def call_until_last_network0(self, xx: torch.Tensor) -> torch.Tensor:
+        return self.networks[0].call_until_last(xx)
+
+    @torch.jit.export
+    def forward_all(self, xx: torch.Tensor) -> list[torch.Tensor]:
+        outs: list[torch.Tensor] = []
+        for ll in self.networks:
+            outs.append(ll(xx))
+        return outs
+
+    @torch.jit.export
+    def call_until_last_all(self, xx: torch.Tensor) -> list[torch.Tensor]:
+        outs: list[torch.Tensor] = []
+        for ll in self.networks:
+            outs.append(ll.call_until_last(xx))
+        return outs
+
+    @torch.jit.export
+    def forward_by_atype(
+        self,
+        xx: torch.Tensor,
+        atype: torch.Tensor,
+        dim_out: int,
+    ) -> torch.Tensor:
+        nf, nloc, _ = xx.shape
+        outs = torch.zeros((nf, nloc, dim_out), dtype=xx.dtype, device=xx.device)
+        for type_i, ll in enumerate(self.networks):
+            mask = (atype == type_i).unsqueeze(-1)
+            mask = torch.tile(mask, (1, 1, dim_out))
+            outs = torch.where(mask, ll(xx), outs)
+        return outs
