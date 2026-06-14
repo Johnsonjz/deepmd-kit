@@ -1,0 +1,4 @@
+LAMMPS (30 Mar 2026 - Development - patch_30Mar2026-1074-g7f680de296)
+OMP_NUM_THREADS environment is not set. Defaulting to 1 thread.
+  using 1 OpenMP thread(s) per MPI task
+Total wall time: 0:00:00

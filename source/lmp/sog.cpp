@@ -40,6 +40,55 @@ constexpr double kSOGDefaultFinufftEps = 1e-9;
 constexpr int kSOGMeshAssignOrder = 5;
 constexpr int kSOGMeshAliasExtent = 8;
 
+constexpr int kSOGGridMin = 8;
+constexpr int kSOGGridMaxIter = 500;
+
+bool factorable_235(int n) {
+  while (n > 1) {
+    if ((n % 2) == 0) {
+      n /= 2;
+    } else if ((n % 3) == 0) {
+      n /= 3;
+    } else if ((n % 5) == 0) {
+      n /= 5;
+    } else {
+      return false;
+    }
+  }
+  return true;
+}
+
+double pppm_ik_error_estimate_order5(const double h,
+                                     const double prd,
+                                     const bigint natoms,
+                                     const double q2,
+                                     const double g_eff) {
+  if (!(natoms > 0) || !(h > 0.0) || !(prd > 0.0) || !(q2 > 0.0) ||
+      !(g_eff > 0.0)) {
+    return std::numeric_limits<double>::infinity();
+  }
+
+  // PPPM order-5 acons coefficients (same error model family as PPPM).
+  static constexpr double acons_order5[] = {
+      1.0 / 23232.0,
+      7601.0 / 13628160.0,
+      143.0 / 69120.0,
+      517231.0 / 106536960.0,
+      106640677.0 / 11737571328.0,
+  };
+
+  double series = 0.0;
+  for (int m = 0; m < 5; ++m) {
+    series +=
+        acons_order5[m] * std::pow(h * g_eff, 2.0 * static_cast<double>(m));
+  }
+
+  const double prefactor = q2 * std::pow(h * g_eff, 5.0);
+  const double root = std::sqrt(g_eff * prd * std::sqrt(MY_2PI) * series /
+                                static_cast<double>(natoms));
+  return prefactor * root / (prd * prd);
+}
+
 struct finufft_opts;
 struct finufft_plan_s;
 using finufft_plan = finufft_plan_s *;
@@ -550,6 +599,15 @@ void SOGKSpace::destroy_fft_plan() {
   mesh_gradx.clear();
   mesh_grady.clear();
   mesh_gradz.clear();
+  mesh_green_energy.clear();
+  mesh_green_force.clear();
+  mesh_green_self.clear();
+  sinc_table_x.clear();
+  sinc_table_y.clear();
+  sinc_table_z.clear();
+  sinc_sum_x.clear();
+  sinc_sum_y.clear();
+  sinc_sum_z.clear();
 }
 
 void SOGKSpace::ensure_fft_plan() {
@@ -563,32 +621,112 @@ void SOGKSpace::ensure_fft_plan() {
   const double ly = domain->yprd;
   const double lz = domain->zprd;
 
-    // Nyquist condition: pi / d >= 2*pi / n_dl  =>  d <= n_dl / 2.
-    // mesh_oversample scales beyond the minimum Nyquist-compliant grid.
-    const double mesh_scale = std::max(1.0, mesh_oversample);
-    int nx =
-      std::max(8, static_cast<int>(std::ceil(mesh_scale * 2.0 * lx / n_dl)));
-    int ny =
-      std::max(8, static_cast<int>(std::ceil(mesh_scale * 2.0 * ly / n_dl)));
-    int nz =
-      std::max(8, static_cast<int>(std::ceil(mesh_scale * 2.0 * lz / n_dl)));
+  // Nyquist lower bound from n_dl: pi / d >= 2*pi / n_dl  =>  d <= n_dl / 2.
+  // mesh_oversample scales beyond the minimum Nyquist-compliant grid.
+  const double mesh_scale = std::max(1.0, mesh_oversample);
+  int nx = std::max(
+      kSOGGridMin, static_cast<int>(std::ceil(mesh_scale * 2.0 * lx / n_dl)));
+  int ny = std::max(
+      kSOGGridMin, static_cast<int>(std::ceil(mesh_scale * 2.0 * ly / n_dl)));
+  int nz = std::max(
+      kSOGGridMin, static_cast<int>(std::ceil(mesh_scale * 2.0 * lz / n_dl)));
 
-  if (nx & 1) {
+  // PPPM-style refinement: use accuracy target to tighten grid counts.
+  // Only run during initial mesh build (mesh_ready == false); on subsequent
+  // calls the grid is kept fixed to avoid q2-dependent oscillations that
+  // would trigger expensive mesh rebuilds every step.
+  if (!mesh_ready && accuracy_in > 0.0 && q2 > 0.0 && atom->natoms > 0) {
+    double cutoff = n_dl;
+    int itmp = 0;
+    auto *p_cutoff = (double *) force->pair->extract("cut_coul", itmp);
+    if (p_cutoff != nullptr && *p_cutoff > 0.0) {
+      cutoff = *p_cutoff;
+    }
+
+    const double volume = lx * ly * lz;
+    const double natoms = static_cast<double>(atom->natoms);
+
+    double g_eff =
+        accuracy_in * std::sqrt(natoms * cutoff * volume) / (2.0 * q2);
+    if (!(g_eff > 0.0) || !std::isfinite(g_eff)) {
+      g_eff = MY_2PI / n_dl;
+    } else if (g_eff >= 1.0) {
+      g_eff = (1.35 - 0.15 * std::log(accuracy_in)) / cutoff;
+    } else {
+      g_eff = std::sqrt(-std::log(g_eff)) / cutoff;
+    }
+
+    if (g_eff > 0.0 && std::isfinite(g_eff)) {
+      double hx = 4.0 / g_eff;
+      double hy = 4.0 / g_eff;
+      double hz = 4.0 / g_eff;
+
+      int nx_pppm = std::max(2, static_cast<int>(lx / hx));
+      int ny_pppm = std::max(2, static_cast<int>(ly / hy));
+      int nz_pppm = std::max(2, static_cast<int>(lz / hz));
+
+      int count = 0;
+      while (true) {
+        const double errx =
+            pppm_ik_error_estimate_order5(hx, lx, atom->natoms, q2, g_eff);
+        const double erry =
+            pppm_ik_error_estimate_order5(hy, ly, atom->natoms, q2, g_eff);
+        const double errz =
+            pppm_ik_error_estimate_order5(hz, lz, atom->natoms, q2, g_eff);
+        const double err = std::max(errx, std::max(erry, errz));
+
+        ++count;
+        if (err <= accuracy_in) {
+          break;
+        }
+        if (count > kSOGGridMaxIter) {
+          break;
+        }
+
+        hx *= 0.95;
+        hy *= 0.95;
+        hz *= 0.95;
+        nx_pppm = std::max(2, static_cast<int>(lx / hx));
+        ny_pppm = std::max(2, static_cast<int>(ly / hy));
+        nz_pppm = std::max(2, static_cast<int>(lz / hz));
+      }
+
+      nx = std::max(nx, nx_pppm);
+      ny = std::max(ny, ny_pppm);
+      nz = std::max(nz, nz_pppm);
+    }
+  }
+
+  while (!factorable_235(nx)) {
     ++nx;
   }
-  if (ny & 1) {
+  while (!factorable_235(ny)) {
     ++ny;
   }
-  if (nz & 1) {
+  while (!factorable_235(nz)) {
     ++nz;
   }
 
+  // ── Case 1: Mesh already built, nothing changed ──
   if (mesh_ready && mesh_nx == nx && mesh_ny == ny && mesh_nz == nz &&
       std::fabs(mesh_lx - lx) < 1e-12 && std::fabs(mesh_ly - ly) < 1e-12 &&
       std::fabs(mesh_lz - lz) < 1e-12) {
     return;
   }
 
+  // ── Case 2: Mesh already built, box changed but grid count unchanged ──
+  // PPPM-style: keep the same FFT grid count, only recompute the Green
+  // functions with the new box dimensions (spacing changed, k-vectors changed).
+  // This avoids the expensive FFT plan rebuild on every NPT step.
+  if (mesh_ready && mesh_nx == nx && mesh_ny == ny && mesh_nz == nz) {
+    mesh_lx = lx;
+    mesh_ly = ly;
+    mesh_lz = lz;
+    precompute_green_functions();
+    return;
+  }
+
+  // ── Case 3: First build or grid count changed ──
   destroy_fft_plan();
 
   const int64_t ngrid64 = static_cast<int64_t>(nx) * static_cast<int64_t>(ny) *
@@ -640,7 +778,249 @@ void SOGKSpace::ensure_fft_plan() {
 #endif
                        );
 
+  precompute_sinc_tables();
+  precompute_green_functions();
+
   mesh_ready = true;
+}
+
+void SOGKSpace::precompute_sinc_tables() {
+  // Precompute box-independent sinc_pow values for alias sums.
+  // sinc_pow(0.5 * q * dx, assign_pow) = sinc_pow(pi * (k_mode/n + j), assign_pow)
+  // depends ONLY on grid indices, not on absolute box dimensions.
+  //
+  // This is called once during mesh creation (Case 3 of ensure_fft_plan).
+  const int assign_pow = 2 * kSOGMeshAssignOrder;   // = 10
+  const int alias_cnt = 2 * mesh_alias_extent + 1;   // = 17 for default extent
+
+  // ── X dimension ──
+  sinc_table_x.assign(static_cast<size_t>(mesh_nx) * static_cast<size_t>(alias_cnt),
+                      0.0);
+  sinc_sum_x.assign(static_cast<size_t>(mesh_nx), 0.0);
+  for (int ix = 0; ix < mesh_nx; ++ix) {
+    const int kx_mode = ix - mesh_nx * (2 * ix / mesh_nx);
+    const double arg_base =
+        MY_PI * static_cast<double>(kx_mode) / static_cast<double>(mesh_nx);
+    const size_t base = static_cast<size_t>(ix) * static_cast<size_t>(alias_cnt);
+    double sum = 0.0;
+    for (int jx = -mesh_alias_extent; jx <= mesh_alias_extent; ++jx) {
+      const double arg = arg_base + MY_PI * static_cast<double>(jx);
+      const double val = sinc_pow(arg, assign_pow);
+      sinc_table_x[base + static_cast<size_t>(jx + mesh_alias_extent)] = val;
+      sum += val;
+    }
+    sinc_sum_x[static_cast<size_t>(ix)] = sum;
+  }
+
+  // ── Y dimension ──
+  sinc_table_y.assign(static_cast<size_t>(mesh_ny) * static_cast<size_t>(alias_cnt),
+                      0.0);
+  sinc_sum_y.assign(static_cast<size_t>(mesh_ny), 0.0);
+  for (int iy = 0; iy < mesh_ny; ++iy) {
+    const int ky_mode = iy - mesh_ny * (2 * iy / mesh_ny);
+    const double arg_base =
+        MY_PI * static_cast<double>(ky_mode) / static_cast<double>(mesh_ny);
+    const size_t base = static_cast<size_t>(iy) * static_cast<size_t>(alias_cnt);
+    double sum = 0.0;
+    for (int jy = -mesh_alias_extent; jy <= mesh_alias_extent; ++jy) {
+      const double arg = arg_base + MY_PI * static_cast<double>(jy);
+      const double val = sinc_pow(arg, assign_pow);
+      sinc_table_y[base + static_cast<size_t>(jy + mesh_alias_extent)] = val;
+      sum += val;
+    }
+    sinc_sum_y[static_cast<size_t>(iy)] = sum;
+  }
+
+  // ── Z dimension ──
+  sinc_table_z.assign(static_cast<size_t>(mesh_nz) * static_cast<size_t>(alias_cnt),
+                      0.0);
+  sinc_sum_z.assign(static_cast<size_t>(mesh_nz), 0.0);
+  for (int iz = 0; iz < mesh_nz; ++iz) {
+    const int kz_mode = iz - mesh_nz * (2 * iz / mesh_nz);
+    const double arg_base =
+        MY_PI * static_cast<double>(kz_mode) / static_cast<double>(mesh_nz);
+    const size_t base = static_cast<size_t>(iz) * static_cast<size_t>(alias_cnt);
+    double sum = 0.0;
+    for (int jz = -mesh_alias_extent; jz <= mesh_alias_extent; ++jz) {
+      const double arg = arg_base + MY_PI * static_cast<double>(jz);
+      const double val = sinc_pow(arg, assign_pow);
+      sinc_table_z[base + static_cast<size_t>(jz + mesh_alias_extent)] = val;
+      sum += val;
+    }
+    sinc_sum_z[static_cast<size_t>(iz)] = sum;
+  }
+}
+
+void SOGKSpace::precompute_green_functions() {
+  // Precompute per-k-point Green functions (geff_energy, geff, self_diag).
+  // These depend on mesh geometry (box dimensions via k-vectors) and SOG
+  // kernel parameters, but use precomputed sinc_pow tables (box-independent)
+  // to avoid expensive sin/pow recomputation on every box change.
+  //
+  // The sinc_pow argument was originally:
+  //   sinc_pow(0.5 * qx * dx, assign_pow)
+  //   = sinc_pow(pi * (kx_mode/nx + jx), assign_pow)   // Lx cancels!
+  // which depends only on grid indices, not on box dimensions.
+
+  const size_t ngrid = static_cast<size_t>(mesh_nx) *
+                       static_cast<size_t>(mesh_ny) *
+                       static_cast<size_t>(mesh_nz);
+
+  mesh_green_energy.assign(ngrid, 0.0);
+  mesh_green_force.assign(ngrid, 0.0);
+  mesh_green_self.assign(ngrid, 0.0);
+
+  const double k_sq_max = (MY_2PI / n_dl) * (MY_2PI / n_dl);
+  const double twopi_over_x = MY_2PI / mesh_lx;
+  const double twopi_over_y = MY_2PI / mesh_ly;
+  const double twopi_over_z = MY_2PI / mesh_lz;
+  const int alias_extent = mesh_alias_extent;
+  const int alias_cnt = 2 * alias_extent + 1;
+
+  // ── Fast-path check: can any alias possibly contribute? ──
+  // For axis α, the alias spacing is Δα = 2π/Lα × n_mesh_α.
+  // The smallest |q| for a j=±1 alias is at least |Δα - |k_α||,
+  // and the minimum over all k-points is (Δα - k_max) where
+  // k_max = sqrt(k_sq_max).  If (Δα - k_max)² > k_sq_max for all
+  // axes, then NO alias from ANY axis can contribute for ANY k-point,
+  // and we can skip the 3D alias loop entirely.
+  const double k_max = std::sqrt(k_sq_max);
+  const bool alias_fast_path =
+      (twopi_over_x * static_cast<double>(mesh_nx) > 2.0 * k_max) &&
+      (twopi_over_y * static_cast<double>(mesh_ny) > 2.0 * k_max) &&
+      (twopi_over_z * static_cast<double>(mesh_nz) > 2.0 * k_max);
+
+  for (int iz = 0; iz < mesh_nz; ++iz) {
+    const int kz_mode = iz - mesh_nz * (2 * iz / mesh_nz);
+    const double kz = twopi_over_z * static_cast<double>(kz_mode);
+    const double sz_sum = sinc_sum_z[static_cast<size_t>(iz)];
+
+    for (int iy = 0; iy < mesh_ny; ++iy) {
+      const int ky_mode = iy - mesh_ny * (2 * iy / mesh_ny);
+      const double ky = twopi_over_y * static_cast<double>(ky_mode);
+      const double sy_sum = sinc_sum_y[static_cast<size_t>(iy)];
+
+      for (int ix = 0; ix < mesh_nx; ++ix) {
+        const int kx_mode = ix - mesh_nx * (2 * ix / mesh_nx);
+        const double kx = twopi_over_x * static_cast<double>(kx_mode);
+        const double sx_sum = sinc_sum_x[static_cast<size_t>(ix)];
+
+        const double sqk = kx * kx + ky * ky + kz * kz;
+        if (!(sqk > 0.0 && sqk <= k_sq_max)) {
+          continue;
+        }
+
+        const double denom_lin = sx_sum * sy_sum * sz_sum;
+        const double denominator = denom_lin * denom_lin;
+        if (!(denominator > 1e-20) || !std::isfinite(denominator)) {
+          continue;
+        }
+
+        const size_t tbl_base_x =
+            static_cast<size_t>(ix) * static_cast<size_t>(alias_cnt);
+        const size_t tbl_base_y =
+            static_cast<size_t>(iy) * static_cast<size_t>(alias_cnt);
+        const size_t tbl_base_z =
+            static_cast<size_t>(iz) * static_cast<size_t>(alias_cnt);
+
+        double sum0, sum1;
+
+        if (alias_fast_path) {
+          // ── Fast path: only principal mode (j=0,0,0) contributes ──
+          // No alias can lie within k_sq_max for any k-point, so
+          // sum0 = K(k²) × w_x[0] × w_y[0] × w_z[0]
+          // sum1 = k² × sum0   (principal mode: dot1 = kx²+ky²+kz² = k²)
+          const double w2x = sinc_table_x[tbl_base_x +
+                                          static_cast<size_t>(alias_extent)];
+          const double w2y = sinc_table_y[tbl_base_y +
+                                          static_cast<size_t>(alias_extent)];
+          const double w2z = sinc_table_z[tbl_base_z +
+                                          static_cast<size_t>(alias_extent)];
+          const double w2_principal = w2x * w2y * w2z;
+
+          const double kfac = spectral_kernel(sqk);
+          sum0 = kfac * w2_principal;
+          sum1 = sqk * sum0;
+
+          const size_t idx = mesh_index(ix, iy, iz);
+          const double geff_energy = sum0 / denominator;
+          // geff = sum1/(sqk*denom) = sum0/denom = geff_energy (fast path)
+
+          mesh_green_energy[idx] = geff_energy;
+          mesh_green_force[idx] = geff_energy;
+          if (w2_principal > 1e-20) {
+            mesh_green_self[idx] = sum0 / w2_principal;
+          }
+        } else {
+          // ── Full path: aliases may contribute ──
+          sum0 = 0.0;
+          sum1 = 0.0;
+          for (int jx = -alias_extent; jx <= alias_extent; ++jx) {
+            const double qx =
+                twopi_over_x * static_cast<double>(kx_mode + mesh_nx * jx);
+            const double wx_alias =
+                sinc_table_x[tbl_base_x +
+                             static_cast<size_t>(jx + alias_extent)];
+
+            for (int jy = -alias_extent; jy <= alias_extent; ++jy) {
+              const double qy =
+                  twopi_over_y * static_cast<double>(ky_mode + mesh_ny * jy);
+              const double wy_alias =
+                  sinc_table_y[tbl_base_y +
+                               static_cast<size_t>(jy + alias_extent)];
+
+              for (int jz = -alias_extent; jz <= alias_extent; ++jz) {
+                const double qz =
+                    twopi_over_z * static_cast<double>(kz_mode + mesh_nz * jz);
+                const double wz_alias =
+                    sinc_table_z[tbl_base_z +
+                                 static_cast<size_t>(jz + alias_extent)];
+
+                const double qsq = qx * qx + qy * qy + qz * qz;
+                if (!(qsq > 0.0 && qsq <= k_sq_max)) {
+                  continue;
+                }
+
+                const double kfac_alias = spectral_kernel(qsq);
+                if (!std::isfinite(kfac_alias) || kfac_alias == 0.0) {
+                  continue;
+                }
+
+                const double wprod = wx_alias * wy_alias * wz_alias;
+                sum0 += kfac_alias * wprod;
+                const double dot1 = kx * qx + ky * qy + kz * qz;
+                sum1 += dot1 * kfac_alias * wprod;
+              }
+            }
+          }
+
+          const size_t idx = mesh_index(ix, iy, iz);
+
+          const double geff_energy = sum0 / denominator;
+          const double geff = sum1 / (sqk * denominator);
+
+          if (!std::isfinite(geff_energy) || !std::isfinite(geff)) {
+            continue;
+          }
+
+          mesh_green_energy[idx] = geff_energy;
+          mesh_green_force[idx] = geff;
+
+          // Self-interaction diag term: sum0 / W2(principal k)
+          const double w2x = sinc_table_x[tbl_base_x +
+                                          static_cast<size_t>(alias_extent)];
+          const double w2y = sinc_table_y[tbl_base_y +
+                                          static_cast<size_t>(alias_extent)];
+          const double w2z = sinc_table_z[tbl_base_z +
+                                          static_cast<size_t>(alias_extent)];
+          const double w2_principal = w2x * w2y * w2z;
+          if (w2_principal > 1e-20) {
+            mesh_green_self[idx] = sum0 / w2_principal;
+          }
+        }
+      }
+    }
+  }
 }
 
 bool SOGKSpace::compute_finufft(int eflag, int vflag) {
@@ -962,9 +1342,6 @@ void SOGKSpace::compute_mesh_fft(int eflag, int vflag) {
     return;
   }
 
-  const double dx = mesh_lx / static_cast<double>(mesh_nx);
-  const double dy = mesh_ly / static_cast<double>(mesh_ny);
-  const double dz = mesh_lz / static_cast<double>(mesh_nz);
   const double volume_local = mesh_lx * mesh_ly * mesh_lz;
   const double rho_scale =
       static_cast<double>(mesh_nx * mesh_ny * mesh_nz) / volume_local;
@@ -1027,121 +1404,44 @@ void SOGKSpace::compute_mesh_fft(int eflag, int vflag) {
 
   const double scaleinv = 1.0 / static_cast<double>(ngrid);
   const double s2 = scaleinv * scaleinv;
-  const double k_sq_max = (MY_2PI / n_dl) * (MY_2PI / n_dl);
   const double twopi_over_x = MY_2PI / mesh_lx;
   const double twopi_over_y = MY_2PI / mesh_ly;
   const double twopi_over_z = MY_2PI / mesh_lz;
-  const int alias_extent = mesh_alias_extent;
-  const int assign_pow = 2 * assign_order;
 
   double energy_local = 0.0;
   double diag_sum_local = 0.0;
 
+  // Use precomputed Green functions (built once per mesh rebuild in
+  // precompute_green_functions()).  This eliminates the per-step
+  // 6-deep nested alias sum and spectral_kernel recomputation.
   for (int iz = 0; iz < mesh_nz; ++iz) {
     const int kz_mode = iz - mesh_nz * (2 * iz / mesh_nz);
     const double kz = twopi_over_z * static_cast<double>(kz_mode);
-    double sz_sum = 0.0;
-    for (int jz = -alias_extent; jz <= alias_extent; ++jz) {
-      const double qz = twopi_over_z * static_cast<double>(kz_mode + mesh_nz * jz);
-      sz_sum += sinc_pow(0.5 * qz * dz, assign_pow);
-    }
 
     for (int iy = 0; iy < mesh_ny; ++iy) {
       const int ky_mode = iy - mesh_ny * (2 * iy / mesh_ny);
       const double ky = twopi_over_y * static_cast<double>(ky_mode);
-      double sy_sum = 0.0;
-      for (int jy = -alias_extent; jy <= alias_extent; ++jy) {
-        const double qy =
-            twopi_over_y * static_cast<double>(ky_mode + mesh_ny * jy);
-        sy_sum += sinc_pow(0.5 * qy * dy, assign_pow);
-      }
 
       for (int ix = 0; ix < mesh_nx; ++ix) {
         const int kx_mode = ix - mesh_nx * (2 * ix / mesh_nx);
         const double kx = twopi_over_x * static_cast<double>(kx_mode);
-        const double w2x = sinc_pow(0.5 * kx * dx, assign_pow);
-        double sx_sum = 0.0;
-        for (int jx = -alias_extent; jx <= alias_extent; ++jx) {
-          const double qx =
-              twopi_over_x * static_cast<double>(kx_mode + mesh_nx * jx);
-          sx_sum += sinc_pow(0.5 * qx * dx, assign_pow);
-        }
 
         const size_t idx = mesh_index(ix, iy, iz);
-        const double sqk = kx * kx + ky * ky + kz * kz;
-        if (!(sqk > 0.0 && sqk <= k_sq_max)) {
+
+        const double geff_energy = mesh_green_energy[idx];
+        const double geff = mesh_green_force[idx];
+
+        // Zero gradients for k-points without a valid precomputed Green
+        // function (sqk==0, sqk>k_sq_max, or non-finite).
+        if (geff == 0.0 && geff_energy == 0.0) {
           mesh_gradx[2 * idx] = mesh_gradx[2 * idx + 1] = 0.0;
           mesh_grady[2 * idx] = mesh_grady[2 * idx + 1] = 0.0;
           mesh_gradz[2 * idx] = mesh_gradz[2 * idx + 1] = 0.0;
           continue;
         }
 
-        const double kfac = spectral_kernel(sqk);
-        if (!std::isfinite(kfac) || kfac == 0.0) {
-          mesh_gradx[2 * idx] = mesh_gradx[2 * idx + 1] = 0.0;
-          mesh_grady[2 * idx] = mesh_grady[2 * idx + 1] = 0.0;
-          mesh_gradz[2 * idx] = mesh_gradz[2 * idx + 1] = 0.0;
-          continue;
-        }
-
-        const double denom_lin = sx_sum * sy_sum * sz_sum;
-        const double denominator = denom_lin * denom_lin;
-        if (!(denominator > 1e-20) || !std::isfinite(denominator)) {
-          mesh_gradx[2 * idx] = mesh_gradx[2 * idx + 1] = 0.0;
-          mesh_grady[2 * idx] = mesh_grady[2 * idx + 1] = 0.0;
-          mesh_gradz[2 * idx] = mesh_gradz[2 * idx + 1] = 0.0;
-          continue;
-        }
-
-        double sum0 = 0.0;
-        double sum1 = 0.0;
-        for (int jx = -alias_extent; jx <= alias_extent; ++jx) {
-          const double qx =
-              twopi_over_x * static_cast<double>(kx_mode + mesh_nx * jx);
-          const double wx_alias = sinc_pow(0.5 * qx * dx, assign_pow);
-
-          for (int jy = -alias_extent; jy <= alias_extent; ++jy) {
-            const double qy =
-                twopi_over_y * static_cast<double>(ky_mode + mesh_ny * jy);
-            const double wy_alias = sinc_pow(0.5 * qy * dy, assign_pow);
-
-            for (int jz = -alias_extent; jz <= alias_extent; ++jz) {
-              const double qz =
-                  twopi_over_z * static_cast<double>(kz_mode + mesh_nz * jz);
-              const double wz_alias = sinc_pow(0.5 * qz * dz, assign_pow);
-
-              const double qsq = qx * qx + qy * qy + qz * qz;
-              if (!(qsq > 0.0 && qsq <= k_sq_max)) {
-                continue;
-              }
-
-              const double kfac_alias = spectral_kernel(qsq);
-              if (!std::isfinite(kfac_alias) || kfac_alias == 0.0) {
-                continue;
-              }
-
-              sum0 += kfac_alias * wx_alias * wy_alias * wz_alias;
-              const double dot1 = kx * qx + ky * qy + kz * qz;
-              sum1 += dot1 * kfac_alias * wx_alias * wy_alias * wz_alias;
-            }
-          }
-        }
-
-        const double geff_energy = sum0 / denominator;
-        const double geff = sum1 / (sqk * denominator);
-        if (!std::isfinite(geff_energy) || !std::isfinite(geff)) {
-          mesh_gradx[2 * idx] = mesh_gradx[2 * idx + 1] = 0.0;
-          mesh_grady[2 * idx] = mesh_grady[2 * idx + 1] = 0.0;
-          mesh_gradz[2 * idx] = mesh_gradz[2 * idx + 1] = 0.0;
-          continue;
-        }
-
-        const double w2y = sinc_pow(0.5 * ky * dy, assign_pow);
-        const double w2z = sinc_pow(0.5 * kz * dz, assign_pow);
-        const double w2_principal = w2x * w2y * w2z;
-        if (w2_principal > 1e-20) {
-          diag_sum_local += sum0 / w2_principal;
-        }
+        // Accumulate self-interaction terms
+        diag_sum_local += mesh_green_self[idx];
 
         const double rho_re = static_cast<double>(mesh_fft_work[2 * idx]);
         const double rho_im = static_cast<double>(mesh_fft_work[2 * idx + 1]);

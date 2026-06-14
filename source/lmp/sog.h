@@ -39,6 +39,8 @@ class SOGKSpace : public KSpace {
 
   void ensure_fft_plan();
   void destroy_fft_plan();
+  void precompute_sinc_tables();
+  void precompute_green_functions();
 
   size_t mesh_index(int ix, int iy, int iz) const;
   double periodic_fraction(double x, double xlo, double prd) const;
@@ -80,6 +82,21 @@ class SOGKSpace : public KSpace {
 
   std::vector<double> amp;
   std::vector<double> bandwidth;
+
+  // Cached Green functions (precomputed once per mesh rebuild)
+  std::vector<double> mesh_green_energy;  // geff_energy[k] for each k-point
+  std::vector<double> mesh_green_force;   // geff[k] for each k-point
+  std::vector<double> mesh_green_self;    // self-interaction diag per k-point
+
+  // Precomputed sinc_pow tables — box-independent, built once per mesh creation.
+  // sinc_table_{x,y,z}[mode_ix * alias_cnt + (j + alias_extent)]
+  std::vector<double> sinc_table_x;
+  std::vector<double> sinc_table_y;
+  std::vector<double> sinc_table_z;
+  // Sum over aliases for each k-mode index.
+  std::vector<double> sinc_sum_x;
+  std::vector<double> sinc_sum_y;
+  std::vector<double> sinc_sum_z;
 };
 
 }  // namespace LAMMPS_NS
