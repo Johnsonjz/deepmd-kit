@@ -1560,7 +1560,8 @@ class Trainer:
         ]
         if len(checkpoint_files) > self.max_ckpt_keep:
             checkpoint_files.sort(key=lambda x: x.stat().st_mtime)
-            checkpoint_files[0].unlink()
+            for f in checkpoint_files[: len(checkpoint_files) - self.max_ckpt_keep]:
+                f.unlink()
 
     def get_data(
         self, is_train: bool = True, task_key: str = "Default"

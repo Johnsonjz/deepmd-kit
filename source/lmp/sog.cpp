@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 
 #include "sog.h"
+#include "sog_spline.h"
 
 #include <math.h>
 
@@ -273,6 +274,201 @@ bool try_load_finufft_api(const std::string &, FinufftApi &, std::string &error_
 }
 #endif
 
+// ── 1D analytic Fourier integrals for the CubeS₂ influence function ──
+// I_p(α) = ∫₀¹ t^p · exp(i·α·t) dt
+// Recurrence-free closed forms with Taylor expansions for |α| < 1e-8.
+// Mirrors fastsog.cpp (used to build |Φ(k)|² analytically).
+
+inline std::complex<double> sog_I_int_0(const double alpha) {
+  if (std::fabs(alpha) < 1e-8) {
+    return std::complex<double>(1.0 - alpha * alpha / 6.0,
+                                alpha / 2.0 - alpha * alpha * alpha / 24.0);
+  }
+  const double cos_a = std::cos(alpha);
+  const double sin_a = std::sin(alpha);
+  return std::complex<double>(sin_a / alpha, (1.0 - cos_a) / alpha);
+}
+
+inline std::complex<double> sog_I_int_1(const double alpha) {
+  if (std::fabs(alpha) < 1e-8) {
+    return std::complex<double>(0.5 - alpha * alpha / 8.0,
+                                alpha / 3.0 - alpha * alpha * alpha / 30.0);
+  }
+  const double cos_a = std::cos(alpha);
+  const double sin_a = std::sin(alpha);
+  const double a2 = alpha * alpha;
+  return std::complex<double>((alpha * sin_a + cos_a - 1.0) / a2,
+                              (sin_a - alpha * cos_a) / a2);
+}
+
+inline std::complex<double> sog_I_int_2(const double alpha) {
+  if (std::fabs(alpha) < 1e-8) {
+    return std::complex<double>(1.0 / 3.0 - alpha * alpha / 10.0, alpha / 4.0);
+  }
+  const double cos_a = std::cos(alpha);
+  const double sin_a = std::sin(alpha);
+  const double a2 = alpha * alpha;
+  const double a3 = a2 * alpha;
+  return std::complex<double>(
+      (2.0 * alpha * sin_a + (a2 - 2.0) * cos_a + 2.0) / a3,
+      ((a2 - 2.0) * sin_a + 2.0 * alpha * cos_a) / a3);
+}
+
+inline std::complex<double> sog_I_int_3(const double alpha) {
+  if (std::fabs(alpha) < 1e-8) {
+    return std::complex<double>(0.25, alpha / 5.0);
+  }
+  const double cos_a = std::cos(alpha);
+  const double sin_a = std::sin(alpha);
+  const double a2 = alpha * alpha;
+  const double a3 = a2 * alpha;
+  const double a4 = a3 * alpha;
+  return std::complex<double>(
+      ((3.0 * a2 - 6.0) * alpha * sin_a + (a3 - 6.0 * alpha) * cos_a + 6.0 * alpha) / a4,
+      ((a3 - 6.0 * alpha) * sin_a + (6.0 - 3.0 * a2) * cos_a + 3.0 * a2 - 6.0) / a4);
+}
+
+// ── Monomial expansion for CubeS₂ 4th-order node weights ──
+// Each entry: (pow_x, pow_y, pow_z, real_coeff). Mirrors fastsog.cpp.
+struct SogMonomialTerm {
+  int px, py, pz;
+  double coeff;
+};
+
+constexpr int kSogMaxMonomialsPerNode = 64;
+
+struct SogCubeS2NodeMonomial {
+  int num_terms;
+  SogMonomialTerm terms[kSogMaxMonomialsPerNode];
+};
+
+// Expand the CubeS₂ weight c_d(θ) into monomials θ_x^px · θ_y^py · θ_z^pz so the
+// influence function Φ(k) = Σ_d e^{i k·d·Δ} Σ C·I_px(αx)·I_py(αy)·I_pz(αz) can be
+// evaluated from the precomputed 1D integrals I_p.
+inline void sog_build_monomials_for_node(const SogCubeS2Node4 &node, const double xi,
+                                         SogCubeS2NodeMonomial &result) {
+  result.num_terms = 0;
+  const int dx = node.dx, dy = node.dy, dz = node.dz;
+  const double a[3] = {static_cast<double>(dx),
+                        static_cast<double>(dy),
+                        static_cast<double>(dz)};
+  const double b[3] = {1.0 - 2.0 * a[0],
+                        1.0 - 2.0 * a[1],
+                        1.0 - 2.0 * a[2]};
+
+  const double xi2 = xi * xi;
+
+  auto binom = [](int n, int k) -> double {
+    if (k < 0 || k > n) return 0.0;
+    constexpr double C[4][4] = {
+      {1, 0, 0, 0},
+      {1, 1, 0, 0},
+      {1, 2, 1, 0},
+      {1, 3, 3, 1},
+    };
+    return C[n][k];
+  };
+
+  if (node.cls == 0) {
+    // Class 0: c_d = L(ηx)·ηy·ηz + L(ηy)·ηz·ηx + L(ηz)·ηx·ηy
+    const double xi2_adj = (9.0 * xi2 - 2.0) / 6.0;
+    const double L_coeffs[4] = {0.5 * xi2, -xi2_adj, 0.5, -0.5};
+
+    for (int term_idx = 0; term_idx < 3; ++term_idx) {
+      int axis_L = term_idx;
+      int axis_n1 = (term_idx + 1) % 3;
+      int axis_n2 = (term_idx + 2) % 3;
+
+      for (int pL = 0; pL <= 3; ++pL) {
+        const double c_L = L_coeffs[pL];
+        if (c_L == 0.0) continue;
+        for (int jL = 0; jL <= pL; ++jL) {
+          const double cf_L = c_L * binom(pL, jL) *
+            std::pow(a[axis_L], static_cast<double>(pL - jL)) *
+            std::pow(b[axis_L], static_cast<double>(jL));
+          for (int jn1 = 0; jn1 <= 1; ++jn1) {
+            const double cf_n1 = binom(1, jn1) *
+              std::pow(a[axis_n1], static_cast<double>(1 - jn1)) *
+              std::pow(b[axis_n1], static_cast<double>(jn1));
+            for (int jn2 = 0; jn2 <= 1; ++jn2) {
+              const double cf_n2 = binom(1, jn2) *
+                std::pow(a[axis_n2], static_cast<double>(1 - jn2)) *
+                std::pow(b[axis_n2], static_cast<double>(jn2));
+              const double coeff = cf_L * cf_n1 * cf_n2;
+              if (coeff == 0.0) continue;
+              int pows[3] = {0, 0, 0};
+              pows[axis_L] = jL;
+              pows[axis_n1] = jn1;
+              pows[axis_n2] = jn2;
+              bool merged = false;
+              for (int m = 0; m < result.num_terms; ++m) {
+                if (result.terms[m].px == pows[0] &&
+                    result.terms[m].py == pows[1] &&
+                    result.terms[m].pz == pows[2]) {
+                  result.terms[m].coeff += coeff;
+                  merged = true;
+                  break;
+                }
+              }
+              if (!merged && result.num_terms < kSogMaxMonomialsPerNode) {
+                result.terms[result.num_terms] = {pows[0], pows[1], pows[2], coeff};
+                result.num_terms++;
+              }
+            }
+          }
+        }
+      }
+    }
+  } else {
+    // Class 1: c_d = R(η_special) · η_n1 · η_n2  (single term, paper Eq. 16)
+    // R(t) = ⅙·t³ + (3ξ²-1)/6·t  →  coeffs [1/6, 0, (3ξ²-1)/6, 0]
+    const double R_coeffs[4] = {0.0, (3.0 * xi2 - 1.0) / 6.0, 0.0, 1.0 / 6.0};
+    int axis_L = node.sp_axis;
+    int axis_n1 = (axis_L + 1) % 3;
+    int axis_n2 = (axis_L + 2) % 3;
+
+    for (int pL = 0; pL <= 3; ++pL) {
+      const double c_R = R_coeffs[pL];
+      if (c_R == 0.0) continue;
+      for (int jL = 0; jL <= pL; ++jL) {
+        const double cf_L = c_R * binom(pL, jL) *
+          std::pow(a[axis_L], static_cast<double>(pL - jL)) *
+          std::pow(b[axis_L], static_cast<double>(jL));
+        for (int jn1 = 0; jn1 <= 1; ++jn1) {
+          const double cf_n1 = binom(1, jn1) *
+            std::pow(a[axis_n1], static_cast<double>(1 - jn1)) *
+            std::pow(b[axis_n1], static_cast<double>(jn1));
+          for (int jn2 = 0; jn2 <= 1; ++jn2) {
+            const double cf_n2 = binom(1, jn2) *
+              std::pow(a[axis_n2], static_cast<double>(1 - jn2)) *
+              std::pow(b[axis_n2], static_cast<double>(jn2));
+            const double coeff = cf_L * cf_n1 * cf_n2;
+            if (coeff == 0.0) continue;
+            int pows[3] = {0, 0, 0};
+            pows[axis_L] = jL;
+            pows[axis_n1] = jn1;
+            pows[axis_n2] = jn2;
+            bool merged = false;
+            for (int m = 0; m < result.num_terms; ++m) {
+              if (result.terms[m].px == pows[0] &&
+                  result.terms[m].py == pows[1] &&
+                  result.terms[m].pz == pows[2]) {
+                result.terms[m].coeff += coeff;
+                merged = true;
+                break;
+              }
+            }
+            if (!merged && result.num_terms < kSogMaxMonomialsPerNode) {
+              result.terms[result.num_terms] = {pows[0], pows[1], pows[2], coeff};
+              result.num_terms++;
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
 }  // namespace
 
 SOGKSpace::SOGKSpace(LAMMPS *lmp)
@@ -286,6 +482,7 @@ SOGKSpace::SOGKSpace(LAMMPS *lmp)
       finufft_warned(false),
   mesh_oversample(1.5),
   mesh_alias_extent(kSOGMeshAliasExtent),
+      spline_type(0),
       b_param(kSOGDefaultB),
       sigma_param(kSOGDefaultSigma),
       m_param(kSOGDefaultM),
@@ -310,7 +507,8 @@ bool SOGKSpace::is_keyword(const std::string &token) const {
          key == "sigma" || key == "m" || key == "amp" ||
          key == "bandwidth" || key == "use_finufft" ||
          key == "finufft_eps" || key == "finufft_library" ||
-         key == "mesh_oversample" || key == "mesh_alias_extent";
+         key == "mesh_oversample" || key == "mesh_alias_extent" ||
+         key == "spline";
 }
 
 bool SOGKSpace::parse_bool_token(const std::string &token, bool &value) const {
@@ -427,6 +625,7 @@ void SOGKSpace::settings(int narg, char **arg) {
   amp.clear();
   bandwidth.clear();
   kernel_ready = false;
+  spline_type = 0;
 
   int iarg = 1;
   while (iarg < narg) {
@@ -521,6 +720,20 @@ void SOGKSpace::settings(int narg, char **arg) {
       }
       mesh_alias_extent = atoi(arg[iarg + 1]);
       iarg += 2;
+    } else if (key == "spline") {
+      if (iarg + 1 >= narg) {
+        error->all(FLERR, "kspace style sog missing spline value");
+      }
+      const std::string val = to_lower_copy(arg[iarg + 1]);
+      if (val == "bspline") {
+        spline_type = 0;
+      } else if (val == "cubes2_4") {
+        spline_type = 4;
+      } else {
+        error->all(FLERR,
+                   "kspace style sog spline expects bspline or cubes2_4");
+      }
+      iarg += 2;
     } else {
       error->all(FLERR, "Illegal kspace_style sog command");
     }
@@ -608,6 +821,9 @@ void SOGKSpace::destroy_fft_plan() {
   sinc_sum_x.clear();
   sinc_sum_y.clear();
   sinc_sum_z.clear();
+  cubes2_influence_re.clear();
+  cubes2_influence_im.clear();
+  cubes2_influence_sq.clear();
 }
 
 void SOGKSpace::ensure_fft_plan() {
@@ -621,79 +837,99 @@ void SOGKSpace::ensure_fft_plan() {
   const double ly = domain->yprd;
   const double lz = domain->zprd;
 
-  // Nyquist lower bound from n_dl: pi / d >= 2*pi / n_dl  =>  d <= n_dl / 2.
-  // mesh_oversample scales beyond the minimum Nyquist-compliant grid.
-  const double mesh_scale = std::max(1.0, mesh_oversample);
-  int nx = std::max(
-      kSOGGridMin, static_cast<int>(std::ceil(mesh_scale * 2.0 * lx / n_dl)));
-  int ny = std::max(
-      kSOGGridMin, static_cast<int>(std::ceil(mesh_scale * 2.0 * ly / n_dl)));
-  int nz = std::max(
-      kSOGGridMin, static_cast<int>(std::ceil(mesh_scale * 2.0 * lz / n_dl)));
-
-  // PPPM-style refinement: use accuracy target to tighten grid counts.
-  // Only run during initial mesh build (mesh_ready == false); on subsequent
-  // calls the grid is kept fixed to avoid q2-dependent oscillations that
-  // would trigger expensive mesh rebuilds every step.
-  if (!mesh_ready && accuracy_in > 0.0 && q2 > 0.0 && atom->natoms > 0) {
-    double cutoff = n_dl;
+  // Retrieve rcut for grid sizing (needed by both B-spline PPPM and CubeS₂
+  // SOG-bandwidth methods).
+  double rcut = n_dl;  // fallback
+  {
     int itmp = 0;
     auto *p_cutoff = (double *) force->pair->extract("cut_coul", itmp);
     if (p_cutoff != nullptr && *p_cutoff > 0.0) {
-      cutoff = *p_cutoff;
+      rcut = *p_cutoff;
     }
+  }
 
-    const double volume = lx * ly * lz;
-    const double natoms = static_cast<double>(atom->natoms);
+  int nx, ny, nz;
 
-    double g_eff =
-        accuracy_in * std::sqrt(natoms * cutoff * volume) / (2.0 * q2);
-    if (!(g_eff > 0.0) || !std::isfinite(g_eff)) {
-      g_eff = MY_2PI / n_dl;
-    } else if (g_eff >= 1.0) {
-      g_eff = (1.35 - 0.15 * std::log(accuracy_in)) / cutoff;
-    } else {
-      g_eff = std::sqrt(-std::log(g_eff)) / cutoff;
-    }
+  if (spline_type >= 4) {
+    // SOG-bandwidth grid estimation for CubeS₂ Midtown splines
+    // φ_max from midtown-sog.md Table III; scaled by fastsog's b_factor.
+    double phi_max = 0.23;  // CubeS₂ 4th, b=2
+    const double b_factor = std::sqrt(std::log(b_param) / std::log(2.0));
+    phi_max /= b_factor;
+    const double delta = phi_max * rcut;
+    nx = std::max(kSOGGridMin, static_cast<int>(std::ceil(lx / delta)));
+    ny = std::max(kSOGGridMin, static_cast<int>(std::ceil(ly / delta)));
+    nz = std::max(kSOGGridMin, static_cast<int>(std::ceil(lz / delta)));
+    // PPPM refinement skipped — CubeS₂ uses φ_max-based grid directly
+  } else {
+    // Legacy B-spline grid: Nyquist lower bound from n_dl + PPPM refinement.
+    const double mesh_scale = std::max(1.0, mesh_oversample);
+    nx = std::max(
+        kSOGGridMin, static_cast<int>(std::ceil(mesh_scale * 2.0 * lx / n_dl)));
+    ny = std::max(
+        kSOGGridMin, static_cast<int>(std::ceil(mesh_scale * 2.0 * ly / n_dl)));
+    nz = std::max(
+        kSOGGridMin, static_cast<int>(std::ceil(mesh_scale * 2.0 * lz / n_dl)));
 
-    if (g_eff > 0.0 && std::isfinite(g_eff)) {
-      double hx = 4.0 / g_eff;
-      double hy = 4.0 / g_eff;
-      double hz = 4.0 / g_eff;
+    // PPPM-style refinement: use accuracy target to tighten grid counts.
+    // Only run during initial mesh build (mesh_ready == false); on subsequent
+    // calls the grid is kept fixed to avoid q2-dependent oscillations that
+    // would trigger expensive mesh rebuilds every step.
+    if (!mesh_ready && accuracy_in > 0.0 && q2 > 0.0 && atom->natoms > 0) {
+      double cutoff = rcut;
 
-      int nx_pppm = std::max(2, static_cast<int>(lx / hx));
-      int ny_pppm = std::max(2, static_cast<int>(ly / hy));
-      int nz_pppm = std::max(2, static_cast<int>(lz / hz));
+      const double volume = lx * ly * lz;
+      const double natoms = static_cast<double>(atom->natoms);
 
-      int count = 0;
-      while (true) {
-        const double errx =
-            pppm_ik_error_estimate_order5(hx, lx, atom->natoms, q2, g_eff);
-        const double erry =
-            pppm_ik_error_estimate_order5(hy, ly, atom->natoms, q2, g_eff);
-        const double errz =
-            pppm_ik_error_estimate_order5(hz, lz, atom->natoms, q2, g_eff);
-        const double err = std::max(errx, std::max(erry, errz));
-
-        ++count;
-        if (err <= accuracy_in) {
-          break;
-        }
-        if (count > kSOGGridMaxIter) {
-          break;
-        }
-
-        hx *= 0.95;
-        hy *= 0.95;
-        hz *= 0.95;
-        nx_pppm = std::max(2, static_cast<int>(lx / hx));
-        ny_pppm = std::max(2, static_cast<int>(ly / hy));
-        nz_pppm = std::max(2, static_cast<int>(lz / hz));
+      double g_eff =
+          accuracy_in * std::sqrt(natoms * cutoff * volume) / (2.0 * q2);
+      if (!(g_eff > 0.0) || !std::isfinite(g_eff)) {
+        g_eff = MY_2PI / n_dl;
+      } else if (g_eff >= 1.0) {
+        g_eff = (1.35 - 0.15 * std::log(accuracy_in)) / cutoff;
+      } else {
+        g_eff = std::sqrt(-std::log(g_eff)) / cutoff;
       }
 
-      nx = std::max(nx, nx_pppm);
-      ny = std::max(ny, ny_pppm);
-      nz = std::max(nz, nz_pppm);
+      if (g_eff > 0.0 && std::isfinite(g_eff)) {
+        double hx = 4.0 / g_eff;
+        double hy = 4.0 / g_eff;
+        double hz = 4.0 / g_eff;
+
+        int nx_pppm = std::max(2, static_cast<int>(lx / hx));
+        int ny_pppm = std::max(2, static_cast<int>(ly / hy));
+        int nz_pppm = std::max(2, static_cast<int>(lz / hz));
+
+        int count = 0;
+        while (true) {
+          const double errx =
+              pppm_ik_error_estimate_order5(hx, lx, atom->natoms, q2, g_eff);
+          const double erry =
+              pppm_ik_error_estimate_order5(hy, ly, atom->natoms, q2, g_eff);
+          const double errz =
+              pppm_ik_error_estimate_order5(hz, lz, atom->natoms, q2, g_eff);
+          const double err = std::max(errx, std::max(erry, errz));
+
+          ++count;
+          if (err <= accuracy_in) {
+            break;
+          }
+          if (count > kSOGGridMaxIter) {
+            break;
+          }
+
+          hx *= 0.95;
+          hy *= 0.95;
+          hz *= 0.95;
+          nx_pppm = std::max(2, static_cast<int>(lx / hx));
+          ny_pppm = std::max(2, static_cast<int>(ly / hy));
+          nz_pppm = std::max(2, static_cast<int>(lz / hz));
+        }
+
+        nx = std::max(nx, nx_pppm);
+        ny = std::max(ny, ny_pppm);
+        nz = std::max(nz, nz_pppm);
+      }
     }
   }
 
@@ -778,7 +1014,11 @@ void SOGKSpace::ensure_fft_plan() {
 #endif
                        );
 
-  precompute_sinc_tables();
+  if (spline_type >= 4) {
+    precompute_cubes2_influence();
+  } else {
+    precompute_sinc_tables();
+  }
   precompute_green_functions();
 
   mesh_ready = true;
@@ -851,6 +1091,124 @@ void SOGKSpace::precompute_sinc_tables() {
   }
 }
 
+void SOGKSpace::precompute_cubes2_influence() {
+  // Analytic CubeS₂ influence function Φ(k) for the 4th-order Midtown spline.
+  // Φ(k) = Σ_d exp(i·k·d·Δ) · Σ_{a,b,c} C_d(a,b,c) · I_a(αx)·I_b(αy)·I_c(αz)
+  // where I_p(α)=∫₀¹ tᵖ e^{iαt}dt and C_d is the node weight polynomial,
+  // expanded into monomials by sog_build_monomials_for_node. The squared
+  // modulus |Φ(k)|² is the assignment-function deconvolution denominator used
+  // by the CubeS₂ Green function branch in precompute_green_functions().
+  // One-time cost per mesh build (Case 3). Mirrors fastsog.cpp.
+  const size_t ngrid = static_cast<size_t>(mesh_nx) *
+                       static_cast<size_t>(mesh_ny) *
+                       static_cast<size_t>(mesh_nz);
+
+  cubes2_influence_re.assign(ngrid, 0.0);
+  cubes2_influence_im.assign(ngrid, 0.0);
+  cubes2_influence_sq.assign(ngrid, 0.0);
+
+  auto *node_mono = new SogCubeS2NodeMonomial[kSogCubes2NumNodes4];
+  const double xi = kSogCubes2Xi4;
+  for (int k = 0; k < kSogCubes2NumNodes4; ++k) {
+    sog_build_monomials_for_node(kSogCubes2Nodes4[k], xi, node_mono[k]);
+  }
+
+  const double twopi_over_x = MY_2PI / mesh_lx;
+  const double twopi_over_y = MY_2PI / mesh_ly;
+  const double twopi_over_z = MY_2PI / mesh_lz;
+  const double dx_grid = mesh_lx / static_cast<double>(mesh_nx);
+  const double dy_grid = mesh_ly / static_cast<double>(mesh_ny);
+  const double dz_grid = mesh_lz / static_cast<double>(mesh_nz);
+
+  // Precompute 1D integrals I_p(α) for each k-mode per axis.
+  std::vector<std::complex<double>> Ipx[4];
+  for (int p = 0; p < 4; ++p) {
+    Ipx[p].resize(static_cast<size_t>(mesh_nx));
+  }
+  for (int ix = 0; ix < mesh_nx; ++ix) {
+    const int kx_mode = ix - mesh_nx * (2 * ix / mesh_nx);
+    const double alpha_x = twopi_over_x * static_cast<double>(kx_mode) * dx_grid;
+    Ipx[0][static_cast<size_t>(ix)] = sog_I_int_0(alpha_x);
+    Ipx[1][static_cast<size_t>(ix)] = sog_I_int_1(alpha_x);
+    Ipx[2][static_cast<size_t>(ix)] = sog_I_int_2(alpha_x);
+    Ipx[3][static_cast<size_t>(ix)] = sog_I_int_3(alpha_x);
+  }
+  std::vector<std::complex<double>> Ipy[4];
+  for (int p = 0; p < 4; ++p) {
+    Ipy[p].resize(static_cast<size_t>(mesh_ny));
+  }
+  for (int iy = 0; iy < mesh_ny; ++iy) {
+    const int ky_mode = iy - mesh_ny * (2 * iy / mesh_ny);
+    const double alpha_y = twopi_over_y * static_cast<double>(ky_mode) * dy_grid;
+    Ipy[0][static_cast<size_t>(iy)] = sog_I_int_0(alpha_y);
+    Ipy[1][static_cast<size_t>(iy)] = sog_I_int_1(alpha_y);
+    Ipy[2][static_cast<size_t>(iy)] = sog_I_int_2(alpha_y);
+    Ipy[3][static_cast<size_t>(iy)] = sog_I_int_3(alpha_y);
+  }
+  std::vector<std::complex<double>> Ipz[4];
+  for (int p = 0; p < 4; ++p) {
+    Ipz[p].resize(static_cast<size_t>(mesh_nz));
+  }
+  for (int iz = 0; iz < mesh_nz; ++iz) {
+    const int kz_mode = iz - mesh_nz * (2 * iz / mesh_nz);
+    const double alpha_z = twopi_over_z * static_cast<double>(kz_mode) * dz_grid;
+    Ipz[0][static_cast<size_t>(iz)] = sog_I_int_0(alpha_z);
+    Ipz[1][static_cast<size_t>(iz)] = sog_I_int_1(alpha_z);
+    Ipz[2][static_cast<size_t>(iz)] = sog_I_int_2(alpha_z);
+    Ipz[3][static_cast<size_t>(iz)] = sog_I_int_3(alpha_z);
+  }
+
+  for (int iz = 0; iz < mesh_nz; ++iz) {
+    const int kz_mode = iz - mesh_nz * (2 * iz / mesh_nz);
+    const double kz = twopi_over_z * static_cast<double>(kz_mode);
+
+    for (int iy = 0; iy < mesh_ny; ++iy) {
+      const int ky_mode = iy - mesh_ny * (2 * iy / mesh_ny);
+      const double ky = twopi_over_y * static_cast<double>(ky_mode);
+
+      for (int ix = 0; ix < mesh_nx; ++ix) {
+        const int kx_mode = ix - mesh_nx * (2 * ix / mesh_nx);
+        const double kx = twopi_over_x * static_cast<double>(kx_mode);
+
+        const double sqk = kx * kx + ky * ky + kz * kz;
+        if (sqk == 0.0) continue;  // skip DC mode
+
+        const size_t idx = mesh_index(ix, iy, iz);
+        std::complex<double> phi_k(0.0, 0.0);
+
+        for (int d = 0; d < kSogCubes2NumNodes4; ++d) {
+          const auto &node = kSogCubes2Nodes4[d];
+          const auto &mono = node_mono[d];
+
+          const double phase = kx * static_cast<double>(node.dx) * dx_grid +
+                               ky * static_cast<double>(node.dy) * dy_grid +
+                               kz * static_cast<double>(node.dz) * dz_grid;
+          const std::complex<double> eikd(std::cos(phase), std::sin(phase));
+
+          std::complex<double> integral(0.0, 0.0);
+          for (int m = 0; m < mono.num_terms; ++m) {
+            const auto &term = mono.terms[m];
+            const std::complex<double> prod =
+                Ipx[term.px][static_cast<size_t>(ix)] *
+                Ipy[term.py][static_cast<size_t>(iy)] *
+                Ipz[term.pz][static_cast<size_t>(iz)];
+            integral += term.coeff * prod;
+          }
+          phi_k += eikd * integral;
+        }
+
+        cubes2_influence_re[idx] = phi_k.real();
+        cubes2_influence_im[idx] = phi_k.imag();
+        const double abs_sq = phi_k.real() * phi_k.real() +
+                              phi_k.imag() * phi_k.imag();
+        cubes2_influence_sq[idx] = abs_sq;
+      }
+    }
+  }
+
+  delete[] node_mono;
+}
+
 void SOGKSpace::precompute_green_functions() {
   // Precompute per-k-point Green functions (geff_energy, geff, self_diag).
   // These depend on mesh geometry (box dimensions via k-vectors) and SOG
@@ -870,7 +1228,21 @@ void SOGKSpace::precompute_green_functions() {
   mesh_green_force.assign(ngrid, 0.0);
   mesh_green_self.assign(ngrid, 0.0);
 
-  const double k_sq_max = (MY_2PI / n_dl) * (MY_2PI / n_dl);
+  // k_sq_max: CubeS₂ uses grid Nyquist (all principal modes); B-spline uses
+  // (2π/n_dl)² to bound the alias loop cost. The SOG kernel kfac = K(k²)
+  // decays exponentially, so any modes beyond ～(2π/n_dl)² contribute
+  // negligibly regardless — both cutoffs are numerically equivalent.
+  double k_sq_max;
+  if (spline_type >= 4) {
+    const double dx = mesh_lx / static_cast<double>(mesh_nx);
+    const double dy = mesh_ly / static_cast<double>(mesh_ny);
+    const double dz = mesh_lz / static_cast<double>(mesh_nz);
+    k_sq_max = MY_PI * MY_PI * (1.0 / (dx * dx) + 1.0 / (dy * dy) +
+                                   1.0 / (dz * dz));
+  } else {
+    k_sq_max = (MY_2PI / n_dl) * (MY_2PI / n_dl);
+  }
+
   const double twopi_over_x = MY_2PI / mesh_lx;
   const double twopi_over_y = MY_2PI / mesh_ly;
   const double twopi_over_z = MY_2PI / mesh_lz;
@@ -893,23 +1265,40 @@ void SOGKSpace::precompute_green_functions() {
   for (int iz = 0; iz < mesh_nz; ++iz) {
     const int kz_mode = iz - mesh_nz * (2 * iz / mesh_nz);
     const double kz = twopi_over_z * static_cast<double>(kz_mode);
-    const double sz_sum = sinc_sum_z[static_cast<size_t>(iz)];
 
     for (int iy = 0; iy < mesh_ny; ++iy) {
       const int ky_mode = iy - mesh_ny * (2 * iy / mesh_ny);
       const double ky = twopi_over_y * static_cast<double>(ky_mode);
-      const double sy_sum = sinc_sum_y[static_cast<size_t>(iy)];
 
       for (int ix = 0; ix < mesh_nx; ++ix) {
         const int kx_mode = ix - mesh_nx * (2 * ix / mesh_nx);
         const double kx = twopi_over_x * static_cast<double>(kx_mode);
-        const double sx_sum = sinc_sum_x[static_cast<size_t>(ix)];
 
         const double sqk = kx * kx + ky * ky + kz * kz;
         if (!(sqk > 0.0 && sqk <= k_sq_max)) {
           continue;
         }
 
+        if (spline_type >= 4) {
+          // CubeS₂ Green function. The grid is oversampled past the kernel
+          // cutoff (mesh_oversample >= 1.0), so no alias can contribute — the
+          // same regime as the B-spline alias fast-path — and the principal-mode
+          // analytic influence |Φ(k)|² suffices: geff = K(k²) / |Φ(k)|².
+          const size_t idx = mesh_index(ix, iy, iz);
+          const double inf_sq = cubes2_influence_sq[idx];
+          if (!(inf_sq > 1e-20) || !std::isfinite(inf_sq)) {
+            continue;
+          }
+          const double kfac = spectral_kernel(sqk);
+          mesh_green_energy[idx] = kfac / inf_sq;
+          mesh_green_force[idx] = kfac / inf_sq;  // alias fast-path
+          mesh_green_self[idx] = kfac;
+          continue;
+        }
+
+        const double sz_sum = sinc_sum_z[static_cast<size_t>(iz)];
+        const double sy_sum = sinc_sum_y[static_cast<size_t>(iy)];
+        const double sx_sum = sinc_sum_x[static_cast<size_t>(ix)];
         const double denom_lin = sx_sum * sy_sum * sz_sum;
         const double denominator = denom_lin * denom_lin;
         if (!(denominator > 1e-20) || !std::isfinite(denominator)) {
@@ -1367,28 +1756,46 @@ void SOGKSpace::compute_mesh_fft(int eflag, int vflag) {
     const double ty = fy - static_cast<double>(iy0);
     const double tz = fz - static_cast<double>(iz0);
 
-    std::array<double, assign_order> wx;
-    std::array<double, assign_order> wy;
-    std::array<double, assign_order> wz;
-    bspline_weights_1d(tx, wx);
-    bspline_weights_1d(ty, wy);
-    bspline_weights_1d(tz, wz);
+    if (spline_type >= 4) {
+      // CubeS₂ 4th-order charge spreading (32 spherical-support nodes).
+      const double xi = kSogCubes2Xi4;
+      const double q_scaled = rho_scale * q[i];
+      for (int k = 0; k < kSogCubes2NumNodes4; ++k) {
+        const auto &node = kSogCubes2Nodes4[k];
+        const double w = sog_cubes2_weight_4(tx, ty, tz, node, xi);
+        if (w == 0.0) {
+          continue;
+        }
+        const int igx = wrap_index(ix0 + node.dx, mesh_nx);
+        const int igy = wrap_index(iy0 + node.dy, mesh_ny);
+        const int igz = wrap_index(iz0 + node.dz, mesh_nz);
+        const size_t idx = mesh_index(igx, igy, igz);
+        mesh_rho[idx] += static_cast<FFT_SCALAR>(q_scaled * w);
+      }
+    } else {
+      std::array<double, assign_order> wx;
+      std::array<double, assign_order> wy;
+      std::array<double, assign_order> wz;
+      bspline_weights_1d(tx, wx);
+      bspline_weights_1d(ty, wy);
+      bspline_weights_1d(tz, wz);
 
-    std::array<int, assign_order> ix;
-    std::array<int, assign_order> iy;
-    std::array<int, assign_order> iz;
-    for (int a = 0; a < assign_order; ++a) {
-      ix[static_cast<size_t>(a)] = wrap_index(ix0 - assign_half + a, mesh_nx);
-      iy[static_cast<size_t>(a)] = wrap_index(iy0 - assign_half + a, mesh_ny);
-      iz[static_cast<size_t>(a)] = wrap_index(iz0 - assign_half + a, mesh_nz);
-    }
+      std::array<int, assign_order> ix;
+      std::array<int, assign_order> iy;
+      std::array<int, assign_order> iz;
+      for (int a = 0; a < assign_order; ++a) {
+        ix[static_cast<size_t>(a)] = wrap_index(ix0 - assign_half + a, mesh_nx);
+        iy[static_cast<size_t>(a)] = wrap_index(iy0 - assign_half + a, mesh_ny);
+        iz[static_cast<size_t>(a)] = wrap_index(iz0 - assign_half + a, mesh_nz);
+      }
 
-    for (int a = 0; a < assign_order; ++a) {
-      for (int b = 0; b < assign_order; ++b) {
-        for (int c = 0; c < assign_order; ++c) {
-          const size_t idx = mesh_index(ix[a], iy[b], iz[c]);
-          mesh_rho[idx] +=
-              static_cast<FFT_SCALAR>(rho_scale * q[i] * wx[a] * wy[b] * wz[c]);
+      for (int a = 0; a < assign_order; ++a) {
+        for (int b = 0; b < assign_order; ++b) {
+          for (int c = 0; c < assign_order; ++c) {
+            const size_t idx = mesh_index(ix[a], iy[b], iz[c]);
+            mesh_rho[idx] +=
+                static_cast<FFT_SCALAR>(rho_scale * q[i] * wx[a] * wy[b] * wz[c]);
+          }
         }
       }
     }
@@ -1486,33 +1893,53 @@ void SOGKSpace::compute_mesh_fft(int eflag, int vflag) {
     const double ty = fy - static_cast<double>(iy0);
     const double tz = fz - static_cast<double>(iz0);
 
-    std::array<double, assign_order> wx;
-    std::array<double, assign_order> wy;
-    std::array<double, assign_order> wz;
-    bspline_weights_1d(tx, wx);
-    bspline_weights_1d(ty, wy);
-    bspline_weights_1d(tz, wz);
-
-    std::array<int, assign_order> ix;
-    std::array<int, assign_order> iy;
-    std::array<int, assign_order> iz;
-    for (int a = 0; a < assign_order; ++a) {
-      ix[static_cast<size_t>(a)] = wrap_index(ix0 - assign_half + a, mesh_nx);
-      iy[static_cast<size_t>(a)] = wrap_index(iy0 - assign_half + a, mesh_ny);
-      iz[static_cast<size_t>(a)] = wrap_index(iz0 - assign_half + a, mesh_nz);
-    }
-
     double gx = 0.0;
     double gy = 0.0;
     double gz = 0.0;
-    for (int a = 0; a < assign_order; ++a) {
-      for (int b = 0; b < assign_order; ++b) {
-        for (int c = 0; c < assign_order; ++c) {
-          const size_t idx = mesh_index(ix[a], iy[b], iz[c]);
-          const double w = wx[a] * wy[b] * wz[c];
-          gx += w * static_cast<double>(mesh_gradx[2 * idx]);
-          gy += w * static_cast<double>(mesh_grady[2 * idx]);
-          gz += w * static_cast<double>(mesh_gradz[2 * idx]);
+
+    if (spline_type >= 4) {
+      // CubeS₂ 4th-order force interpolation (32 spherical-support nodes).
+      const double xi = kSogCubes2Xi4;
+      for (int k = 0; k < kSogCubes2NumNodes4; ++k) {
+        const auto &node = kSogCubes2Nodes4[k];
+        const double w = sog_cubes2_weight_4(tx, ty, tz, node, xi);
+        if (w == 0.0) {
+          continue;
+        }
+        const int igx = wrap_index(ix0 + node.dx, mesh_nx);
+        const int igy = wrap_index(iy0 + node.dy, mesh_ny);
+        const int igz = wrap_index(iz0 + node.dz, mesh_nz);
+        const size_t idx = mesh_index(igx, igy, igz);
+        gx += w * static_cast<double>(mesh_gradx[2 * idx]);
+        gy += w * static_cast<double>(mesh_grady[2 * idx]);
+        gz += w * static_cast<double>(mesh_gradz[2 * idx]);
+      }
+    } else {
+      std::array<double, assign_order> wx;
+      std::array<double, assign_order> wy;
+      std::array<double, assign_order> wz;
+      bspline_weights_1d(tx, wx);
+      bspline_weights_1d(ty, wy);
+      bspline_weights_1d(tz, wz);
+
+      std::array<int, assign_order> ix;
+      std::array<int, assign_order> iy;
+      std::array<int, assign_order> iz;
+      for (int a = 0; a < assign_order; ++a) {
+        ix[static_cast<size_t>(a)] = wrap_index(ix0 - assign_half + a, mesh_nx);
+        iy[static_cast<size_t>(a)] = wrap_index(iy0 - assign_half + a, mesh_ny);
+        iz[static_cast<size_t>(a)] = wrap_index(iz0 - assign_half + a, mesh_nz);
+      }
+
+      for (int a = 0; a < assign_order; ++a) {
+        for (int b = 0; b < assign_order; ++b) {
+          for (int c = 0; c < assign_order; ++c) {
+            const size_t idx = mesh_index(ix[a], iy[b], iz[c]);
+            const double w = wx[a] * wy[b] * wz[c];
+            gx += w * static_cast<double>(mesh_gradx[2 * idx]);
+            gy += w * static_cast<double>(mesh_grady[2 * idx]);
+            gz += w * static_cast<double>(mesh_gradz[2 * idx]);
+          }
         }
       }
     }
@@ -1597,7 +2024,10 @@ double SOGKSpace::memory_usage() {
       mesh_fft_work.capacity() * sizeof(FFT_SCALAR) +
       mesh_gradx.capacity() * sizeof(FFT_SCALAR) +
       mesh_grady.capacity() * sizeof(FFT_SCALAR) +
-      mesh_gradz.capacity() * sizeof(FFT_SCALAR);
+      mesh_gradz.capacity() * sizeof(FFT_SCALAR) +
+      (cubes2_influence_re.capacity() + cubes2_influence_im.capacity() +
+       cubes2_influence_sq.capacity()) *
+          sizeof(double);
   const size_t param_bytes =
       (amp.capacity() + bandwidth.capacity()) * sizeof(double);
   return static_cast<double>(mesh_bytes + param_bytes);

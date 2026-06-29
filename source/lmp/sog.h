@@ -40,6 +40,7 @@ class SOGKSpace : public KSpace {
   void ensure_fft_plan();
   void destroy_fft_plan();
   void precompute_sinc_tables();
+  void precompute_cubes2_influence();
   void precompute_green_functions();
 
   size_t mesh_index(int ix, int iy, int iz) const;
@@ -55,6 +56,9 @@ class SOGKSpace : public KSpace {
 
   double mesh_oversample;
   int mesh_alias_extent;
+
+  // Charge-assignment spline: 0 = order-5 B-spline (default), 4 = CubeS₂ 4th.
+  int spline_type;
 
   double b_param;
   double sigma_param;
@@ -97,6 +101,11 @@ class SOGKSpace : public KSpace {
   std::vector<double> sinc_sum_x;
   std::vector<double> sinc_sum_y;
   std::vector<double> sinc_sum_z;
+
+  // CubeS₂ influence function Φ(k) (replaces sinc tables when spline_type >= 4).
+  std::vector<double> cubes2_influence_re;  // Re[Φ(k)]
+  std::vector<double> cubes2_influence_im;  // Im[Φ(k)]
+  std::vector<double> cubes2_influence_sq;  // |Φ(k)|²
 };
 
 }  // namespace LAMMPS_NS
