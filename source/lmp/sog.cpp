@@ -482,7 +482,7 @@ SOGKSpace::SOGKSpace(LAMMPS *lmp)
       finufft_warned(false),
   mesh_oversample(1.5),
   mesh_alias_extent(kSOGMeshAliasExtent),
-      spline_type(0),
+      spline_type(4),  // CubeS₂ 4th-order Midtown splines (default)
       b_param(kSOGDefaultB),
       sigma_param(kSOGDefaultSigma),
       m_param(kSOGDefaultM),
@@ -557,7 +557,10 @@ void SOGKSpace::finalize_kernel_parameters() {
 
   if (amp.empty()) {
     const double amp0 = 4.0 * MY_PI * std::log(b_param);
-    amp.assign(bandwidth.size(), amp0);
+    amp.resize(bandwidth.size());
+    for (size_t mm = 0; mm < bandwidth.size(); ++mm) {
+      amp[mm] = amp0 * bandwidth[mm];
+    }
   }
 
   if (amp.size() == 1 && bandwidth.size() > 1) {
