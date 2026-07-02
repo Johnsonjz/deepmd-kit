@@ -113,20 +113,31 @@ class SOGEnergyModel(DPModelCommon, SOGEnergyModel_):
             dtype=real_dtype,
         )
 
-        kernel = sog_lib.Sog(
-            sog_arguments={
-                "use_atomwise": False,
-                "n_dl": float(fitting.n_dl),
-                "amp": amp_internal_runtime,
+        nlayers = getattr(self.atomic_model.descriptor, "nlayers", 1) if hasattr(self.atomic_model, "descriptor") else 1
+        # Build sog_arguments dict — prefer cubes2_phi_max, fall back to n_dl
+        sog_args: dict = {
+            "use_atomwise": False,
+            "amp": amp_internal_runtime,
                 "bandwidth": bw2_runtime,
                 "kernel_param_mode": "internal",
                 "kernel_tensor_mode": "external",
                 "remove_self_interaction": bool(fitting.remove_self_interaction),
                 "nufft": False,
                 "use_nufft": False,
+                "use_cubes2_fft": True,
+                "nlayers": nlayers,
                 "norm_factor": E2_PER_ANGSTROM_TO_EV,
                 "trainable_kernel": False,
-            },
+            }
+        # Prefer cubes2_phi_max (new API), fall back to n_dl (legacy)
+        if getattr(fitting, "cubes2_phi_max", None) is not None:
+            sog_args["cubes2_phi_max"] = float(fitting.cubes2_phi_max)
+        elif getattr(fitting, "n_dl", None) is not None:
+            sog_args["n_dl"] = float(fitting.n_dl)
+        # else: auto-default from SOG lib's Table III
+
+        kernel = sog_lib.Sog(
+            sog_arguments=sog_args,
             r_cut=float(self.get_rcut()),
         )
         return kernel

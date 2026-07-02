@@ -101,8 +101,11 @@ class SOGEnergyFittingNet(LRFittingNet):
         Base bandwidth used by SOG parameterization.
     M : int
         Number of geometric bandwidth levels.
-    n_dl : float
-        NUFFT long-range grid density control factor.
+    n_dl : float, optional (deprecated)
+        Legacy grid density control. Use `cubes2_phi_max` instead.
+    cubes2_phi_max : float, optional
+        φ = Δ/r_c grid control factor. Auto-defaults from Predescu 2020 Table III
+        when not specified. See sog lib documentation for recommended values.
     remove_self_interaction : bool
         If True, remove self interaction term in long-range correction.
     external_kspace : bool
@@ -141,7 +144,8 @@ class SOGEnergyFittingNet(LRFittingNet):
         b: float | torch.Tensor | None = None,
         sigma: float | torch.Tensor | None = None,
         M: int | None = None,
-        n_dl: float | int = 1.0,
+        n_dl: float | int | None = None,
+        cubes2_phi_max: float | None = None,
         remove_self_interaction: bool = False,
         external_kspace: bool = False,
         **kwargs: Any,
@@ -174,27 +178,25 @@ class SOGEnergyFittingNet(LRFittingNet):
             **kwargs,
         )
         if b is None:
-            b_tensor = torch.as_tensor(SOG_DEFAULT_B, dtype=dtype, device=device)
+            b_value = SOG_DEFAULT_B  # sog lib default (b=2)
         else:
             b_tensor = torch.as_tensor(b, dtype=dtype, device=device)
-        if b_tensor.numel() == 0:
-            b_tensor = torch.as_tensor(SOG_DEFAULT_B, dtype=dtype, device=device)
-        b_value = float(b_tensor.reshape(-1)[0].item())
+            b_value = float(b_tensor.reshape(-1)[0].item())
         if b_value <= 0.0:
             raise ValueError("`b` should be positive.")
 
         if sigma is None:
-            sigma_tensor = torch.as_tensor(SOG_DEFAULT_SIGMA, dtype=dtype, device=device)
+            sigma_value = SOG_DEFAULT_SIGMA  # will be overridden by sog lib via rcut
         else:
             sigma_tensor = torch.as_tensor(sigma, dtype=dtype, device=device)
-        if sigma_tensor.numel() == 0:
-            sigma_tensor = torch.as_tensor(SOG_DEFAULT_SIGMA, dtype=dtype, device=device)
-        sigma_value = float(sigma_tensor.reshape(-1)[0].item())
+            sigma_value = float(sigma_tensor.reshape(-1)[0].item())
         if sigma_value <= 0.0:
             raise ValueError("`sigma` should be positive.")
 
-        m_value = SOG_DEFAULT_M if M is None else int(M)
-        m_value = max(1, m_value)
+        if M is None:
+            m_value = SOG_DEFAULT_M  # sog lib default (M=12)
+        else:
+            m_value = max(1, int(M))
 
         if bandwidth is None:
             b_base = torch.tensor(b_value, dtype=dtype, device=device)
@@ -233,11 +235,18 @@ class SOGEnergyFittingNet(LRFittingNet):
         # Store amp as sog-lib internal amplitude (already includes bw^2 factor).
         amp_tensor *= bandwidth_tensor
 
-        n_dl_value = float(n_dl)
-        if (not np.isfinite(n_dl_value)) or n_dl_value <= 0.0:
-            raise ValueError("`n_dl` should be a positive finite number.")
+        # Grid control: prefer cubes2_phi_max, fall back to n_dl (deprecated)
+        if n_dl is not None:
+            n_dl_value = float(n_dl)
+            if (not np.isfinite(n_dl_value)) or n_dl_value <= 0.0:
+                raise ValueError("`n_dl` should be a positive finite number.")
+        if cubes2_phi_max is not None:
+            phi_val = float(cubes2_phi_max)
+            if (not np.isfinite(phi_val)) or phi_val <= 0.0:
+                raise ValueError("`cubes2_phi_max` should be positive finite.")
 
-        self.n_dl = n_dl_value
+        self.n_dl = float(n_dl) if n_dl is not None else None
+        self.cubes2_phi_max = float(cubes2_phi_max) if cubes2_phi_max is not None else None
         self.amp = torch.nn.Parameter(
             amp_tensor,
             requires_grad=bool(self.trainable),
@@ -282,7 +291,10 @@ class SOGEnergyFittingNet(LRFittingNet):
         data["b"] = float(self.b)
         data["sigma"] = float(self.sigma)
         data["M"] = int(self.M)
-        data["n_dl"] = self.n_dl
+        if self.cubes2_phi_max is not None:
+            data["cubes2_phi_max"] = self.cubes2_phi_max
+        if self.n_dl is not None:
+            data["n_dl"] = self.n_dl  # legacy
         data["remove_self_interaction"] = bool(self.remove_self_interaction)
         data["external_kspace"] = bool(self.external_kspace)
         return data

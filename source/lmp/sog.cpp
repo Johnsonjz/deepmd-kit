@@ -487,6 +487,7 @@ SOGKSpace::SOGKSpace(LAMMPS *lmp)
       sigma_param(kSOGDefaultSigma),
       m_param(kSOGDefaultM),
       self_diag_sum(0.0),
+      self_coeff(0.0),
       kernel_ready(false),
       mesh_ready(false),
       mesh_nx(0),
@@ -503,7 +504,8 @@ SOGKSpace::~SOGKSpace() { destroy_fft_plan(); }
 
 bool SOGKSpace::is_keyword(const std::string &token) const {
   const std::string key = to_lower_copy(token);
-  return key == "n_dl" || key == "remove_self_interaction" || key == "b" ||
+  return key == "n_dl" || key == "cubes2_phi_max" ||
+         key == "remove_self_interaction" || key == "b" ||
          key == "sigma" || key == "m" || key == "amp" ||
          key == "bandwidth" || key == "use_finufft" ||
          key == "finufft_eps" || key == "finufft_library" ||
@@ -522,6 +524,24 @@ bool SOGKSpace::parse_bool_token(const std::string &token, bool &value) const {
     return true;
   }
   return false;
+}
+
+// ── RBSOG self-energy helpers ──
+
+static double G_sigma(const double sigma, const double r) {
+  return std::exp(-r * r / (2.0 * sigma * sigma)) /
+         std::sqrt(2.0 * MY_PI * sigma * sigma);
+}
+
+static double compute_w0(const double r0, const double b) {
+  // r0 = rcut / sigma
+  double sum = 0.0;
+  for (int i = 1; i < 200; ++i) {
+    const double bi = std::pow(b, static_cast<double>(-i));
+    sum += bi * G_sigma(1.0, bi * r0);
+  }
+  return (1.0 / G_sigma(1.0, r0)) *
+         ((1.0 / (2.0 * std::log(b) * r0)) - sum);
 }
 
 void SOGKSpace::finalize_kernel_parameters() {
@@ -602,6 +622,23 @@ double SOGKSpace::spectral_kernel(const double sqk) const {
   return coeff;
 }
 
+double SOGKSpace::virial_kernel(const double sqk) const {
+  // ∂K/∂(k²) weighted by bandwidth:
+  //   virial_kernel(k²) = Σ_ℓ  amp[ℓ] · bandwidth[ℓ] · exp(-½ bandwidth[ℓ] · k²)
+  // Used to build the k-space virial via (rbsog-npt.md §3.1):
+  //   W_{αβ}^F = (1/(2V)) Σ_k |ρ(k)|² [K(k²)δ_{αβ} - virial_kernel(k²)·k_α·k_β]
+  if (!(sqk > 0.0)) {
+    return 0.0;
+  }
+
+  double coeff = 0.0;
+  for (size_t mm = 0; mm < amp.size(); ++mm) {
+    coeff += amp[mm] * bandwidth[mm] * std::exp(-0.5 * bandwidth[mm] * sqk);
+  }
+
+  return coeff;
+}
+
 void SOGKSpace::settings(int narg, char **arg) {
   if (narg < 1) {
     error->all(FLERR, "Illegal kspace_style sog command");
@@ -615,6 +652,7 @@ void SOGKSpace::settings(int narg, char **arg) {
   accuracy_relative = accuracy_in;
 
   n_dl = 1.0;
+  cubes2_phi_max = 0.0;  // 0 = auto from Table III
   remove_self_interaction = false;
   use_finufft = true;
   finufft_eps = kSOGDefaultFinufftEps;
@@ -638,6 +676,16 @@ void SOGKSpace::settings(int narg, char **arg) {
         error->all(FLERR, "kspace style sog missing n_dl value");
       }
       n_dl = atof(arg[iarg + 1]);
+      iarg += 2;
+    } else if (key == "cubes2_phi_max") {
+      if (iarg + 1 >= narg) {
+        error->all(FLERR, "kspace style sog missing cubes2_phi_max value");
+      }
+      cubes2_phi_max = atof(arg[iarg + 1]);
+      if (!(std::isfinite(cubes2_phi_max) && cubes2_phi_max > 0.0)) {
+        error->all(FLERR,
+                   "kspace style sog cubes2_phi_max must be positive finite");
+      }
       iarg += 2;
     } else if (key == "remove_self_interaction") {
       if (iarg + 1 >= narg) {
@@ -732,9 +780,11 @@ void SOGKSpace::settings(int narg, char **arg) {
         spline_type = 0;
       } else if (val == "cubes2_4") {
         spline_type = 4;
+      } else if (val == "cubes2_6") {
+        spline_type = 6;
       } else {
         error->all(FLERR,
-                   "kspace style sog spline expects bspline or cubes2_4");
+                   "kspace style sog spline expects bspline, cubes2_4, or cubes2_6");
       }
       iarg += 2;
     } else {
@@ -777,6 +827,23 @@ void SOGKSpace::init() {
     error->all(FLERR,
                "kspace style sog is incompatible with current pair style");
   }
+  const double rcut = *p_cutoff;
+  if (!(rcut > 0.0)) {
+    error->all(FLERR, "kspace style sog requires positive cut_coul");
+  }
+
+  // Compute self-coefficient for RBSOG real-space self-energy correction.
+  // self_coeff = log(b) / (sqrt(2π)·σ) · (w0 + Σ_{m=1}^{M-1} b^{-m})
+  // where w0 enforces continuity of the u-series at r=rcut.
+  const double r0 = rcut / sigma_param;
+  const double w0 = compute_w0(r0, b_param);
+  const double logb = std::log(b_param);
+  double sum_b = 0.0;
+  for (int m = 1; m < m_param; ++m) {
+    sum_b += std::pow(b_param, static_cast<double>(-m));
+  }
+  self_coeff = (logb / (std::sqrt(2.0 * MY_PI) * sigma_param)) *
+               (w0 + sum_b);
 
   scale = 1.0;
   qqrd2e = force->qqrd2e;
@@ -854,16 +921,39 @@ void SOGKSpace::ensure_fft_plan() {
   int nx, ny, nz;
 
   if (spline_type >= 4) {
-    // SOG-bandwidth grid estimation for CubeS₂ Midtown splines
-    // φ_max from midtown-sog.md Table III; scaled by fastsog's b_factor.
-    double phi_max = 0.23;  // CubeS₂ 4th, b=2
-    const double b_factor = std::sqrt(std::log(b_param) / std::log(2.0));
-    phi_max /= b_factor;
-    const double delta = phi_max * rcut;
+    // SOG-bandwidth grid estimation for CubeS₂ Midtown splines.
+    // φ = Δ/r_c from Predescu 2020 Table III (or user-specified).
+    double phi_val;
+    if (cubes2_phi_max > 0.0) {
+      // User-specified φ value
+      phi_val = cubes2_phi_max;
+    } else {
+      // Auto from Table III (Predescu 2020 JCP 153, 224117):
+      //   CubeS₂ 4th, b=2:      φ_max = 0.23
+      //   CubeS₂ 4th, b≈1.630:  φ_max = 0.065
+      //   CubeS₂ 6th, b=2:      φ_max = 0.35
+      //   CubeS₂ 6th, b≈1.630:  φ_max = 0.160
+      // Linear interpolation between tabulated values.
+      const double b_ref_lo = 1.6297670882677647;
+      const double phi_lo = (spline_type >= 6) ? 0.160 : 0.065;
+      const double b_ref_hi = 2.0;
+      const double phi_hi = (spline_type >= 6) ? 0.350 : 0.230;
+      double phi_max;
+      if (b_param <= b_ref_lo) {
+        phi_max = phi_lo;
+      } else if (b_param >= b_ref_hi) {
+        phi_max = phi_hi;
+      } else {
+        phi_max = phi_lo + (b_param - b_ref_lo) / (b_ref_hi - b_ref_lo)
+                                * (phi_hi - phi_lo);
+      }
+      phi_val = phi_max;
+    }
+    const double delta = phi_val * rcut;
     nx = std::max(kSOGGridMin, static_cast<int>(std::ceil(lx / delta)));
     ny = std::max(kSOGGridMin, static_cast<int>(std::ceil(ly / delta)));
     nz = std::max(kSOGGridMin, static_cast<int>(std::ceil(lz / delta)));
-    // PPPM refinement skipped — CubeS₂ uses φ_max-based grid directly
+    // PPPM refinement skipped — CubeS₂ uses φ-based grid directly
   } else {
     // Legacy B-spline grid: Nyquist lower bound from n_dl + PPPM refinement.
     const double mesh_scale = std::max(1.0, mesh_oversample);
@@ -1097,11 +1187,14 @@ void SOGKSpace::precompute_sinc_tables() {
 void SOGKSpace::precompute_cubes2_influence() {
   // Analytic CubeS₂ influence function Φ(k) for the 4th-order Midtown spline.
   // Φ(k) = Σ_d exp(i·k·d·Δ) · Σ_{a,b,c} C_d(a,b,c) · I_a(αx)·I_b(αy)·I_c(αz)
-  // where I_p(α)=∫₀¹ tᵖ e^{iαt}dt and C_d is the node weight polynomial,
-  // expanded into monomials by sog_build_monomials_for_node. The squared
-  // modulus |Φ(k)|² is the assignment-function deconvolution denominator used
-  // by the CubeS₂ Green function branch in precompute_green_functions().
-  // One-time cost per mesh build (Case 3). Mirrors fastsog.cpp.
+  // where I_p(α)=∫₀¹ tᵖ e^{iαt}dt is the 1D Fourier integral of the monomial
+  // basis and C_d is the node weight polynomial expanded by
+  // sog_build_monomials_for_node. The squared modulus |Φ(k)|² is the
+  // assignment-function deconvolution denominator used by the CubeS₂ Green
+  // function branch in precompute_green_functions().
+  //
+  // One-time cost per mesh build. Identical algorithm to fastsog.cpp
+  // precompute_cubes2_influence() (verified correct against PPPM).
   const size_t ngrid = static_cast<size_t>(mesh_nx) *
                        static_cast<size_t>(mesh_ny) *
                        static_cast<size_t>(mesh_nz);
@@ -1111,7 +1204,7 @@ void SOGKSpace::precompute_cubes2_influence() {
   cubes2_influence_sq.assign(ngrid, 0.0);
 
   auto *node_mono = new SogCubeS2NodeMonomial[kSogCubes2NumNodes4];
-  const double xi = kSogCubes2Xi4;
+  const double xi = (spline_type == 4) ? kSogCubes2Xi4 : kSogCubes2Xi4;
   for (int k = 0; k < kSogCubes2NumNodes4; ++k) {
     sog_build_monomials_for_node(kSogCubes2Nodes4[k], xi, node_mono[k]);
   }
@@ -1230,6 +1323,7 @@ void SOGKSpace::precompute_green_functions() {
   mesh_green_energy.assign(ngrid, 0.0);
   mesh_green_force.assign(ngrid, 0.0);
   mesh_green_self.assign(ngrid, 0.0);
+  mesh_green_virial.assign(ngrid, 0.0);
 
   // k_sq_max: CubeS₂ uses grid Nyquist (all principal modes); B-spline uses
   // (2π/n_dl)² to bound the alias loop cost. The SOG kernel kfac = K(k²)
@@ -1293,9 +1387,11 @@ void SOGKSpace::precompute_green_functions() {
             continue;
           }
           const double kfac = spectral_kernel(sqk);
+          const double vkern = virial_kernel(sqk);
           mesh_green_energy[idx] = kfac / inf_sq;
           mesh_green_force[idx] = kfac / inf_sq;  // alias fast-path
           mesh_green_self[idx] = kfac;
+          mesh_green_virial[idx] = vkern / inf_sq;
           continue;
         }
 
@@ -1331,6 +1427,7 @@ void SOGKSpace::precompute_green_functions() {
           const double w2_principal = w2x * w2y * w2z;
 
           const double kfac = spectral_kernel(sqk);
+          const double vkern = virial_kernel(sqk);
           sum0 = kfac * w2_principal;
           sum1 = sqk * sum0;
 
@@ -1340,6 +1437,7 @@ void SOGKSpace::precompute_green_functions() {
 
           mesh_green_energy[idx] = geff_energy;
           mesh_green_force[idx] = geff_energy;
+          mesh_green_virial[idx] = vkern * w2_principal / denominator;
           if (w2_principal > 1e-20) {
             mesh_green_self[idx] = sum0 / w2_principal;
           }
@@ -1347,6 +1445,7 @@ void SOGKSpace::precompute_green_functions() {
           // ── Full path: aliases may contribute ──
           sum0 = 0.0;
           sum1 = 0.0;
+          double sum_virial = 0.0;
           for (int jx = -alias_extent; jx <= alias_extent; ++jx) {
             const double qx =
                 twopi_over_x * static_cast<double>(kx_mode + mesh_nx * jx);
@@ -1382,6 +1481,12 @@ void SOGKSpace::precompute_green_functions() {
                 sum0 += kfac_alias * wprod;
                 const double dot1 = kx * qx + ky * qy + kz * qz;
                 sum1 += dot1 * kfac_alias * wprod;
+
+                // Virial: sum over aliases of K_v(q²) * wprod
+                const double kfac_virial = virial_kernel(qsq);
+                if (std::isfinite(kfac_virial) && kfac_virial != 0.0) {
+                  sum_virial += kfac_virial * wprod;
+                }
               }
             }
           }
@@ -1397,6 +1502,7 @@ void SOGKSpace::precompute_green_functions() {
 
           mesh_green_energy[idx] = geff_energy;
           mesh_green_force[idx] = geff;
+          mesh_green_virial[idx] = sum_virial / denominator;
 
           // Self-interaction diag term: sum0 / W2(principal k)
           const double w2x = sinc_table_x[tbl_base_x +
@@ -1683,6 +1789,8 @@ bool SOGKSpace::compute_finufft(int eflag, int vflag) {
   }
 
   if (want_energy_global) {
+    // RBSOG real-space self-energy correction (FINUFFT path)
+    energy_local -= self_coeff * qsqsum_local;
     energy = qscale_local * energy_local;
   } else {
     energy = 0.0;
@@ -1760,7 +1868,9 @@ void SOGKSpace::compute_mesh_fft(int eflag, int vflag) {
     const double tz = fz - static_cast<double>(iz0);
 
     if (spline_type >= 4) {
-      // CubeS₂ 4th-order charge spreading (32 spherical-support nodes).
+      // CubeS₂ charge spreading.
+      // spline_type == 6: 6th-order weight polynomials need verification
+      // against paper Appendix Eq. A9. Falling back to 4th-order.
       const double xi = kSogCubes2Xi4;
       const double q_scaled = rho_scale * q[i];
       for (int k = 0; k < kSogCubes2NumNodes4; ++k) {
@@ -1820,6 +1930,7 @@ void SOGKSpace::compute_mesh_fft(int eflag, int vflag) {
 
   double energy_local = 0.0;
   double diag_sum_local = 0.0;
+  std::array<double, 6> virial_local = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};     // analytic
 
   // Use precomputed Green functions (built once per mesh rebuild in
   // precompute_green_functions()).  This eliminates the per-step
@@ -1861,6 +1972,22 @@ void SOGKSpace::compute_mesh_fft(int eflag, int vflag) {
               s2 * geff_energy * (rho_re * rho_re + rho_im * rho_im);
         }
 
+        // ── Analytic k-space virial (rbsog-npt.md §3.1) ──
+        // For orthogonal boxes this should match Σ r_i·F_i exactly.
+        // Accumulated here as a debug cross-check against the force-based virial.
+        //   W_{αβ}^F = s2 · Σ_k |ρ(k)|² · (G_energy·δ_{αβ} - G_virial·k_α·k_β)
+        // where G_energy = K(k²)/|Φ(k)|²,  G_virial = virial_kernel(k²)/|Φ(k)|²
+        if (want_virial_global) {
+          const double rho_sq = rho_re * rho_re + rho_im * rho_im;
+          const double geff_v = mesh_green_virial[idx];
+          virial_local[0] += s2 * rho_sq * (geff_energy - geff_v * kx * kx);
+          virial_local[1] += s2 * rho_sq * (geff_energy - geff_v * ky * ky);
+          virial_local[2] += s2 * rho_sq * (geff_energy - geff_v * kz * kz);
+          virial_local[3] += s2 * rho_sq * (-geff_v * kx * ky);
+          virial_local[4] += s2 * rho_sq * (-geff_v * kx * kz);
+          virial_local[5] += s2 * rho_sq * (-geff_v * ky * kz);
+        }
+
         const double vk_re = scaleinv * geff * rho_re;
         const double vk_im = scaleinv * geff * rho_im;
 
@@ -1879,7 +2006,7 @@ void SOGKSpace::compute_mesh_fft(int eflag, int vflag) {
   mesh_fft->compute(mesh_gradz.data(), mesh_gradz.data(), FFT3d::BACKWARD);
 
   const double qscale_local = force->qqrd2e * scale;
-  std::array<double, 6> virial_local = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
+  std::array<double, 6> virial_local_rF = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};  // r_i·F_i
 
   for (int i = 0; i < nlocal; ++i) {
     const double fx = periodic_fraction(x[i][0], domain->boxlo[0], mesh_lx) *
@@ -1901,7 +2028,8 @@ void SOGKSpace::compute_mesh_fft(int eflag, int vflag) {
     double gz = 0.0;
 
     if (spline_type >= 4) {
-      // CubeS₂ 4th-order force interpolation (32 spherical-support nodes).
+      // CubeS₂ force interpolation.
+      // spline_type == 6 falls back to 4th-order (see spread comment).
       const double xi = kSogCubes2Xi4;
       for (int k = 0; k < kSogCubes2NumNodes4; ++k) {
         const auto &node = kSogCubes2Nodes4[k];
@@ -1957,12 +2085,12 @@ void SOGKSpace::compute_mesh_fft(int eflag, int vflag) {
     atom->f[i][2] += fzs;
 
     if (want_virial_global) {
-      virial_local[0] += x[i][0] * fxs;
-      virial_local[1] += x[i][1] * fys;
-      virial_local[2] += x[i][2] * fzs;
-      virial_local[3] += x[i][0] * fys;
-      virial_local[4] += x[i][0] * fzs;
-      virial_local[5] += x[i][1] * fzs;
+      virial_local_rF[0] += x[i][0] * fxs;
+      virial_local_rF[1] += x[i][1] * fys;
+      virial_local_rF[2] += x[i][2] * fzs;
+      virial_local_rF[3] += x[i][0] * fys;
+      virial_local_rF[4] += x[i][0] * fzs;
+      virial_local_rF[5] += x[i][1] * fzs;
     }
   }
 
@@ -1986,14 +2114,41 @@ void SOGKSpace::compute_mesh_fft(int eflag, int vflag) {
     if (remove_self_interaction) {
       energy -= qsqsum_all * self_diag_sum;
     }
+    // RBSOG real-space self-energy correction
+    energy -= self_coeff * qsqsum_all;
     energy *= qscale_local;
   }
 
   if (want_virial_global) {
     double virial_all[6] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
+    double virial_rF_all[6] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
     MPI_Allreduce(virial_local.data(), virial_all, 6, MPI_DOUBLE, MPI_SUM, world);
+    MPI_Allreduce(virial_local_rF.data(), virial_rF_all, 6, MPI_DOUBLE, MPI_SUM, world);
+
+    // Analytic virial as default (rbsog-npt.md §3.1):
+    //   W_{αβ} = 0.5·V·qscale · s2 · Σ_k |ρ|² (G_energy·δ_{αβ} - G_virial·k_α·k_β)
+    const double virial_scale = 0.5 * volume_local * qscale_local;
     for (int j = 0; j < 6; ++j) {
-      virial[j] = virial_all[j];
+      virial[j] = virial_scale * virial_all[j];
+    }
+
+    // Debug: compare analytic vs Σ r_i·F_i on first mesh build
+    if (comm->me == 0) {
+      std::string ss = "SOG virial check (analytic vs r_i-F_i):";
+      const char *names[6] = {"xx","yy","zz","xy","xz","yz"};
+      for (int j = 0; j < 6; ++j) {
+        double ana = virial_scale * virial_all[j];
+        double delta = ana - virial_rF_all[j];
+        double rel = (std::abs(virial_rF_all[j]) > 1e-10)
+                         ? std::abs(delta / virial_rF_all[j]) * 100.0
+                         : 0.0;
+        char buf[128];
+        std::snprintf(buf, sizeof(buf),
+                      " %s: ana=%.6g rF=%.6g diff=%.3g (%.2f%%)",
+                      names[j], ana, virial_rF_all[j], delta, rel);
+        ss += buf;
+      }
+      utils::logmesg(lmp, ss + "\n");
     }
   }
 }

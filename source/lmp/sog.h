@@ -34,6 +34,7 @@ class SOGKSpace : public KSpace {
   bool parse_bool_token(const std::string& token, bool& value) const;
   void finalize_kernel_parameters();
   double spectral_kernel(const double sqk) const;
+  double virial_kernel(const double sqk) const;
   bool compute_finufft(int eflag, int vflag);
   void compute_mesh_fft(int eflag, int vflag);
 
@@ -48,6 +49,7 @@ class SOGKSpace : public KSpace {
 
   double accuracy_in;
   double n_dl;
+  double cubes2_phi_max;  // φ = Δ/r_c grid control (0 = auto from Table III)
   bool remove_self_interaction;
   bool use_finufft;
   double finufft_eps;
@@ -64,6 +66,7 @@ class SOGKSpace : public KSpace {
   double sigma_param;
   int m_param;
   double self_diag_sum;
+  double self_coeff;  // RBSOG self-energy coefficient
 
   bool kernel_ready;
   bool mesh_ready;
@@ -91,6 +94,7 @@ class SOGKSpace : public KSpace {
   std::vector<double> mesh_green_energy;  // geff_energy[k] for each k-point
   std::vector<double> mesh_green_force;   // geff[k] for each k-point
   std::vector<double> mesh_green_self;    // self-interaction diag per k-point
+  std::vector<double> mesh_green_virial;  // virial kernel[k] = Σ amp[ℓ]·bw[ℓ]·e^{-½bw[ℓ]k²}
 
   // Precomputed sinc_pow tables — box-independent, built once per mesh creation.
   // sinc_table_{x,y,z}[mode_ix * alias_cnt + (j + alias_extent)]

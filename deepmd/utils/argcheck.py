@@ -2276,11 +2276,13 @@ def fitting_sog_energy() -> list[Argument]:
             doc=doc_only_pt_supported + doc_M,
         ),
         Argument(
-            "n_dl",
+            "cubes2_phi_max",
             [float, int],
             optional=True,
-            default=1.0,
-            doc=doc_only_pt_supported + doc_n_dl,
+            default=None,
+            doc=doc_only_pt_supported
+            + "φ = Δ/r_c grid control for CubeS₂ FFT solver. "
+            + "Auto-defaults from Predescu 2020 Table III when not set.",
         ),
         Argument(
             "remove_self_interaction",
