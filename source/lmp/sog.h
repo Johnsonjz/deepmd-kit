@@ -44,6 +44,10 @@ class SOGKSpace : public KSpace {
   void precompute_cubes2_influence();
   void precompute_green_functions();
 
+  // Infer effective b and sigma from user-provided amp/bandwidth arrays.
+  double infer_effective_b() const;
+  double infer_effective_sigma() const;
+
   size_t mesh_index(int ix, int iy, int iz) const;
   double periodic_fraction(double x, double xlo, double prd) const;
 

@@ -34,8 +34,8 @@ using namespace MathConst;
 
 namespace {
 
-constexpr double kSOGDefaultB = 1.62976708826776469;
-constexpr double kSOGDefaultSigma = 2.180230445405648;
+constexpr double kSOGDefaultB = 2.0;
+constexpr double kSOGDefaultSigma = 1.0;
 constexpr int kSOGDefaultM = 12;
 constexpr double kSOGDefaultFinufftEps = 1e-9;
 constexpr int kSOGMeshAssignOrder = 5;
@@ -835,14 +835,17 @@ void SOGKSpace::init() {
   // Compute self-coefficient for RBSOG real-space self-energy correction.
   // self_coeff = log(b) / (sqrt(2π)·σ) · (w0 + Σ_{m=1}^{M-1} b^{-m})
   // where w0 enforces continuity of the u-series at r=rcut.
-  const double r0 = rcut / sigma_param;
-  const double w0 = compute_w0(r0, b_param);
-  const double logb = std::log(b_param);
+  // Use effective b/sigma inferred from bandwidth/amp arrays if available.
+  const double b_eff = infer_effective_b();
+  const double sigma_eff = infer_effective_sigma();
+  const double r0 = rcut / sigma_eff;
+  const double w0 = compute_w0(r0, b_eff);
+  const double logb = std::log(b_eff);
   double sum_b = 0.0;
   for (int m = 1; m < m_param; ++m) {
-    sum_b += std::pow(b_param, static_cast<double>(-m));
+    sum_b += std::pow(b_eff, static_cast<double>(-m));
   }
-  self_coeff = (logb / (std::sqrt(2.0 * MY_PI) * sigma_param)) *
+  self_coeff = (logb / (std::sqrt(2.0 * MY_PI) * sigma_eff)) *
                (w0 + sum_b);
 
   scale = 1.0;
@@ -896,6 +899,34 @@ void SOGKSpace::destroy_fft_plan() {
   cubes2_influence_sq.clear();
 }
 
+// ── Infer effective b and sigma from bandwidth/amp arrays ──
+
+double SOGKSpace::infer_effective_b() const {
+  // Layer 1: bandwidth geometric ratio (most reliable)
+  // bandwidth[m] = sigma² · b^(2m) → b = sqrt(bw[m] / bw[m-1])
+  if (bandwidth.size() >= 2) {
+    const size_t last = bandwidth.size() - 1;
+    if (bandwidth[last - 1] > 0.0) {
+      const double b2 = bandwidth[last] / bandwidth[last - 1];
+      if (b2 > 1.0) return std::sqrt(b2);
+    }
+  }
+  // Layer 2: amp[0] / bandwidth[0] = 4π·log(b)
+  if (!amp.empty() && !bandwidth.empty() && bandwidth[0] > 0.0) {
+    const double ratio = amp[0] / bandwidth[0];
+    if (ratio > 0.0) return std::exp(ratio / (4.0 * MY_PI));
+  }
+  // Fallback: user-specified b_param
+  return b_param;
+}
+
+double SOGKSpace::infer_effective_sigma() const {
+  // bandwidth[0] = sigma²
+  if (!bandwidth.empty() && bandwidth[0] > 0.0)
+    return std::sqrt(bandwidth[0]);
+  return sigma_param;
+}
+
 void SOGKSpace::ensure_fft_plan() {
   if (!(domain->xprd > 0.0 && domain->yprd > 0.0 && domain->zprd > 0.0)) {
     error->all(FLERR,
@@ -934,17 +965,19 @@ void SOGKSpace::ensure_fft_plan() {
       //   CubeS₂ 6th, b=2:      φ_max = 0.35
       //   CubeS₂ 6th, b≈1.630:  φ_max = 0.160
       // Linear interpolation between tabulated values.
+      // Use effective b inferred from bandwidth/amp arrays if available.
+      const double b_eff = infer_effective_b();
       const double b_ref_lo = 1.6297670882677647;
       const double phi_lo = (spline_type >= 6) ? 0.160 : 0.065;
       const double b_ref_hi = 2.0;
       const double phi_hi = (spline_type >= 6) ? 0.350 : 0.230;
       double phi_max;
-      if (b_param <= b_ref_lo) {
+      if (b_eff <= b_ref_lo) {
         phi_max = phi_lo;
-      } else if (b_param >= b_ref_hi) {
+      } else if (b_eff >= b_ref_hi) {
         phi_max = phi_hi;
       } else {
-        phi_max = phi_lo + (b_param - b_ref_lo) / (b_ref_hi - b_ref_lo)
+        phi_max = phi_lo + (b_eff - b_ref_lo) / (b_ref_hi - b_ref_lo)
                                 * (phi_hi - phi_lo);
       }
       phi_val = phi_max;
