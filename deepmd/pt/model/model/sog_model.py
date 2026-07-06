@@ -114,7 +114,14 @@ class SOGEnergyModel(DPModelCommon, SOGEnergyModel_):
         )
 
         nlayers = getattr(self.atomic_model.descriptor, "nlayers", 1) if hasattr(self.atomic_model, "descriptor") else 1
-        # Build sog_arguments dict — prefer cubes2_phi_max, fall back to n_dl
+        # Auto-detect FFT vs direct:
+        # Explicit n_dl without cubes2_phi_max → direct k-sum (training/validation).
+        _has_n_dl = getattr(fitting, "n_dl", None) is not None
+        _has_phi = getattr(fitting, "cubes2_phi_max", None) is not None
+        _use_fft = bool(getattr(fitting, "use_cubes2_fft", False))
+        if _has_n_dl and not _has_phi:
+            _use_fft = False
+        # Build sog_arguments dict
         sog_args: dict = {
             "use_atomwise": False,
             "amp": amp_internal_runtime,
@@ -124,10 +131,11 @@ class SOGEnergyModel(DPModelCommon, SOGEnergyModel_):
                 "remove_self_interaction": bool(fitting.remove_self_interaction),
                 "nufft": False,
                 "use_nufft": False,
-                "use_cubes2_fft": True,
+                "use_cubes2_fft": _use_fft,
                 "nlayers": nlayers,
                 "norm_factor": E2_PER_ANGSTROM_TO_EV,
                 "trainable_kernel": False,
+                "b": float(fitting.b),
             }
         # Prefer cubes2_phi_max (new API), fall back to n_dl (legacy)
         if getattr(fitting, "cubes2_phi_max", None) is not None:
@@ -135,6 +143,9 @@ class SOGEnergyModel(DPModelCommon, SOGEnergyModel_):
         elif getattr(fitting, "n_dl", None) is not None:
             sog_args["n_dl"] = float(fitting.n_dl)
         # else: auto-default from SOG lib's Table III
+        # Optional charge neutrality penalty (None = disabled, use physical k=0 instead)
+        if getattr(fitting, "charge_neutral_lambda", None) is not None:
+            sog_args["charge_neutral_lambda"] = float(fitting.charge_neutral_lambda)
 
         kernel = sog_lib.Sog(
             sog_arguments=sog_args,

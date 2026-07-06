@@ -57,6 +57,11 @@ class PairDeepMD : public PairDeepBaseModel {
  private:
   CommBrickDeepMD* commdata_;
   bool latent_charge_to_q;
+
+ public:
+  // Multi-channel charge access for kspace (fast_dp_sog)
+  int ncharge_channels;
+  std::vector<double> dcharge_multi;
 };
 
 }  // namespace LAMMPS_NS

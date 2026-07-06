@@ -51,11 +51,15 @@ class SOGEnergyAtomicModel(BaseAtomicModel):
 
         self.descriptor = descriptor
         self.fitting_net = sog_energy_fitting
-        # self.sog_energy_fitting = self.fitting_net
         self.type_map = type_map
         self.ntypes = len(type_map)
         self.rcut = self.descriptor.get_rcut()
         self.sel = self.descriptor.get_sel()
+
+        # Apply SOG library defaults: if sigma was not explicitly set by user,
+        # compute it from the descriptor's r_cut (sigma = r_cut * nlayers / RCUT_TO_SIGMA).
+        nlayers_sog = getattr(self.descriptor, "nlayers", 1)
+        self.fitting_net.recompute_from_rcut(self.rcut, nlayers_sog)
 
         super().init_out_stat()
 

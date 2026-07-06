@@ -1,4 +1,21 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later
+/* -*- c++ -*- ----------------------------------------------------------
+   LAMMPS - Large-scale Atomic/Molecular Massively Parallel Simulator
+   https://lammps.sandia.gov/, Sandia National Laboratories
+   Steve Plimpton, sjplimp@sandia.gov
+
+   Copyright (2003) Sandia Corporation.  Under the terms of Contract
+   DE-AC04-94AL85000 with Sandia Corporation, the U.S. Government retains
+   certain rights in this software.  This software is distributed under
+   the GNU General Public License.
+
+   See the README file in the top-level LAMMPS directory.
+------------------------------------------------------------------------- */
+
+/* ----------------------------------------------------------------------
+   Contributing authors: Zhen Jiang (SJTU), based on sog.cpp (deepmd-kit)
+   and rbsog_intel.cpp
+------------------------------------------------------------------------- */
+
 #ifdef KSPACE_CLASS
 // clang-format off
 KSpaceStyle(sog, SOGKSpace)
@@ -8,11 +25,11 @@ KSpaceStyle(sog, SOGKSpace)
 #ifndef LMP_SOG_H
 #define LMP_SOG_H
 
-#include <string>
-#include <vector>
-
 #include "kspace.h"
 #include "lmpfftsettings.h"
+
+#include <array>
+#include <vector>
 
 namespace LAMMPS_NS {
 
@@ -20,70 +37,46 @@ class FFT3d;
 
 class SOGKSpace : public KSpace {
  public:
-  explicit SOGKSpace(class LAMMPS* lmp);
+  explicit SOGKSpace(class LAMMPS *lmp);
   ~SOGKSpace() override;
 
-  void settings(int narg, char** arg) override;
+  void settings(int narg, char **arg) override;
   void init() override;
   void setup() override;
   void compute(int eflag, int vflag) override;
+  void compute_single(int eflag, int vflag);
   double memory_usage() override;
 
- private:
-  bool is_keyword(const std::string& token) const;
-  bool parse_bool_token(const std::string& token, bool& value) const;
-  void finalize_kernel_parameters();
-  double spectral_kernel(const double sqk) const;
-  double virial_kernel(const double sqk) const;
-  bool compute_finufft(int eflag, int vflag);
-  void compute_mesh_fft(int eflag, int vflag);
-
-  void ensure_fft_plan();
-  void destroy_fft_plan();
-  void precompute_sinc_tables();
-  void precompute_cubes2_influence();
-  void precompute_green_functions();
-
-  // Infer effective b and sigma from user-provided amp/bandwidth arrays.
-  double infer_effective_b() const;
-  double infer_effective_sigma() const;
-
-  size_t mesh_index(int ix, int iy, int iz) const;
-  double periodic_fraction(double x, double xlo, double prd) const;
-
-  double accuracy_in;
-  double n_dl;
-  double cubes2_phi_max;  // φ = Δ/r_c grid control (0 = auto from Table III)
+ protected:
+  // ── SOG kernel parameters ──
+  double b_param;        // b: geometric scaling factor
+  double sigma_param;    // sigma: base Gaussian width
+  int M_param;           // M: number of Gaussians
+  double accuracy_in;    // force accuracy target
+  double n_dl;           // mesh resolution parameter (legacy PPPM grid)
   bool remove_self_interaction;
-  bool use_finufft;
-  double finufft_eps;
-  std::string finufft_library;
-  bool finufft_warned;
-
   double mesh_oversample;
   int mesh_alias_extent;
 
-  // Charge-assignment spline: 0 = order-5 B-spline (default), 4 = CubeS₂ 4th.
-  int spline_type;
+  // ── Spline / grid method selection ──
+  int spline_type;       // 0 = B-spline order 5 (legacy), 4 = CubeS2 4th, 6 = CubeS2 6th
+  int grid_method;       // 0 = SOG bandwidth (new), 1 = PPPM iteration (legacy)
+  double phi_max_user;   // user-specified φ_max override (>0 means active, −1 = auto)
 
-  double b_param;
-  double sigma_param;
-  int m_param;
-  double self_diag_sum;
-  double self_coeff;  // RBSOG self-energy coefficient
+  // ── Computed from SOG params + cutoff ──
+  double w0;             // real-space correction factor (only on m=0 term)
+  std::vector<double> amp;       // coef[m] = A_m (for energy)
+  std::vector<double> bandwidth; // band_m = b^(2m) * sigma^2
+  std::vector<double> amp_virial; // coef_virial[m] = A_m * band_m (for virial)
+  double self_coeff;     // self-energy coefficient
+  double amp_sum;       // Σ_m amp_m, total SOG amplitude at k=0
+  bool amp_from_user;  // true when amp/bandwidth provided externally
 
-  bool kernel_ready;
+  // ── Mesh + FFT ──
+  int mesh_nx, mesh_ny, mesh_nz;
+  double mesh_lx, mesh_ly, mesh_lz;
+  FFT3d *mesh_fft;
   bool mesh_ready;
-
-  int mesh_nx;
-  int mesh_ny;
-  int mesh_nz;
-
-  double mesh_lx;
-  double mesh_ly;
-  double mesh_lz;
-
-  FFT3d* mesh_fft;
 
   std::vector<FFT_SCALAR> mesh_rho;
   std::vector<FFT_SCALAR> mesh_fft_work;
@@ -91,29 +84,39 @@ class SOGKSpace : public KSpace {
   std::vector<FFT_SCALAR> mesh_grady;
   std::vector<FFT_SCALAR> mesh_gradz;
 
-  std::vector<double> amp;
-  std::vector<double> bandwidth;
+  // ── Precomputed Green functions ──
+  std::vector<double> mesh_green_energy;
+  std::vector<double> mesh_green_force;
+  std::vector<double> mesh_green_self;
+  std::vector<double> mesh_green_virial;  // K_virial(k²)/|Φ(k)|²
 
-  // Cached Green functions (precomputed once per mesh rebuild)
-  std::vector<double> mesh_green_energy;  // geff_energy[k] for each k-point
-  std::vector<double> mesh_green_force;   // geff[k] for each k-point
-  std::vector<double> mesh_green_self;    // self-interaction diag per k-point
-  std::vector<double> mesh_green_virial;  // virial kernel[k] = Σ amp[ℓ]·bw[ℓ]·e^{-½bw[ℓ]k²}
-
-  // Precomputed sinc_pow tables — box-independent, built once per mesh creation.
-  // sinc_table_{x,y,z}[mode_ix * alias_cnt + (j + alias_extent)]
+  // ── Box-independent sinc tables ──
   std::vector<double> sinc_table_x;
   std::vector<double> sinc_table_y;
   std::vector<double> sinc_table_z;
-  // Sum over aliases for each k-mode index.
   std::vector<double> sinc_sum_x;
   std::vector<double> sinc_sum_y;
   std::vector<double> sinc_sum_z;
 
-  // CubeS₂ influence function Φ(k) (replaces sinc tables when spline_type >= 4).
+  // ── CubeS₂ influence function (replaces sinc tables when spline_type > 0) ──
   std::vector<double> cubes2_influence_re;  // Re[Φ(k)]
   std::vector<double> cubes2_influence_im;  // Im[Φ(k)]
   std::vector<double> cubes2_influence_sq;  // |Φ(k)|²
+
+  // ── Methods ──
+  void finalize_kernel_parameters();
+  void finalize_virial_parameters();
+  double spectral_kernel(double ksq) const;
+  double spectral_kernel_virial(double ksq) const;
+  void ensure_fft_plan();
+  void destroy_fft_plan();
+  void precompute_sinc_tables();
+  void precompute_cubes2_influence();
+  void precompute_green_functions();
+
+  size_t mesh_index(int ix, int iy, int iz) const;
+  double periodic_fraction(double x, double xlo, double prd) const;
+  int wrap_index(int i, int n) const;
 };
 
 }  // namespace LAMMPS_NS

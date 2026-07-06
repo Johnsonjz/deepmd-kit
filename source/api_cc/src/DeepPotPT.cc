@@ -479,6 +479,7 @@ void DeepPotPT::compute_with_charge(
                         nall_real);
 
   atom_charge.clear();
+  int nchannels = 1;
   if (outputs.contains("latent_charge")) {
     torch::Tensor latent_tensor = outputs.at("latent_charge").toTensor();
     if (latent_tensor.dim() != 3 || latent_tensor.size(0) != nframes) {
@@ -489,25 +490,25 @@ void DeepPotPT::compute_with_charge(
       throw deepmd::deepmd_exception(
           "latent_charge must have last dimension >= 1 to map to atom->q.");
     }
-    // Keep LAMMPS q mapping consistent with Python-side validation path:
-    // use the first latent_charge channel as scalar q.
-    latent_tensor = latent_tensor.slice(/*dim=*/2, /*start=*/0, /*end=*/1);
+    // Preserve all latent_charge channels (dim_out_lr).
+    // Flatten as [atom0_ch0, atom0_ch1, ..., atom0_chN, atom1_ch0, ...]
+    nchannels = static_cast<int>(latent_tensor.size(2));
     torch::Tensor flat_latent_ =
-        latent_tensor.squeeze(-1).contiguous().view({-1}).to(floatType);
+        latent_tensor.contiguous().view({-1}).to(floatType);
     torch::Tensor cpu_latent_ = flat_latent_.to(torch::kCPU);
     std::vector<VALUETYPE> dcharge_local;
     dcharge_local.assign(cpu_latent_.data_ptr<VALUETYPE>(),
                          cpu_latent_.data_ptr<VALUETYPE>() +
                              cpu_latent_.numel());
-    if (dcharge_local.size() != static_cast<size_t>(nframes * nloc)) {
+    if (dcharge_local.size() != static_cast<size_t>(nframes * nloc * nchannels)) {
       throw deepmd::deepmd_exception(
           "latent_charge size is inconsistent with local atom count.");
     }
-    std::vector<VALUETYPE> dcharge_nall_real(nall_real, 0);
+    std::vector<VALUETYPE> dcharge_nall_real(nall_real * nchannels, 0);
     std::copy(dcharge_local.begin(), dcharge_local.end(),
               dcharge_nall_real.begin());
-    atom_charge.resize(static_cast<size_t>(nframes) * fwd_map.size(), 0);
-    select_map<VALUETYPE>(atom_charge, dcharge_nall_real, bkw_map, 1, nframes,
+    atom_charge.resize(static_cast<size_t>(nframes) * fwd_map.size() * nchannels, 0);
+    select_map<VALUETYPE>(atom_charge, dcharge_nall_real, bkw_map, nchannels, nframes,
                           fwd_map.size(), nall_real);
   }
 

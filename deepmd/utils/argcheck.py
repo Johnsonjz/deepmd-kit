@@ -2285,6 +2285,25 @@ def fitting_sog_energy() -> list[Argument]:
             + "Auto-defaults from Predescu 2020 Table III when not set.",
         ),
         Argument(
+            "n_dl",
+            [float, int, type(None)],
+            optional=True,
+            default=None,
+            doc=doc_only_pt_supported
+            + "Legacy k-space grid density control. When set without cubes2_phi_max, "
+            + "triggers direct k-space summation (no FFT). "
+            + "Compute from ε via n_dl = 2π / sqrt(2·ln(1/ε) / bw[0]).",
+        ),
+        Argument(
+            "use_cubes2_fft",
+            bool,
+            optional=True,
+            default=False,
+            doc=doc_only_pt_supported
+            + "If True, use CubeS₂ + FFT solver. "
+            + "If False (default), use direct k-space summation (fully autograd-compatible).",
+        ),
+        Argument(
             "remove_self_interaction",
             bool,
             optional=True,

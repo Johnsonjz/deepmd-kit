@@ -120,6 +120,7 @@ static const char cite_user_deepmd_package[] =
 PairDeepMD::PairDeepMD(LAMMPS* lmp)
   : PairDeepBaseModel(lmp, cite_user_deepmd_package) {
   latent_charge_to_q = false;
+  ncharge_channels = 0;
   print_summary("  ");
 }
 
@@ -544,13 +545,25 @@ void PairDeepMD::compute(int eflag, int vflag) {
                  "latent_charge_to_q is enabled but model output has no "
                  "latent_charge");
     }
-    if (dcharge.size() < static_cast<size_t>(nlocal)) {
+    // Detect number of charge channels from dcharge size.
+    // dcharge is flat: [atom0_ch0, atom0_ch1, ..., atom1_ch0, ...]
+    // dcharge includes ghost atoms: size = nall * nchannels
+    int nall = nlocal + atom->nghost;
+    ncharge_channels = static_cast<int>(dcharge.size()) / nall;
+    if (dcharge.size() % nall != 0) {
       error->all(FLERR,
-                 "latent_charge size is smaller than local atom count");
+                 "latent_charge size is not a multiple of total atom count");
     }
+    if (ncharge_channels < 1) {
+      error->all(FLERR,
+                 "latent_charge size is smaller than atom count");
+    }
+    // Store full multi-channel charge for kspace access
+    dcharge_multi = dcharge;
+    // Set atom->q to channel 0 for backward compatibility (existing sog kspace)
     double* q = atom->q;
     for (int ii = 0; ii < nlocal; ++ii) {
-      q[ii] = dcharge[ii];
+      q[ii] = dcharge[ii * ncharge_channels];
     }
   }
 

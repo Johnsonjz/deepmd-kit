@@ -1,16 +1,83 @@
-LAMMPS (22 Jul 2025 - Update 4)
-units metal
-atom_style atomic
-lattice fcc 3.5
-Lattice spacing in x,y,z = 3.5 3.5 3.5
-region box block 0 1 0 1 0 1
-create_box 1 box
-Created orthogonal box = (0 0 0) to (3.5 3.5 3.5)
+LAMMPS (30 Mar 2026 - Development - 7f680de296)
+OMP_NUM_THREADS environment is not set. Defaulting to 1 thread.
+  using 1 OpenMP thread(s) per MPI task
+units           real
+atom_style      charge
+plugin load     /data/home/public/jiangzhen/dp/deepmd-kit/build/sog_lmp_develop_plugin/lmp/plugin/libdeepmd_lmp.so
+Loading plugin: deepmd pair style  by Han Wang
+Loading plugin: deepspin pair style  by Duo Zhang
+Loading plugin: compute deeptensor/atom  by Han Wang
+Loading plugin: fix dplr  by Han Wang
+Loading plugin: kspace pppm/dplr  by Han Wang
+Loading plugin: kspace les  by DeepMD contributors
+Loading plugin: kspace sog  by DeepMD contributors
+pair_style      coul/long 10.0
+kspace_style    sog 1e-5 2.0 5.027010924194599 12 spline cubes2_4 remove_self_interaction no
+read_data       /tmp/water_clean.data
+Reading data file ...
+  orthogonal box = (7.9947316 0 0) to (52.005268 44.121 54.219)
   1 by 1 by 1 MPI processor grid
-create_atoms 1 box
-Created 4 atoms
-  using lattice units in orthogonal box = (0 0 0) to (3.5 3.5 3.5)
-  create_atoms CPU = 0.000 seconds
-pair_style deepmd /tmp/nonexistent.pth
-ERROR: Unrecognized pair style 'deepmd' (src/force.cpp:275)
-Last input line: pair_style deepmd /tmp/nonexistent.pth
+  reading atoms ...
+  10368 atoms
+  read_data CPU = 0.023 seconds
+pair_coeff      * *
+thermo          1
+thermo_style    custom step pe ke etotal pxx pyy pzz pxy pxz pyz vol
+run             0
+WARNING: No fixes with time integration, atoms won't move
+For more information see https://docs.lammps.org/err0028 (src/verlet.cpp:60)
+SOG initialization ...
+  b = 2, sigma = 5.02701, M = 12
+  n_dl = 6.58236, accuracy = 1e-05
+  w0 = 0.99444649, rcut = 10
+  SOG-bandwidth grid: phi_max=0.2300 delta=2.3 -> 20x20x24
+  CubeS2 influence: grid 20x20x24 ngrid=9600
+  CubeS2 monomials built
+  CubeS2 1D integrals done, starting 3D loop
+  CubeS2 influence done
+Generated 0 of 1 mixed pair_coeff terms from geometric mixing rule
+Neighbor list info ...
+  update: every = 1 steps, delay = 0 steps, check = yes
+  max neighbors/atom: 2000, page size: 100000
+  master list distance cutoff = 12
+  ghost atom cutoff = 12
+  binsize = 6, bins = 8 8 10
+  1 neighbor lists, perpetual/occasional/extra = 1 0 0
+  (1) pair coul/long, perpetual
+      attributes: half, newton on
+      pair build: half/bin/atomonly/newton
+      stencil: half/bin/3d
+      bin: standard
+  SOG virial: max |force·r - Fourier|/max = 1.887629
+    force·r:       0.1158       0.0227      -0.0662      -0.0541       0.6101       1.1526
+    Fourier:      -0.2882      -0.6333      -0.7060       0.0480       0.1175       0.0562
+Per MPI rank memory allocation (min/avg/max) = 24.09 | 24.09 | 24.09 Mbytes
+   Step         PotEng         KinEng         TotEng          Pxx            Pyy            Pzz            Pxy            Pxz            Pyz           Volume    
+         0  -1484147        0             -1484147       -325151.18     -322689.17     -323022.85      1245.8592      623.70609     -62.88239       105281.85    
+Loop time of 5.4e-07 on 1 procs for 0 steps with 10368 atoms
+
+185.2% CPU use with 1 MPI tasks x 1 OpenMP threads
+
+MPI task timing breakdown:
+Section |  min time  |  avg time  |  max time  |%varavg| %total
+---------------------------------------------------------------
+Pair    | 0          | 0          | 0          |   0.0 |  0.00
+Kspace  | 0          | 0          | 0          |   0.0 |  0.00
+Neigh   | 0          | 0          | 0          |   0.0 |  0.00
+Comm    | 0          | 0          | 0          |   0.0 |  0.00
+Output  | 0          | 0          | 0          |   0.0 |  0.00
+Modify  | 0          | 0          | 0          |   0.0 |  0.00
+Other   |            | 5.4e-07    |            |       |100.00
+
+Nlocal:          10368 ave       10368 max       10368 min
+Histogram: 1 0 0 0 0 0 0 0 0 0
+Nghost:          25333 ave       25333 max       25333 min
+Histogram: 1 0 0 0 0 0 0 0 0 0
+Neighs:    3.69241e+06 ave 3.69241e+06 max 3.69241e+06 min
+Histogram: 1 0 0 0 0 0 0 0 0 0
+
+Total # of neighbors = 3692412
+Ave neighs/atom = 356.13542
+Neighbor list builds = 0
+Dangerous builds = 0
+Total wall time: 0:00:00

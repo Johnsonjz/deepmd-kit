@@ -31,9 +31,12 @@ from deepmd.pt.model.task.lr_fitting import (
     LRFittingNet,
 )
 
-SOG_DEFAULT_B = to_numpy_array(np.array(1.62976708826776469))
+SOG_DEFAULT_B = to_numpy_array(np.array(2.0))
 SOG_DEFAULT_SIGMA = to_numpy_array(np.array(2.180230445405648))
 SOG_DEFAULT_M = int(12)
+# r_cut / sigma = RCUT_TO_SIGMA for C¹ continuity at the cutoff.
+# Equivalent to the parameter in sog.module.gaussian.
+RCUT_TO_SIGMA = 1.9892536839080267
 
 
 @LRFittingNet.register("sog_energy")
@@ -111,6 +114,10 @@ class SOGEnergyFittingNet(LRFittingNet):
     external_kspace : bool
         If True, long-range correction is handled externally (e.g. kspace),
         and the model only provides latent charges.
+    use_cubes2_fft : bool
+        If True, use CubeS₂ + FFT for long-range computation (fast, default).
+        If False, use direct k-space summation (exact but slower for large systems).
+        The grid resolution is controlled by n_dl (k-space cutoff) when FFT is off.
     """
 
     def __init__(
@@ -147,7 +154,9 @@ class SOGEnergyFittingNet(LRFittingNet):
         n_dl: float | int | None = None,
         cubes2_phi_max: float | None = None,
         remove_self_interaction: bool = False,
+        charge_neutral_lambda: float | None = None,
         external_kspace: bool = False,
+        use_cubes2_fft: bool = False,
         **kwargs: Any,
     ) -> None:
         super().__init__(
@@ -185,8 +194,11 @@ class SOGEnergyFittingNet(LRFittingNet):
         if b_value <= 0.0:
             raise ValueError("`b` should be positive.")
 
+        self._sigma_user_set = sigma is not None
+        self.use_cubes2_fft = bool(use_cubes2_fft)
+        self.charge_neutral_lambda = charge_neutral_lambda
         if sigma is None:
-            sigma_value = SOG_DEFAULT_SIGMA  # will be overridden by sog lib via rcut
+            sigma_value = float(SOG_DEFAULT_SIGMA)  # placeholder, may be recomputed via rcut
         else:
             sigma_tensor = torch.as_tensor(sigma, dtype=dtype, device=device)
             sigma_value = float(sigma_tensor.reshape(-1)[0].item())
@@ -297,6 +309,9 @@ class SOGEnergyFittingNet(LRFittingNet):
             data["n_dl"] = self.n_dl  # legacy
         data["remove_self_interaction"] = bool(self.remove_self_interaction)
         data["external_kspace"] = bool(self.external_kspace)
+        data["use_cubes2_fft"] = bool(self.use_cubes2_fft)
+        if self.charge_neutral_lambda is not None:
+            data["charge_neutral_lambda"] = self.charge_neutral_lambda
         return data
 
     @classmethod
@@ -310,6 +325,8 @@ class SOGEnergyFittingNet(LRFittingNet):
         data["@variables"] = variables
 
         obj = super().deserialize(data)
+
+        obj.charge_neutral_lambda = data.get("charge_neutral_lambda", None)
 
         with torch.no_grad():
             if bandwidth_tensor is not None:
@@ -363,6 +380,39 @@ class SOGEnergyFittingNet(LRFittingNet):
 
     def _kernel_params(self) -> tuple[torch.Tensor, torch.Tensor]:
         return self.amp, self.bandwidth
+
+    def recompute_from_rcut(self, rcut: float, nlayers: int = 1) -> None:
+        """Recompute sigma, amp, bandwidth from the descriptor's r_cut.
+
+        This implements the SOG library's default sigma formula:
+            sigma = r_cut * nlayers / RCUT_TO_SIGMA
+
+        Only recomputes when sigma was NOT explicitly set by the user,
+        so explicit sigma in the config is always respected.
+        """
+        if self._sigma_user_set:
+            return  # user explicitly set sigma — don't override
+
+        new_sigma = rcut * nlayers / RCUT_TO_SIGMA
+        b_base = torch.tensor(self.b, dtype=self.amp.dtype, device=self.amp.device)
+        bw_tensor = new_sigma * torch.pow(
+            b_base,
+            torch.arange(self.M, dtype=self.amp.dtype, device=self.amp.device),
+        )
+        new_bandwidth = bw_tensor.square()
+        coef1 = float(4.0 * np.pi * np.log(self.b))
+        new_amp = torch.full_like(new_bandwidth, coef1)
+        new_amp *= new_bandwidth  # convert to sog-lib internal amplitude
+
+        self.sigma = new_sigma
+        self.amp = torch.nn.Parameter(
+            new_amp.to(device=self.amp.device, dtype=self.amp.dtype),
+            requires_grad=bool(self.trainable),
+        )
+        self.bandwidth = torch.nn.Parameter(
+            new_bandwidth.to(device=self.bandwidth.device, dtype=self.bandwidth.dtype),
+            requires_grad=bool(self.trainable),
+        )
 
     def forward(
         self,
