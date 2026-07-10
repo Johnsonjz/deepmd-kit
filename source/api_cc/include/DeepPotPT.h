@@ -133,6 +133,25 @@ class DeepPotPT : public DeepPotBackend {
                            const std::vector<VALUETYPE>& aparam,
                            const bool atomic);
   /**
+   * @brief Charge-response correction force and virial.
+   * @param[out] force_corr  Correction force, size nall*3.
+   * @param[out] virial_corr Correction virial, size 9.
+   * @param[in]  v_per_atom  Per-atom potential v_i, size nloc*nchannels.
+   */
+  template <typename VALUETYPE>
+  void compute_charge_response(
+      std::vector<VALUETYPE> &force_corr,
+      std::vector<VALUETYPE> &virial_corr,
+      const std::vector<VALUETYPE> &v_per_atom,
+      const std::vector<VALUETYPE> &coord,
+      const std::vector<int> &atype,
+      const std::vector<VALUETYPE> &box,
+      const int nghost,
+      const InputNlist &lmp_list,
+      const int &ago,
+      const std::vector<VALUETYPE> &fparam,
+      const std::vector<VALUETYPE> &aparam);
+  /**
    * @brief Evaluate the energy, force, and virial with the mixed type
    *by using this DP.
    * @param[out] ener The system energy.
@@ -352,6 +371,47 @@ class DeepPotPT : public DeepPotBackend {
                             const std::vector<float>& fparam,
                             const std::vector<float>& aparam,
                             const bool atomic);
+  void computew_charge_response(
+      std::vector<double> &force_corr, std::vector<double> &virial_corr,
+      const std::vector<double> &v_per_atom,
+      const std::vector<double> &coord, const std::vector<int> &atype,
+      const std::vector<double> &box, const int nghost,
+      const InputNlist &inlist, const int &ago,
+      const std::vector<double> &fparam = {},
+      const std::vector<double> &aparam = {});
+  void computew_charge_response(
+      std::vector<float> &force_corr, std::vector<float> &virial_corr,
+      const std::vector<float> &v_per_atom,
+      const std::vector<float> &coord, const std::vector<int> &atype,
+      const std::vector<float> &box, const int nghost,
+      const InputNlist &inlist, const int &ago,
+      const std::vector<float> &fparam = {},
+      const std::vector<float> &aparam = {});
+  // ── Charge-response fusion: reuse the pair's retained forward graph ──
+  void set_retain_charge_graph(bool b) { retain_charge_graph_ = b; }
+  template <typename VALUETYPE>
+  void compute_charge_response_cached(
+      std::vector<VALUETYPE> &force_corr,
+      std::vector<VALUETYPE> &virial_corr,
+      const std::vector<VALUETYPE> &v_per_atom);
+  void computew_charge_response_cached(std::vector<double> &force_corr,
+                                       std::vector<double> &virial_corr,
+                                       const std::vector<double> &v_per_atom);
+  void computew_charge_response_cached(std::vector<float> &force_corr,
+                                       std::vector<float> &virial_corr,
+                                       const std::vector<float> &v_per_atom);
+  // ── Tier-2 fused path: energy-only+charge forward (no extended_force) + one combined backward ──
+  void set_charge_only_forward(bool b) { charge_only_forward_ = b; }
+  template <typename VALUETYPE>
+  void compute_combined_response(std::vector<VALUETYPE> &force_total,
+                                 std::vector<VALUETYPE> &virial_total,
+                                 const std::vector<VALUETYPE> &v_per_atom);
+  void computew_combined_response(std::vector<double> &force_total,
+                                  std::vector<double> &virial_total,
+                                  const std::vector<double> &v_per_atom);
+  void computew_combined_response(std::vector<float> &force_total,
+                                  std::vector<float> &virial_total,
+                                  const std::vector<float> &v_per_atom);
   void computew_mixed_type(std::vector<double>& ener,
                            std::vector<double>& force,
                            std::vector<double>& virial,
@@ -397,6 +457,21 @@ class DeepPotPT : public DeepPotBackend {
   at::Tensor firstneigh_tensor;
   c10::optional<torch::Tensor> mapping_tensor;
   torch::Dict<std::string, torch::Tensor> comm_dict;
+  // ── Charge-response graph retention (fix sog/response fusion) ──
+  // When retain_charge_graph_ is set (by pair_deepmd for a registered
+  // fix sog/response), compute_with_charge keeps the forward autograd graph
+  // (coord leaf + latent_charge node) alive so compute_charge_response_cached
+  // can do only the VJP backward with seed v_i, instead of a redundant forward.
+  bool retain_charge_graph_ = false;
+  bool charge_graph_valid_ = false;
+  bool charge_only_forward_ = false;     // Tier-2: energy-only+charge forward, defer force to the fix
+  torch::Tensor cached_coord_leaf_;      // owning coord leaf, requires_grad
+  torch::Tensor cached_latent_charge_;   // [1, nloc, nq] graph node
+  torch::Tensor cached_energy_;          // reduced short-range energy (graph node), for the combined seed
+  std::vector<int> cached_bkw_map_;
+  int cached_fwd_size_ = 0;              // = fwd_map.size() (nall incl. virtual)
+  int cached_nall_real_ = 0;
+  int cached_nloc_ = 0;
   std::vector<std::vector<int>> remapped_sendlist;
   std::vector<int*> remapped_sendlist_ptrs;
   std::vector<int> remapped_sendnum;

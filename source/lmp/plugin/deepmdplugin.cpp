@@ -13,6 +13,7 @@
 #include "les.h"
 #include "pppm_dplr.h"
 #include "sog.h"
+#include "fix_sog_response.h"
 #endif
 
 using namespace LAMMPS_NS;
@@ -32,6 +33,9 @@ static Fix* fixdplr(LAMMPS* lmp, int narg, char** arg) {
 static KSpace* pppmdplr(LAMMPS* lmp) { return new PPPMDPLR(lmp); }
 static KSpace* leskspace(LAMMPS* lmp) { return new LESKSpace(lmp); }
 static KSpace* sogkspace(LAMMPS* lmp) { return new SOGKSpace(lmp); }
+static Fix* fixsogresponse(LAMMPS* lmp, int narg, char** arg) {
+  return new FixSOGResponse(lmp, narg, arg);
+}
 #endif
 
 extern "C" void lammpsplugin_init(void* lmp, void* handle, void* regfunc) {
@@ -91,6 +95,13 @@ extern "C" void lammpsplugin_init(void* lmp, void* handle, void* regfunc) {
   plugin.info = "kspace sog " STR_GIT_SUMM;
   plugin.author = "DeepMD contributors";
   plugin.creator.v1 = (lammpsplugin_factory1*)&sogkspace;
+  (*register_plugin)(&plugin, lmp);
+
+  plugin.style = "fix";
+  plugin.name = "sog/response";
+  plugin.info = "fix sog/response " STR_GIT_SUMM;
+  plugin.author = "DeepMD contributors";
+  plugin.creator.v2 = (lammpsplugin_factory2*)&fixsogresponse;
   (*register_plugin)(&plugin, lmp);
 #endif
 }

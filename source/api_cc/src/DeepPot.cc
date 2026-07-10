@@ -447,6 +447,127 @@ void DeepPot::compute_with_charge(
       "compute_with_charge is only supported for PyTorch backends.");
 }
 
+template <typename VALUETYPE>
+void DeepPot::compute_charge_response(
+    std::vector<VALUETYPE> &force_corr,
+    std::vector<VALUETYPE> &virial_corr,
+    const std::vector<VALUETYPE> &v_per_atom,
+    const std::vector<VALUETYPE> &dcoord_,
+    const std::vector<int> &datype_,
+    const std::vector<VALUETYPE> &dbox,
+    const int nghost,
+    const InputNlist &lmp_list,
+    const int &ago,
+    const std::vector<VALUETYPE> &fparam,
+    const std::vector<VALUETYPE> &aparam) {
+#ifdef BUILD_PYTORCH
+  if (auto dp_pt = std::dynamic_pointer_cast<deepmd::DeepPotPT>(dp)) {
+    dp_pt->computew_charge_response(force_corr, virial_corr, v_per_atom,
+                                    dcoord_, datype_, dbox, nghost, lmp_list,
+                                    ago, fparam, aparam);
+    return;
+  }
+#if BUILD_PT_EXPT
+  if (auto dp_pt_expt = std::dynamic_pointer_cast<deepmd::DeepPotPTExpt>(dp)) {
+    dp_pt_expt->computew_charge_response(force_corr, virial_corr, v_per_atom,
+                                         dcoord_, datype_, dbox, nghost,
+                                         lmp_list, ago, fparam, aparam);
+    return;
+  }
+#endif
+#endif
+  throw deepmd::deepmd_exception(
+      "compute_charge_response is only supported for PyTorch backends.");
+}
+
+template void DeepPot::compute_charge_response<double>(
+    std::vector<double> &force_corr,
+    std::vector<double> &virial_corr,
+    const std::vector<double> &v_per_atom,
+    const std::vector<double> &dcoord_,
+    const std::vector<int> &datype_,
+    const std::vector<double> &dbox,
+    const int nghost,
+    const InputNlist &lmp_list,
+    const int &ago,
+    const std::vector<double> &fparam,
+    const std::vector<double> &aparam);
+
+template void DeepPot::compute_charge_response<float>(
+    std::vector<float> &force_corr,
+    std::vector<float> &virial_corr,
+    const std::vector<float> &v_per_atom,
+    const std::vector<float> &dcoord_,
+    const std::vector<int> &datype_,
+    const std::vector<float> &dbox,
+    const int nghost,
+    const InputNlist &lmp_list,
+    const int &ago,
+    const std::vector<float> &fparam,
+    const std::vector<float> &aparam);
+
+void DeepPot::set_retain_charge_graph(bool b) {
+#ifdef BUILD_PYTORCH
+  if (auto dp_pt = std::dynamic_pointer_cast<deepmd::DeepPotPT>(dp)) {
+    dp_pt->set_retain_charge_graph(b);
+  }
+#endif
+  // no-op for non-PyTorch backends
+}
+
+template <typename VALUETYPE>
+void DeepPot::compute_charge_response_cached(
+    std::vector<VALUETYPE> &force_corr,
+    std::vector<VALUETYPE> &virial_corr,
+    const std::vector<VALUETYPE> &v_per_atom) {
+#ifdef BUILD_PYTORCH
+  if (auto dp_pt = std::dynamic_pointer_cast<deepmd::DeepPotPT>(dp)) {
+    dp_pt->computew_charge_response_cached(force_corr, virial_corr, v_per_atom);
+    return;
+  }
+#endif
+  throw deepmd::deepmd_exception(
+      "compute_charge_response_cached is only supported for PyTorch backends.");
+}
+
+template void DeepPot::compute_charge_response_cached<double>(
+    std::vector<double> &force_corr, std::vector<double> &virial_corr,
+    const std::vector<double> &v_per_atom);
+template void DeepPot::compute_charge_response_cached<float>(
+    std::vector<float> &force_corr, std::vector<float> &virial_corr,
+    const std::vector<float> &v_per_atom);
+
+void DeepPot::set_charge_only_forward(bool b) {
+#ifdef BUILD_PYTORCH
+  if (auto dp_pt = std::dynamic_pointer_cast<deepmd::DeepPotPT>(dp)) {
+    dp_pt->set_charge_only_forward(b);
+  }
+#endif
+  // no-op for non-PyTorch backends
+}
+
+template <typename VALUETYPE>
+void DeepPot::compute_combined_response(
+    std::vector<VALUETYPE> &force_total,
+    std::vector<VALUETYPE> &virial_total,
+    const std::vector<VALUETYPE> &v_per_atom) {
+#ifdef BUILD_PYTORCH
+  if (auto dp_pt = std::dynamic_pointer_cast<deepmd::DeepPotPT>(dp)) {
+    dp_pt->computew_combined_response(force_total, virial_total, v_per_atom);
+    return;
+  }
+#endif
+  throw deepmd::deepmd_exception(
+      "compute_combined_response is only supported for PyTorch backends.");
+}
+
+template void DeepPot::compute_combined_response<double>(
+    std::vector<double> &force_total, std::vector<double> &virial_total,
+    const std::vector<double> &v_per_atom);
+template void DeepPot::compute_combined_response<float>(
+    std::vector<float> &force_total, std::vector<float> &virial_total,
+    const std::vector<float> &v_per_atom);
+
 template void DeepPot::compute_with_charge<double>(
     ENERGYTYPE& dener,
     std::vector<double>& dforce_,

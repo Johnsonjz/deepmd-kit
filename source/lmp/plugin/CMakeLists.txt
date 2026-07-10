@@ -114,7 +114,20 @@ if(DEFINED LAMMPS_SOURCE_ROOT OR DEFINED LAMMPS_VERSION)
     set(libname "${libname}plugin")
   endif()
 
+  # ── GPU SOG kspace (sog_gpu.cu) — raw CUDA + cuFFT, plugin-internal (no in-tree LAMMPS edits) ──
+  file(GLOB SOG_GPU_SRC ../sog_gpu.cu)
+  if(SOG_GPU_SRC)
+    enable_language(CUDA)
+    set(CMAKE_CUDA_ARCHITECTURES "80")
+    list(APPEND LMP_SRC ${SOG_GPU_SRC})
+    set(CUDA_cufft_LIBRARY "/usr/local/cuda/lib64/libcufft.so")
+  endif()
+
   add_library(${libname} MODULE ${LMP_SRC})
+
+  if(SOG_GPU_SRC)
+    target_link_libraries(${libname} PUBLIC ${CUDA_cufft_LIBRARY})
+  endif()
 
   # link: libdeepmd
   if(DP_USING_C_API)

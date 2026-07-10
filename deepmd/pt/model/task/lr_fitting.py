@@ -519,8 +519,13 @@ class LRFittingNet(Fitting):
         return self.dim_out_lr
 
     def _corr_head(self, lr_out: torch.Tensor) -> torch.Tensor:
-        # TODO: Add latent_charge correction logic after LR output is finalized.
-        return lr_out
+        # Enforce per-frame charge neutrality: subtract the per-frame mean
+        # so that sum_i q_i = 0 for each frame and each charge channel.
+        # This prevents multi-channel models from developing large per-channel
+        # charges that cancel only in the total energy, which can cause
+        # instability during training and inconsistent long-range computation.
+        mean_q = lr_out.mean(dim=1, keepdim=True)
+        return lr_out - mean_q
 
     def _compress_bias_atom_q(self, bias: torch.Tensor) -> torch.Tensor:
         # Keep lr bias numerically stable in a bounded range.
@@ -626,7 +631,7 @@ class LRFittingNet(Fitting):
 
         results: dict[str, torch.Tensor] = {}
         sr_out = self._apply_networks(
-            self.filter_layers_sr,
+            True,
             self.neuron_sr,
             self.sr_net_dim_out,
             xx,
@@ -636,7 +641,7 @@ class LRFittingNet(Fitting):
             bias_tensor=self.bias_atom_e,
         )
         lr_out = self._apply_networks(
-            self.filter_layers_lr,
+            False,
             self.neuron_lr,
             self.lr_net_dim_out,
             xx,
@@ -655,7 +660,7 @@ class LRFittingNet(Fitting):
 
     def _apply_networks(
         self,
-        layers: NetworkCollection,
+        use_sr: bool,
         neuron: list[int],
         dim_out: int,
         xx: torch.Tensor,
@@ -666,15 +671,31 @@ class LRFittingNet(Fitting):
     ) -> torch.Tensor:
         nf, nloc, _ = xx.shape
         outs = torch.zeros((nf, nloc, dim_out), dtype=self.prec, device=xx.device)
-        atom_properties = layers.forward_all(xx)
+        # Call the concrete NetworkCollection in each branch. Passing it as a function
+        # argument makes TorchScript mangle filter_layers_sr / filter_layers_lr to
+        # distinct types and breaks scripting (freeze). Selecting inside keeps each call
+        # bound to a concrete module type.
+        if use_sr:
+            atom_properties = self.filter_layers_sr.forward_all(xx)
+        else:
+            atom_properties = self.filter_layers_lr.forward_all(xx)
         atom_properties_zeros: list[torch.Tensor] = []
         if xx_zeros is not None:
-            atom_properties_zeros = layers.forward_all(xx_zeros)
+            if use_sr:
+                atom_properties_zeros = self.filter_layers_sr.forward_all(xx_zeros)
+            else:
+                atom_properties_zeros = self.filter_layers_lr.forward_all(xx_zeros)
+        middle_all: list[torch.Tensor] = []
+        if self.eval_return_middle_output and middle_output is not None:
+            if use_sr:
+                middle_all = self.filter_layers_sr.call_until_last_all(xx)
+            else:
+                middle_all = self.filter_layers_lr.call_until_last_all(xx)
 
         if self.mixed_types:
             atom_property = atom_properties[0]
             if self.eval_return_middle_output and middle_output is not None:
-                middle_output["middle_output"] = layers.call_until_last_all(xx)[0]
+                middle_output["middle_output"] = middle_all[0]
             if xx_zeros is not None:
                 atom_property = atom_property - atom_properties_zeros[0]
 
@@ -685,14 +706,12 @@ class LRFittingNet(Fitting):
             outs = outs + atom_property
             return outs
 
-        middle_outputs_all: list[torch.Tensor] = []
+        middle_outputs_all: list[torch.Tensor] = middle_all
         outs_middle = torch.zeros(
             (nf, nloc, neuron[-1]),
             dtype=self.prec,
             device=xx.device,
         )
-        if self.eval_return_middle_output and middle_output is not None:
-            middle_outputs_all = layers.call_until_last_all(xx)
 
         for type_i, atom_property in enumerate(atom_properties):
             mask = (atype == type_i).unsqueeze(-1)

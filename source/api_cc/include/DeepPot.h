@@ -308,6 +308,70 @@ class DeepPot : public DeepBaseModel {
             const std::vector<VALUETYPE>& aparam = std::vector<VALUETYPE>(),
             const bool atomic = false);
   /**
+   * @brief Charge-response correction force and virial (DPLR-style long-range
+   *        feedback). Given the per-atom electrostatic potential v_i = \partial
+   *        E_k/\partial q_i from an external kspace solver, backpropagates through
+   *        the model's latent-charge network to yield the correction force and
+   *        virial terms omitted by the fixed-charge solver.
+   * @param[out] force_corr  Correction force, size nall*3 (mapped to nall order).
+   * @param[out] virial_corr Correction virial, size 9.
+   * @param[in]  v_per_atom  Per-atom potential v_i, size nloc*nchannels.
+   * @param[in]  coord       Coordinates, size nall*3.
+   * @param[in]  atype       Atom types, size nall.
+   * @param[in]  box         Cell, size 9.
+   * @param[in]  nghost      Number of ghost atoms.
+   * @param[in]  lmp_list    Input neighbour list.
+   * @param[in]  ago         Update internal neighbour list if ago is 0.
+   * @param[in]  fparam      Optional frame parameters.
+   * @param[in]  aparam      Optional atomic parameters.
+   */
+  template <typename VALUETYPE>
+  void compute_charge_response(
+      std::vector<VALUETYPE> &force_corr,
+      std::vector<VALUETYPE> &virial_corr,
+      const std::vector<VALUETYPE> &v_per_atom,
+      const std::vector<VALUETYPE> &coord,
+      const std::vector<int> &atype,
+      const std::vector<VALUETYPE> &box,
+      const int nghost,
+      const InputNlist &lmp_list,
+      const int &ago,
+      const std::vector<VALUETYPE> &fparam = std::vector<VALUETYPE>(),
+      const std::vector<VALUETYPE> &aparam = std::vector<VALUETYPE>());
+  /**
+   * @brief Enable retaining the forward autograd graph so the charge-response
+   * correction can be computed by a VJP-only backward (fix sog/response fusion).
+   */
+  void set_retain_charge_graph(bool b);
+  /**
+   * @brief Charge-response correction reusing the retained forward graph.
+   * @param[out] force_corr  Correction force, size nall*3.
+   * @param[out] virial_corr Correction virial, size 9.
+   * @param[in]  v_per_atom  Per-atom potential v_i, size nloc*nchannels.
+   */
+  template <typename VALUETYPE>
+  void compute_charge_response_cached(
+      std::vector<VALUETYPE> &force_corr,
+      std::vector<VALUETYPE> &virial_corr,
+      const std::vector<VALUETYPE> &v_per_atom);
+  /**
+   * @brief Tier-2 fused path: switch the retained forward to an energy-only+charge forward
+   *        (no extended_force), so a single combined backward yields the total force.
+   */
+  void set_charge_only_forward(bool b);
+  /**
+   * @brief Combined backward on the retained energy+charge graph:
+   *        total force/virial = -∂(E_short + Σ_i v_i q_i)/∂r (short-range + charge-response).
+   * @param[out] force_total  Total force, size nall*3.
+   * @param[out] virial_total Total virial, size 9.
+   * @param[in]  v_per_atom   Per-atom potential v_i, size nloc*nchannels.
+   */
+  template <typename VALUETYPE>
+  void compute_combined_response(
+      std::vector<VALUETYPE> &force_total,
+      std::vector<VALUETYPE> &virial_total,
+      const std::vector<VALUETYPE> &v_per_atom);
+  /**
    * @brief Evaluate the energy, force and virial by using this DP.
    * @param[out] ener The system energy.
    * @param[out] force The force on each atom.

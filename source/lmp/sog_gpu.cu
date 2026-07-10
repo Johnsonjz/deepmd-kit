@@ -1,0 +1,362 @@
+// sog_gpu.cu — plugin-internal GPU SOG kspace (raw CUDA + cuFFT). Tier-2 full-GPU pipeline:
+//   spread(q@x) -> cuFFT fwd -> green-multiply (grad meshes + potential + energy/6-virial reductions)
+//   -> cuFFT inv -> gather force (+ per-atom potential v_i).
+// Two splines: separable QuadS (PRIMARY — 3D tensor-product 1D weights, GPU-friendly scatter once
+// cuFFT makes the FFT ~free and spreading dominates) and CubeS2-4 (BASELINE — bit-matches CPU sog.cpp).
+// Math ported from sog.cpp::compute_single. STATUS: nvcc-syntax-compiled; NOT yet GPU-bit-validated
+// against the CPU path (cuFFT is unnormalized vs LAMMPS FFT3d 1/ngrid — the normalization constants
+// below must be confirmed by the run-0 bit-match once the GPU frees). See sog-progress.md §8.
+#include "sog_gpu.cuh"
+#include "sog_spline.h"     // CubeS2 node tables + xi constants (single source of truth)
+#include <cufft.h>
+#include <cuda_runtime.h>
+#include <cstdio>
+#include <cmath>
+
+#define CK(x) do{ cudaError_t e=(x); if(e!=cudaSuccess){ \
+  fprintf(stderr,"sog_gpu CUDA %s:%d %s\n",__FILE__,__LINE__,cudaGetErrorString(e)); }}while(0)
+
+// ── device state ──
+struct SogGpuState {
+  int nx=0, ny=0, nz=0; size_t ngrid=0;
+  cufftHandle plan=0;                 // Z2Z, 3D
+  cufftDoubleComplex *d_rho=nullptr;  // charge mesh / rho_hat (in place)
+  cufftDoubleComplex *d_gx=nullptr, *d_gy=nullptr, *d_gz=nullptr, *d_pot=nullptr;
+  double *d_ge=nullptr, *d_gf=nullptr, *d_gv=nullptr, *d_gs=nullptr;  // green energy/force/virial/self tables
+  double *d_x=nullptr, *d_q=nullptr, *d_force=nullptr, *d_vpot=nullptr;  // per-atom
+  double *d_red=nullptr;              // energy + 6 virial + diag_sum reductions (8 doubles)
+  int cap_atoms=0;
+};
+
+// ── helpers ──
+__device__ __forceinline__ double periodic_frac(double xi, double lo, double L){
+  double t=(xi-lo)/L; t-=floor(t); return t;
+}
+__device__ __forceinline__ int wrap(int i,int n){ i%=n; return i<0? i+n : i; }
+__device__ __forceinline__ size_t midx(int ix,int iy,int iz,int nx,int ny){
+  return (size_t)iz*ny*nx + (size_t)iy*nx + ix;   // matches sog.cpp mesh_index (x fastest)
+}
+
+// ── separable QuadS 1D weights — EXACT port of quads_fft.py::_quads_1d_weights ──
+// QuadS = CubeS2's L/R functions applied SEPARABLY (tensor product). QuadS is ORDER-4 ONLY in this
+// codebase (quads_fft.py has no order-6). xi = 2/sqrt(15) (the general-purpose optimum used by
+// _quads_xi_per_dim, xi^2 = 4/15), NOT 1/sqrt(3). Nodes at offsets {-1,0,1,2}, weights (R(1-t),L(t),R(t),L(1-t)).
+__device__ __forceinline__ double quads_L(double th){ const double xi2 = 4.0/15.0;
+  return -0.5*th*th*th + 0.5*th*th - (9.0*xi2-2.0)/6.0*th + 0.5*xi2; }
+__device__ __forceinline__ double quads_R(double th){ const double xi2 = 4.0/15.0;
+  return (1.0/6.0)*th*th*th + (3.0*xi2-1.0)/6.0*th; }
+__device__ __forceinline__ void quads4_w(double t, double *w /*[4]*/){   // offsets -1,0,1,2
+  w[0]=quads_R(1.0-t); w[1]=quads_L(t); w[2]=quads_R(t); w[3]=quads_L(1.0-t);
+}
+// QuadS order-6 does NOT exist (quads_fft.py is order-4 only) -> order-6 uses CubeS2-6 (baseline).
+// Stub kept only so the NORD=6 template instantiation compiles; it is never used for QuadS.
+__device__ __forceinline__ void quads6_w(double t, double *w /*[6]*/){
+  double w4[4]; quads4_w(t,w4); w[0]=0; w[1]=w4[0]; w[2]=w4[1]; w[3]=w4[2]; w[4]=w4[3]; w[5]=0;
+}
+
+// ── CubeS₂ device port — EXACT port of sog_spline.h (bit-matches CPU sog.cpp) ──
+// Node tables live in __constant__ memory (uploaded once at create). GpuNode layout == CubeS2Node4.
+typedef LAMMPS_NS::CubeS2Node4 GpuNode;
+__constant__ GpuNode c_nodes4[32];
+__constant__ GpuNode c_nodes6[88];
+__device__ const double kXi4 = 0.5773502691896258;   // 1/√3  (kCubes2Xi4)
+__device__ const double kXi6 = 0.6503998764035732;   // kCubes2Xi6
+
+__device__ __forceinline__ double cs2_L(double th,double xi){ double x2=xi*xi;
+  return -0.5*th*th*th + 0.5*th*th - (9.0*x2-2.0)/6.0*th + 0.5*x2; }
+__device__ __forceinline__ double cs2_R(double th,double xi){ double x2=xi*xi;
+  return (1.0/6.0)*th*th*th + (3.0*x2-1.0)/6.0*th; }
+__device__ __forceinline__ double eta_pos_off(int off,double c){ return (off==1)?c:(1.0-c); }
+
+__device__ __forceinline__ double cs2_w4(double tx,double ty,double tz,const GpuNode&nd,double xi){
+  if(nd.cls==0){
+    double ex=(nd.dx==1)?tx:(1.0-tx), ey=(nd.dy==1)?ty:(1.0-ty), ez=(nd.dz==1)?tz:(1.0-tz);
+    return cs2_L(ex,xi)*ey*ez + cs2_L(ey,xi)*ex*ez + cs2_L(ez,xi)*ex*ey;
+  } else {
+    double es,e1,e2;
+    if(nd.sp_axis==0){ es=nd.sp_is_neg?(1.0-tx):tx; e1=(nd.dy==1)?ty:(1.0-ty); e2=(nd.dz==1)?tz:(1.0-tz); }
+    else if(nd.sp_axis==1){ es=nd.sp_is_neg?(1.0-ty):ty; e1=(nd.dx==1)?tx:(1.0-tx); e2=(nd.dz==1)?tz:(1.0-tz); }
+    else { es=nd.sp_is_neg?(1.0-tz):tz; e1=(nd.dx==1)?tx:(1.0-tx); e2=(nd.dy==1)?ty:(1.0-ty); }
+    return cs2_R(es,xi)*e1*e2;
+  }
+}
+
+__device__ __forceinline__ double cs2_L111_6(double t,double xi){ double x2=xi*xi,x4=x2*x2;
+  return (1.0/12.0)*t*t*t*t*t - (1.0/6.0)*t*t*t*t + (10.0*x2-1.0)/12.0*t*t*t
+       - (6.0*x2-1.0)/6.0*t*t + (5.0*x4-x2)/4.0*t - (3.0*x4-x2)/6.0; }
+__device__ __forceinline__ double cs2_L311_6(double t,double xi){ double x2=xi*xi,x4=x2*x2;
+  return (1.0/120.0)*t*t*t*t*t + (2.0*x2-1.0)/24.0*t*t*t + (15.0*x4-15.0*x2+4.0)/120.0*t; }
+__device__ __forceinline__ double cs2_L211_6(double t,double xi){ return -0.25*cs2_L111_6(t,xi)-2.5*cs2_L311_6(t,xi); }
+__device__ __forceinline__ double cs2_S6(double t,double xi){
+  return -0.5*t*t*t + 0.5*t*t - (3.0*xi*xi-2.0)/2.0*t + 0.5*xi*xi; }
+
+__device__ __forceinline__ double cs2_w6(double tx,double ty,double tz,const GpuNode&nd,double xi){
+  double coords[3]={tx,ty,tz}; int offs[3]={nd.dx,nd.dy,nd.dz};
+  if(nd.cls==0){
+    double ex=(nd.dx==1)?tx:(1.0-tx), ey=(nd.dy==1)?ty:(1.0-ty), ez=(nd.dz==1)?tz:(1.0-tz);
+    return cs2_L111_6(ex,xi)*ey*ez + cs2_L111_6(ey,xi)*ez*ex + cs2_L111_6(ez,xi)*ex*ey
+         + cs2_S6(ex,xi)*cs2_S6(ey,xi)*cs2_S6(ez,xi);
+  } else if(nd.cls==1){
+    int sp=nd.sp_axis; double es=nd.sp_is_neg?(1.0-coords[sp]):coords[sp];
+    int n1=(sp+1)%3,n2=(sp+2)%3; if(n1>n2){int t=n1;n1=n2;n2=t;}
+    return cs2_L211_6(es,xi)*eta_pos_off(offs[n1],coords[n1])*eta_pos_off(offs[n2],coords[n2])
+         + cs2_R(es,xi)*cs2_S6(eta_pos_off(offs[n1],coords[n1]),xi)*cs2_S6(eta_pos_off(offs[n2],coords[n2]),xi);
+  } else if(nd.cls==2){
+    int sp=nd.sp_axis; double es=nd.sp_is_neg?(1.0-coords[sp]):coords[sp];
+    int n1=(sp+1)%3,n2=(sp+2)%3; if(n1>n2){int t=n1;n1=n2;n2=t;}
+    return cs2_L311_6(es,xi)*eta_pos_off(offs[n1],coords[n1])*eta_pos_off(offs[n2],coords[n2]);
+  } else if(nd.cls==3){
+    int nm=nd.sp_axis; int s1=(nm+1)%3,s2=(nm+2)%3; if(s1>s2){int t=s1;s1=s2;s2=t;}
+    double en=eta_pos_off(offs[nm],coords[nm]);
+    double es1=(nd.sp_is_neg&1)?(1.0-coords[s1]):coords[s1];
+    double es2=(nd.sp_is_neg&2)?(1.0-coords[s2]):coords[s2];
+    return cs2_S6(en,xi)*cs2_R(es1,xi)*cs2_R(es2,xi);
+  } else {
+    double ex=(nd.sp_is_neg&1)?(1.0-tx):tx, ey=(nd.sp_is_neg&2)?(1.0-ty):ty, ez=(nd.sp_is_neg&4)?(1.0-tz):tz;
+    return cs2_R(ex,xi)*cs2_R(ey,xi)*cs2_R(ez,xi);
+  }
+}
+
+// CubeS2 spread: 1 thread/atom, loop 32/88 nodes, atomicAdd into d_rho.real.
+template<int ORD>
+__global__ void k_spread_cubes2(int nlocal,const double*x,const double*boxlo,
+    double lx,double ly,double lz,const double*q,double rho_scale,
+    int nx,int ny,int nz,cufftDoubleComplex*rho){
+  int i=blockIdx.x*blockDim.x+threadIdx.x; if(i>=nlocal) return;
+  double fx=periodic_frac(x[3*i+0],boxlo[0],lx)*nx;
+  double fy=periodic_frac(x[3*i+1],boxlo[1],ly)*ny;
+  double fz=periodic_frac(x[3*i+2],boxlo[2],lz)*nz;
+  int ix0=(int)floor(fx),iy0=(int)floor(fy),iz0=(int)floor(fz);
+  double tx=fx-ix0,ty=fy-iy0,tz=fz-iz0, qs=rho_scale*q[i];
+  const int NN=(ORD==4)?32:88; const double xi=(ORD==4)?kXi4:kXi6;
+  for(int k=0;k<NN;++k){
+    GpuNode nd=(ORD==4)?c_nodes4[k]:c_nodes6[k];
+    double w=(ORD==4)?cs2_w4(tx,ty,tz,nd,xi):cs2_w6(tx,ty,tz,nd,xi);
+    if(w==0.0) continue;
+    int gx=wrap(ix0+nd.dx,nx),gy=wrap(iy0+nd.dy,ny),gz=wrap(iz0+nd.dz,nz);
+    atomicAdd(&rho[midx(gx,gy,gz,nx,ny)].x, qs*w);
+  }
+}
+
+template<int ORD>
+__global__ void k_gather_cubes2(int nlocal,const double*x,const double*boxlo,
+    double lx,double ly,double lz,const double*q,double qscale,
+    int nx,int ny,int nz,const cufftDoubleComplex*gx,const cufftDoubleComplex*gy,
+    const cufftDoubleComplex*gz,const cufftDoubleComplex*pot,int want_pot,
+    double*force,double*vpot){
+  int i=blockIdx.x*blockDim.x+threadIdx.x; if(i>=nlocal) return;
+  double fx=periodic_frac(x[3*i+0],boxlo[0],lx)*nx;
+  double fy=periodic_frac(x[3*i+1],boxlo[1],ly)*ny;
+  double fz=periodic_frac(x[3*i+2],boxlo[2],lz)*nz;
+  int ix0=(int)floor(fx),iy0=(int)floor(fy),iz0=(int)floor(fz);
+  double tx=fx-ix0,ty=fy-iy0,tz=fz-iz0;
+  const int NN=(ORD==4)?32:88; const double xi=(ORD==4)?kXi4:kXi6;
+  double ggx=0,ggy=0,ggz=0,gp=0;
+  for(int k=0;k<NN;++k){
+    GpuNode nd=(ORD==4)?c_nodes4[k]:c_nodes6[k];
+    double w=(ORD==4)?cs2_w4(tx,ty,tz,nd,xi):cs2_w6(tx,ty,tz,nd,xi);
+    if(w==0.0) continue;
+    int gxi=wrap(ix0+nd.dx,nx),gyi=wrap(iy0+nd.dy,ny),gzi=wrap(iz0+nd.dz,nz);
+    size_t id=midx(gxi,gyi,gzi,nx,ny);
+    ggx+=w*gx[id].x; ggy+=w*gy[id].x; ggz+=w*gz[id].x;
+    if(want_pot) gp+=w*pot[id].x;
+  }
+  double qi=q[i];
+  force[3*i+0]=-qscale*qi*ggx; force[3*i+1]=-qscale*qi*ggy; force[3*i+2]=-qscale*qi*ggz;
+  if(want_pot) vpot[i]=qscale*gp;
+}
+
+// ── kernels ──
+// QuadS spread: 1 thread/atom, (norder)^3 tensor-product atomicAdds into the real part of d_rho.
+template<int NORD>
+__global__ void k_spread_quads(int nlocal,const double*x,const double*boxlo,
+    double lx,double ly,double lz,const double*q,double rho_scale,
+    int nx,int ny,int nz,cufftDoubleComplex*rho){
+  int i=blockIdx.x*blockDim.x+threadIdx.x; if(i>=nlocal) return;
+  double fx=periodic_frac(x[3*i+0],boxlo[0],lx)*nx;
+  double fy=periodic_frac(x[3*i+1],boxlo[1],ly)*ny;
+  double fz=periodic_frac(x[3*i+2],boxlo[2],lz)*nz;
+  int ix0=(int)floor(fx), iy0=(int)floor(fy), iz0=(int)floor(fz);
+  double tx=fx-ix0, ty=fy-iy0, tz=fz-iz0;
+  double wx[NORD],wy[NORD],wz[NORD];
+  if(NORD==4){ quads4_w(tx,wx); quads4_w(ty,wy); quads4_w(tz,wz); }
+  else       { quads6_w(tx,wx); quads6_w(ty,wy); quads6_w(tz,wz); }
+  const int off=(NORD==4)?-1:-2;
+  double qs=rho_scale*q[i];
+  for(int a=0;a<NORD;++a){int gx=wrap(ix0+off+a,nx); double wa=wx[a]*qs;
+    for(int b=0;b<NORD;++b){int gy=wrap(iy0+off+b,ny); double wab=wa*wy[b];
+      for(int c=0;c<NORD;++c){int gz=wrap(iz0+off+c,nz);
+        atomicAdd(&rho[midx(gx,gy,gz,nx,ny)].x, wab*wz[c]); }}}
+}
+
+// green-multiply: 1 thread/grid-point. Builds ik*gf*rho grad meshes + ge*rho potential mesh,
+// and reduces energy + 6 virial (block-reduced into d_red via atomicAdd).
+__global__ void k_kspace(int nx,int ny,int nz,double lx,double ly,double lz,
+    const cufftDoubleComplex*rho,const double*ge,const double*gf,const double*gv,const double*gs,
+    cufftDoubleComplex*gx,cufftDoubleComplex*gy,cufftDoubleComplex*gz,
+    cufftDoubleComplex*pot,int want_pot,double scaleinv,double*red){
+  size_t idx=(size_t)blockIdx.x*blockDim.x+threadIdx.x; size_t ngrid=(size_t)nx*ny*nz;
+  if(idx>=ngrid) return;
+  int ix=idx%nx, iy=(idx/nx)%ny, iz=idx/((size_t)nx*ny);
+  int kxm=ix-nx*((2*ix)/nx), kym=iy-ny*((2*iy)/ny), kzm=iz-nz*((2*iz)/nz);
+  double kx=2*M_PI/lx*kxm, ky=2*M_PI/ly*kym, kz=2*M_PI/lz*kzm;
+  double geff=gf[idx], gee=ge[idx], gvv=gv[idx];
+  double rr=rho[idx].x, ri=rho[idx].y, rho2=rr*rr+ri*ri;
+  double s2=scaleinv*scaleinv;
+  // diag_sum for the mesh self-term: Σ green_self over modes where green is non-zero (skip k=0),
+  // matching sog.cpp's `if (geff==0 && geff_energy==0) continue; diag_sum += mesh_green_self`.
+  if(!(geff==0.0 && gee==0.0)) atomicAdd(&red[7], gs[idx]);
+  // energy + virial reductions
+  double e = s2*gee*rho2;
+  atomicAdd(&red[0], e);
+  atomicAdd(&red[1], s2*rho2*(gee - gvv*kx*kx));
+  atomicAdd(&red[2], s2*rho2*(gee - gvv*ky*ky));
+  atomicAdd(&red[3], s2*rho2*(gee - gvv*kz*kz));
+  atomicAdd(&red[4], s2*rho2*(-gvv*kx*ky));
+  atomicAdd(&red[5], s2*rho2*(-gvv*kx*kz));
+  atomicAdd(&red[6], s2*rho2*(-gvv*ky*kz));
+  // gradient meshes: grad = i*k * (scaleinv*geff*rho)
+  double vkr=scaleinv*geff*rr, vki=scaleinv*geff*ri;
+  gx[idx].x=-kx*vki; gx[idx].y=kx*vkr;
+  gy[idx].x=-ky*vki; gy[idx].y=ky*vkr;
+  gz[idx].x=-kz*vki; gz[idx].y=kz*vkr;
+  if(want_pot){ pot[idx].x=scaleinv*gee*rr; pot[idx].y=scaleinv*gee*ri; }
+}
+
+template<int NORD>
+__global__ void k_gather_quads(int nlocal,const double*x,const double*boxlo,
+    double lx,double ly,double lz,const double*q,double qscale,
+    int nx,int ny,int nz,const cufftDoubleComplex*gx,const cufftDoubleComplex*gy,
+    const cufftDoubleComplex*gz,const cufftDoubleComplex*pot,int want_pot,
+    double*force,double*vpot){
+  int i=blockIdx.x*blockDim.x+threadIdx.x; if(i>=nlocal) return;
+  double fx=periodic_frac(x[3*i+0],boxlo[0],lx)*nx;
+  double fy=periodic_frac(x[3*i+1],boxlo[1],ly)*ny;
+  double fz=periodic_frac(x[3*i+2],boxlo[2],lz)*nz;
+  int ix0=(int)floor(fx),iy0=(int)floor(fy),iz0=(int)floor(fz);
+  double tx=fx-ix0,ty=fy-iy0,tz=fz-iz0;
+  double wx[NORD],wy[NORD],wz[NORD];
+  if(NORD==4){ quads4_w(tx,wx); quads4_w(ty,wy); quads4_w(tz,wz); }
+  else       { quads6_w(tx,wx); quads6_w(ty,wy); quads6_w(tz,wz); }
+  const int off=(NORD==4)?-1:-2;
+  double ggx=0,ggy=0,ggz=0,gp=0;
+  for(int a=0;a<NORD;++a){int gxi=wrap(ix0+off+a,nx);
+    for(int b=0;b<NORD;++b){int gyi=wrap(iy0+off+b,ny); double wab=wx[a]*wy[b];
+      for(int c=0;c<NORD;++c){int gzi=wrap(iz0+off+c,nz); double w=wab*wz[c];
+        size_t id=midx(gxi,gyi,gzi,nx,ny);
+        ggx+=w*gx[id].x; ggy+=w*gy[id].x; ggz+=w*gz[id].x;
+        if(want_pot) gp+=w*pot[id].x; }}}
+  double qi=q[i];
+  force[3*i+0]=-qscale*qi*ggx; force[3*i+1]=-qscale*qi*ggy; force[3*i+2]=-qscale*qi*ggz;
+  if(want_pot) vpot[i]=qscale*gp;
+}
+
+__global__ void k_zero_complex(cufftDoubleComplex*a,size_t n){
+  size_t i=(size_t)blockIdx.x*blockDim.x+threadIdx.x; if(i<n){a[i].x=0;a[i].y=0;}
+}
+
+// ── host API ──
+extern "C" SogGpuState *sog_gpu_create(){
+  // upload CubeS2 node tables to constant memory (layout GpuNode == CubeS2Node4)
+  cudaMemcpyToSymbol(c_nodes4, LAMMPS_NS::kCubes2Nodes4, 32*sizeof(GpuNode));
+  cudaMemcpyToSymbol(c_nodes6, LAMMPS_NS::kCubes2Nodes6, 88*sizeof(GpuNode));
+  return new SogGpuState();
+}
+extern "C" void sog_gpu_destroy(SogGpuState*s){
+  if(!s) return;
+  if(s->plan) cufftDestroy(s->plan);
+  cudaFree(s->d_rho);cudaFree(s->d_gx);cudaFree(s->d_gy);cudaFree(s->d_gz);cudaFree(s->d_pot);
+  cudaFree(s->d_ge);cudaFree(s->d_gf);cudaFree(s->d_gv);cudaFree(s->d_gs);
+  cudaFree(s->d_x);cudaFree(s->d_q);cudaFree(s->d_force);cudaFree(s->d_vpot);cudaFree(s->d_red);
+  delete s;
+}
+
+extern "C" void sog_gpu_setup(SogGpuState*s,int nx,int ny,int nz,
+    const double*ge,const double*gf,const double*gs,const double*gvv){
+  size_t ng=(size_t)nx*ny*nz;
+  if(nx!=s->nx||ny!=s->ny||nz!=s->nz){
+    if(s->plan) cufftDestroy(s->plan);
+    cudaFree(s->d_rho);cudaFree(s->d_gx);cudaFree(s->d_gy);cudaFree(s->d_gz);cudaFree(s->d_pot);
+    cudaFree(s->d_ge);cudaFree(s->d_gf);cudaFree(s->d_gv);cudaFree(s->d_gs);
+    CK(cudaMalloc(&s->d_rho,ng*sizeof(cufftDoubleComplex)));
+    CK(cudaMalloc(&s->d_gx,ng*sizeof(cufftDoubleComplex)));
+    CK(cudaMalloc(&s->d_gy,ng*sizeof(cufftDoubleComplex)));
+    CK(cudaMalloc(&s->d_gz,ng*sizeof(cufftDoubleComplex)));
+    CK(cudaMalloc(&s->d_pot,ng*sizeof(cufftDoubleComplex)));
+    CK(cudaMalloc(&s->d_ge,ng*sizeof(double)));CK(cudaMalloc(&s->d_gf,ng*sizeof(double)));
+    CK(cudaMalloc(&s->d_gv,ng*sizeof(double)));CK(cudaMalloc(&s->d_gs,ng*sizeof(double)));
+    // cuFFT 3D expects (nz,ny,nx) with x fastest -> pass dims as (nz,ny,nx)
+    cufftPlan3d(&s->plan,nz,ny,nx,CUFFT_Z2Z);
+    s->nx=nx;s->ny=ny;s->nz=nz;s->ngrid=ng;
+  }
+  CK(cudaMemcpy(s->d_ge,ge,ng*sizeof(double),cudaMemcpyHostToDevice));
+  CK(cudaMemcpy(s->d_gf,gf,ng*sizeof(double),cudaMemcpyHostToDevice));
+  CK(cudaMemcpy(s->d_gv,gvv,ng*sizeof(double),cudaMemcpyHostToDevice));
+  CK(cudaMemcpy(s->d_gs,gs,ng*sizeof(double),cudaMemcpyHostToDevice));
+}
+
+extern "C" double sog_gpu_compute(SogGpuState*s,int nlocal,const double*x,const double*boxlo,
+    double lx,double ly,double lz,const double*q,double qscale,int spline,int want_pot,
+    double*force,double*virial6,double*vpot,double self_coeff,double qsqsum,int remove_self){
+  size_t ng=s->ngrid;
+  if(nlocal>s->cap_atoms){
+    cudaFree(s->d_x);cudaFree(s->d_q);cudaFree(s->d_force);cudaFree(s->d_vpot);
+    CK(cudaMalloc(&s->d_x,3*nlocal*sizeof(double)));CK(cudaMalloc(&s->d_q,nlocal*sizeof(double)));
+    CK(cudaMalloc(&s->d_force,3*nlocal*sizeof(double)));CK(cudaMalloc(&s->d_vpot,nlocal*sizeof(double)));
+    if(!s->d_red) CK(cudaMalloc(&s->d_red,8*sizeof(double)));
+    s->cap_atoms=nlocal;
+  }
+  double boxlo3[3]={boxlo[0],boxlo[1],boxlo[2]};
+  double *d_boxlo; CK(cudaMalloc(&d_boxlo,3*sizeof(double)));
+  CK(cudaMemcpy(d_boxlo,boxlo3,3*sizeof(double),cudaMemcpyHostToDevice));
+  CK(cudaMemcpy(s->d_x,x,3*nlocal*sizeof(double),cudaMemcpyHostToDevice));
+  CK(cudaMemcpy(s->d_q,q,nlocal*sizeof(double),cudaMemcpyHostToDevice));
+  CK(cudaMemset(s->d_red,0,8*sizeof(double)));
+  double volume=lx*ly*lz, rho_scale=(double)ng/volume, scaleinv=1.0/(double)ng;
+
+  int tb=256, gg=(ng+tb-1)/tb, ga=(nlocal+tb-1)/tb;
+  k_zero_complex<<<gg,tb>>>(s->d_rho,ng);
+  bool quads = (spline==SOG_QUADS_4||spline==SOG_QUADS_6);
+  int nord = (spline==SOG_CUBES2_6||spline==SOG_QUADS_6)?6:4;
+  // CubeS2 (default, bit-matches CPU sog) vs separable QuadS (spline==104/106).
+  if(quads){
+    if(nord==4) k_spread_quads<4><<<ga,tb>>>(nlocal,s->d_x,d_boxlo,lx,ly,lz,s->d_q,rho_scale,s->nx,s->ny,s->nz,s->d_rho);
+    else        k_spread_quads<6><<<ga,tb>>>(nlocal,s->d_x,d_boxlo,lx,ly,lz,s->d_q,rho_scale,s->nx,s->ny,s->nz,s->d_rho);
+  } else {
+    if(nord==4) k_spread_cubes2<4><<<ga,tb>>>(nlocal,s->d_x,d_boxlo,lx,ly,lz,s->d_q,rho_scale,s->nx,s->ny,s->nz,s->d_rho);
+    else        k_spread_cubes2<6><<<ga,tb>>>(nlocal,s->d_x,d_boxlo,lx,ly,lz,s->d_q,rho_scale,s->nx,s->ny,s->nz,s->d_rho);
+  }
+  cufftExecZ2Z(s->plan,s->d_rho,s->d_rho,CUFFT_FORWARD);
+  k_kspace<<<gg,tb>>>(s->nx,s->ny,s->nz,lx,ly,lz,s->d_rho,s->d_ge,s->d_gf,s->d_gv,s->d_gs,
+                      s->d_gx,s->d_gy,s->d_gz,s->d_pot,want_pot,scaleinv,s->d_red);
+  cufftExecZ2Z(s->plan,s->d_gx,s->d_gx,CUFFT_INVERSE);
+  cufftExecZ2Z(s->plan,s->d_gy,s->d_gy,CUFFT_INVERSE);
+  cufftExecZ2Z(s->plan,s->d_gz,s->d_gz,CUFFT_INVERSE);
+  if(want_pot) cufftExecZ2Z(s->plan,s->d_pot,s->d_pot,CUFFT_INVERSE);
+  if(quads){
+    if(nord==4) k_gather_quads<4><<<ga,tb>>>(nlocal,s->d_x,d_boxlo,lx,ly,lz,s->d_q,qscale,s->nx,s->ny,s->nz,s->d_gx,s->d_gy,s->d_gz,s->d_pot,want_pot,s->d_force,s->d_vpot);
+    else        k_gather_quads<6><<<ga,tb>>>(nlocal,s->d_x,d_boxlo,lx,ly,lz,s->d_q,qscale,s->nx,s->ny,s->nz,s->d_gx,s->d_gy,s->d_gz,s->d_pot,want_pot,s->d_force,s->d_vpot);
+  } else {
+    if(nord==4) k_gather_cubes2<4><<<ga,tb>>>(nlocal,s->d_x,d_boxlo,lx,ly,lz,s->d_q,qscale,s->nx,s->ny,s->nz,s->d_gx,s->d_gy,s->d_gz,s->d_pot,want_pot,s->d_force,s->d_vpot);
+    else        k_gather_cubes2<6><<<ga,tb>>>(nlocal,s->d_x,d_boxlo,lx,ly,lz,s->d_q,qscale,s->nx,s->ny,s->nz,s->d_gx,s->d_gy,s->d_gz,s->d_pot,want_pot,s->d_force,s->d_vpot);
+  }
+
+  double red[8]; CK(cudaMemcpy(red,s->d_red,8*sizeof(double),cudaMemcpyDeviceToHost));
+  CK(cudaMemcpy(force,s->d_force,3*nlocal*sizeof(double),cudaMemcpyDeviceToHost));
+  if(want_pot){
+    CK(cudaMemcpy(vpot,s->d_vpot,nlocal*sizeof(double),cudaMemcpyDeviceToHost));
+    // v_i self-energy part (matches sog.cpp:2083): vpot[i] -= qscale·q_i·(rsi·diag_sum/V + 2·self_coeff)
+    double rsi = remove_self ? red[7]/volume : 0.0;
+    double sc = 2.0*self_coeff;
+    for(int i=0;i<nlocal;++i) vpot[i] -= qscale*q[i]*(rsi + sc);
+  }
+  cudaFree(d_boxlo);
+  // Energy = qscale * [ 0.5*V*Σ(s2·ge·|ρ|²)  −  (rsi) qsqsum·diag_sum/(2V)  −  self_coeff·qsqsum ]
+  // (matches sog.cpp: k≠0 mesh sum + mesh self-term + real-space self-energy). red[7]=diag_sum.
+  double e_kneq0 = 0.5*volume*red[0];
+  double e_self  = self_coeff*qsqsum + (remove_self ? qsqsum*red[7]/(2.0*volume) : 0.0);
+  double energy = qscale*(e_kneq0 - e_self);
+  for(int j=0;j<6;++j) virial6[j]=0.5*volume*qscale*red[j+1];
+  (void)quads;
+  return energy;
+}

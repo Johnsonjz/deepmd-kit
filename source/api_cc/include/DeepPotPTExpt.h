@@ -218,6 +218,22 @@ class DeepPotPTExpt : public DeepPotBackend {
                             const std::vector<float>& fparam,
                             const std::vector<float>& aparam,
                             const bool atomic);
+  void computew_charge_response(
+      std::vector<double> &force_corr, std::vector<double> &virial_corr,
+      const std::vector<double> &v_per_atom,
+      const std::vector<double> &coord, const std::vector<int> &atype,
+      const std::vector<double> &box, const int nghost,
+      const InputNlist &inlist, const int &ago,
+      const std::vector<double> &fparam,
+      const std::vector<double> &aparam);
+  void computew_charge_response(
+      std::vector<float> &force_corr, std::vector<float> &virial_corr,
+      const std::vector<float> &v_per_atom,
+      const std::vector<float> &coord, const std::vector<int> &atype,
+      const std::vector<float> &box, const int nghost,
+      const InputNlist &inlist, const int &ago,
+      const std::vector<float> &fparam,
+      const std::vector<float> &aparam);
   void computew_mixed_type(std::vector<double>& ener,
                            std::vector<double>& force,
                            std::vector<double>& virial,

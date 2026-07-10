@@ -1475,6 +1475,28 @@ void DeepPotPTExpt::computew_with_charge(
                         fparam, aparam, atomic);
   });
 }
+void DeepPotPTExpt::computew_charge_response(
+    std::vector<double> &, std::vector<double> &,
+    const std::vector<double> &,
+    const std::vector<double> &, const std::vector<int> &,
+    const std::vector<double> &, const int,
+    const InputNlist &, const int &,
+    const std::vector<double> &,
+    const std::vector<double> &) {
+  throw deepmd::deepmd_exception(
+      "compute_charge_response is not implemented for PT exportable models.");
+}
+void DeepPotPTExpt::computew_charge_response(
+    std::vector<float> &, std::vector<float> &,
+    const std::vector<float> &,
+    const std::vector<float> &, const std::vector<int> &,
+    const std::vector<float> &, const int,
+    const InputNlist &, const int &,
+    const std::vector<float> &,
+    const std::vector<float> &) {
+  throw deepmd::deepmd_exception(
+      "compute_charge_response is not implemented for PT exportable models.");
+}
 
 template <typename VALUETYPE>
 void DeepPotPTExpt::compute_mixed_type_impl(
