@@ -18,7 +18,8 @@ void sog_gpu_destroy(SogGpuState *s);
 // for grid nx*ny*nz. Called from ensure_fft_plan whenever the grid changes.
 void sog_gpu_setup(SogGpuState *s, int nx, int ny, int nz,
                    const double *green_energy, const double *green_force,
-                   const double *green_self, const double *green_virial);
+                   const double *green_self, const double *green_virial,
+                   const double *green_self_virial);
 
 // One SOG kspace step, entirely on device:
 //   spread(q@x) -> cuFFT fwd -> green-multiply (grad meshes + potential + energy/virial reductions)

@@ -507,8 +507,15 @@ void SOGKSpace::settings(int narg, char **arg) {
         spline_type = 4;
       else if (val == "cubes2_6")
         spline_type = 6;
-      else
-        error->all(FLERR, "sog spline expects bspline, cubes2_4, or cubes2_6");
+      else if (val == "quads_4") {
+        spline_type = 4;
+        is_quads = true;
+      } else if (val == "quads_6") {
+        spline_type = 6;
+        is_quads = true;
+      } else
+        error->all(FLERR,
+                   "sog spline expects bspline, cubes2_4, cubes2_6, quads_4, or quads_6");
       iarg += 2;
     } else if (key == "grid_method") {
       if (iarg + 1 >= narg)
@@ -835,9 +842,6 @@ void SOGKSpace::destroy_fft_plan() {
   sinc_sum_x.clear();
   sinc_sum_y.clear();
   sinc_sum_z.clear();
-  cubes2_influence_re.clear();
-  cubes2_influence_im.clear();
-  cubes2_influence_sq.clear();
 }
 
 size_t SOGKSpace::mesh_index(int ix, int iy, int iz) const {
@@ -893,23 +897,24 @@ void SOGKSpace::ensure_fft_plan() {
       // water kernel — C_ν is kernel/system-dependent (~100× spread), so the precise per-kernel
       // value comes from those tools; the constants below are the cons/water FORCE-rel calibration,
       // with each φ_max point pinned by BISECTION on the true FFT-vs-direct curve (no fit scatter).
-      // ε is a target FORCE-rel accuracy; the default 1e-4 reproduces both production φ (order-4
-      // φ=0.0675, order-6 φ=0.10); override with the `phi_accuracy` keyword. bandwidth is
+      // ε is a target FORCE-rel accuracy; default 1e-4 gives a genuine 1e-4-force-rel grid
+      // (order-6 φ=0.068, order-4 φ=0.032 on cons); override with the `phi_accuracy` keyword. bandwidth is
       // always populated by finalize_kernel_parameters (init), so σ_min = √β_min is available.
       double bw_min = bandwidth.empty() ? sigma_param * sigma_param : bandwidth[0];
       for (double bw : bandwidth)
         if (bw < bw_min) bw_min = bw;
       const double sigma_min = std::sqrt(bw_min);
-      // (C_ν, p_ν) = bisection-refined FORCE-rel error law on the cons/water kernel
-      // (sog/refine_phi_max_constants.py: pin φ_max where force-rel = ε by bisection on the true
-      // FFT-vs-direct curve, then refit — no log-log-fit scatter). Recalibrated so the canonical
-      // ε=1e-4 (matching sog/phi_max_rule.py + test_phi_max_rule.py) reproduces BOTH production φ
-      // (order-6→0.100, order-4→0.0675). Only C_ν (prefactor) is re-tuned vs the old 3e-3 default;
-      // p_ν (the physics convergence order) is unchanged, and φ only sizes the mesh — the resulting
-      // GRID (not φ itself) enters the physics, so this exactly reproduces the explicit
-      // phi_max=0.10 → 50×100×100 reference. Per-kernel C_ν still comes from the offline tools.
-      const double C_nu = (spline_type == 6) ? 2.10e-3 : 1.90e-3;   // force-rel prefactor (ε=1e-4 tuning)
-      const double p_nu = (spline_type == 6) ? 7.59 : 3.69;         // force-rel convergence exponent
+      // (C_ν, p_ν) = HONEST FORCE-rel error law from calibrate_phi_max_anchors.py (2026-07-10):
+      // φ_max pinned by BISECTION of the true FFT-vs-direct force-rel curve on a PANEL of random
+      // systems × kernels, then pooled log-log refit. The single-parameter (Δ/σ_min) law collapses
+      // tightly for force-rel (CV ~5%); energy-rel does not (15-30%). These REPLACE the old back-fit
+      // constants (2.10e-3/7.59, 1.90e-3/3.69) that were tuned so ε=1e-4 reproduced φ=0.10/0.0675 —
+      // the true force-rel at φ=0.10 (order-6 cons) is ~2e-3, NOT 1e-4 (optimistic ~30×). With these
+      // honest constants ε=1e-4 gives φ=0.068 (order-6) / 0.032 (order-4) on the cons kernel → a finer
+      // mesh (75×150×150). PRODUCTION pins explicit phi_max=0.10 (force-rel ~2e-3, validated adequate:
+      // RDF/density match DPA + experiment); auto-derive here targets genuine 1e-4 accuracy.
+      const double C_nu = (spline_type == 6) ? 1.681e-2 : 4.465e-2; // honest force-rel prefactor (bisection panel)
+      const double p_nu = (spline_type == 6) ? 6.533 : 3.956;       // honest force-rel convergence exponent
       const double eps_default = 1.0e-4;                            // canonical target force-rel accuracy
       const double eps = (phi_accuracy_user > 0.0) ? phi_accuracy_user : eps_default;
       const double ds = std::pow(eps / C_nu, 1.0 / p_nu);          // Δ/σ_min at target ε
@@ -1002,7 +1007,8 @@ void SOGKSpace::ensure_fft_plan() {
       if (!gpu_) gpu_ = sog_gpu_create();
       sog_gpu_setup((SogGpuState*)gpu_, mesh_nx, mesh_ny, mesh_nz,
                     mesh_green_energy.data(), mesh_green_force.data(),
-                    mesh_green_self.data(), mesh_green_virial.data());
+                    mesh_green_self.data(), mesh_green_virial.data(),
+                    mesh_green_self_virial.data());
     }
     return;
   }
@@ -1038,9 +1044,12 @@ void SOGKSpace::ensure_fft_plan() {
                         mesh_ny - 1, 0, mesh_nz - 1, 0, 0, &tmp,
                         collective_flag);
 
-  if (spline_type >= 4) {
-    precompute_cubes2_influence();
-  } else {
+  // CubeS₂ (Form B) needs no spline-influence precompute: precompute_green_functions() builds the
+  // separable variance-subtraction Green tables directly from amp/bandwidth. Only the legacy B-spline
+  // Green path needs the sinc influence/alias tables. (The old non-separable Form-A influence build,
+  // precompute_cubes2_influence(), was dead — its |Φ|² output is never read, and dividing by it is
+  // unstable for the non-convolutional CubeS₂ window — so it is no longer called.)
+  if (spline_type == 0) {
     precompute_sinc_tables();
   }
   precompute_green_functions();
@@ -1048,7 +1057,8 @@ void SOGKSpace::ensure_fft_plan() {
     if (!gpu_) gpu_ = sog_gpu_create();
     sog_gpu_setup((SogGpuState*)gpu_, mesh_nx, mesh_ny, mesh_nz,
                   mesh_green_energy.data(), mesh_green_force.data(),
-                  mesh_green_self.data(), mesh_green_virial.data());
+                  mesh_green_self.data(), mesh_green_virial.data(),
+                  mesh_green_self_virial.data());
   }
   mesh_ready = true;
 }
@@ -1124,6 +1134,14 @@ void SOGKSpace::precompute_sinc_tables() {
 
 // ──────────────────────────────────────────────────────────────────────
 // CubeS₂ influence function precomputation
+//
+// DEAD CODE — retained for reference, NOT called. This builds the exact
+// non-separable CubeS₂ spectral influence Φ(k) (Form A, SPME-style |Φ|²
+// division). It is superseded by the separable variance-subtraction Green
+// function (Form B) in precompute_green_functions(): dividing by |Φ|² is
+// numerically unstable for the non-convolutional CubeS₂ window (near-zeros
+// at high k), and the cubes2_influence_* outputs were never read. Kept only
+// as an executable record of the non-separable form.
 // ──────────────────────────────────────────────────────────────────────
 
 void SOGKSpace::precompute_cubes2_influence() {
@@ -1268,6 +1286,7 @@ void SOGKSpace::precompute_green_functions() {
   mesh_green_energy.assign(ngrid, 0.0);
   mesh_green_force.assign(ngrid, 0.0);
   mesh_green_self.assign(ngrid, 0.0);
+  mesh_green_self_virial.assign(ngrid, 0.0);
   mesh_green_virial.assign(ngrid, 0.0);
 
   // k_sq_max: cutoff for which k‑modes contribute.
@@ -1310,6 +1329,69 @@ void SOGKSpace::precompute_green_functions() {
       (twopi_over_y * static_cast<double>(mesh_ny) > 2.0 * k_max) &&
       (twopi_over_z * static_cast<double>(mesh_nz) > 2.0 * k_max);
 
+  // ── CubeS₂ separable Green build: per-axis 1D exp tables (PPPM-style factorization) ──
+  // Form B is  Ĝ(k) = [Σ_m amp[m]·exp(-½·bandwidth[m]·k²)] · exp(Σ_α σ_{s,α}²·k_α²). Because k²=kx²+ky²+kz²
+  // and the deconv argument enter ONLY as exponents, each Gaussian factors per axis. Precompute the
+  // per-axis factors ONCE here — (n_gauss+1)·(nx+ny+nz) ≈ a few thousand exp — so the per-grid loop below
+  // is pure multiply-add with ZERO exp. This is the whole point under NPT: `fix_nh` calls
+  // `kspace->setup()` every step, so this table was rebuilt with ~12M exp/mesh; the factorization drops
+  // that to O(nx+ny+nz) exp and makes NPT fast even single-threaded (no longer OpenMP-dependent).
+  //   Bα[m][iα] = exp(-½·bandwidth[m]·kα²)   → folds into spectral_kernel / spectral_kernel_virial
+  //   Dα[iα]    = exp(σ_{s,α}²·kα²)           → the separable variance-subtraction deconv
+  const size_t n_gauss = amp.size();
+  // QuadS (is_quads): the separable deconv D_α becomes the EXACT inverse window influence
+  // 1/|Ŵ_α(k_α)|² (Form A, mode-based → strain-invariant / NPT-free), replacing the CubeS₂
+  // Form-B Gaussian D_α = exp(σ_{s,α}²·k_α²). Everything else (B_α, kfac, kfacv) is identical.
+  const double xi_quads = is_quads ? quads_xi(spline_type) : 0.0;
+  std::vector<double> Bx, By, Bz, Dx, Dy, Dz;
+  if (spline_type >= 4) {
+    Bx.assign(n_gauss * static_cast<size_t>(mesh_nx), 0.0);
+    By.assign(n_gauss * static_cast<size_t>(mesh_ny), 0.0);
+    Bz.assign(n_gauss * static_cast<size_t>(mesh_nz), 0.0);
+    Dx.assign(static_cast<size_t>(mesh_nx), 0.0);
+    Dy.assign(static_cast<size_t>(mesh_ny), 0.0);
+    Dz.assign(static_cast<size_t>(mesh_nz), 0.0);
+    for (int ix = 0; ix < mesh_nx; ++ix) {
+      const int kx_mode = ix - mesh_nx * (2 * ix / mesh_nx);
+      const double kx = twopi_over_x * static_cast<double>(kx_mode);
+      const double kx2 = kx * kx;
+      Dx[static_cast<size_t>(ix)] =
+          is_quads ? 1.0 / quads_influence_1d(kx_mode, mesh_nx, xi_quads, spline_type)
+                   : std::exp(sig_sx2 * kx2);
+      for (size_t m = 0; m < n_gauss; ++m)
+        Bx[m * static_cast<size_t>(mesh_nx) + static_cast<size_t>(ix)] =
+            std::exp(-0.5 * bandwidth[m] * kx2);
+    }
+    for (int iy = 0; iy < mesh_ny; ++iy) {
+      const int ky_mode = iy - mesh_ny * (2 * iy / mesh_ny);
+      const double ky = twopi_over_y * static_cast<double>(ky_mode);
+      const double ky2 = ky * ky;
+      Dy[static_cast<size_t>(iy)] =
+          is_quads ? 1.0 / quads_influence_1d(ky_mode, mesh_ny, xi_quads, spline_type)
+                   : std::exp(sig_sy2 * ky2);
+      for (size_t m = 0; m < n_gauss; ++m)
+        By[m * static_cast<size_t>(mesh_ny) + static_cast<size_t>(iy)] =
+            std::exp(-0.5 * bandwidth[m] * ky2);
+    }
+    for (int iz = 0; iz < mesh_nz; ++iz) {
+      const int kz_mode = iz - mesh_nz * (2 * iz / mesh_nz);
+      const double kz = twopi_over_z * static_cast<double>(kz_mode);
+      const double kz2 = kz * kz;
+      Dz[static_cast<size_t>(iz)] =
+          is_quads ? 1.0 / quads_influence_1d(kz_mode, mesh_nz, xi_quads, spline_type)
+                   : std::exp(sig_sz2 * kz2);
+      for (size_t m = 0; m < n_gauss; ++m)
+        Bz[m * static_cast<size_t>(mesh_nz) + static_cast<size_t>(iz)] =
+            std::exp(-0.5 * bandwidth[m] * kz2);
+    }
+  }
+
+  // Parallelize the per-grid-point green-function build. Each iteration writes only its own
+  // mesh_green_*[idx] (idx unique per ix,iy,iz) and reads shared const tables — embarrassingly
+  // parallel. This matters because under NPT `fix_nh` calls `kspace->setup()` EVERY step
+  // (fix_nh.cpp), so this loop (~12M exp over the mesh) reran single-threaded at ~114 ms/step
+  // inside the barostat and doubled NPT wall time; threaded over the cores it is ~1-2 ms.
+#pragma omp parallel for schedule(static)
   for (int iz = 0; iz < mesh_nz; ++iz) {
     const int kz_mode = iz - mesh_nz * (2 * iz / mesh_nz);
     const double kz = twopi_over_z * static_cast<double>(kz_mode);
@@ -1328,14 +1410,26 @@ void SOGKSpace::precompute_green_functions() {
         const size_t idx = mesh_index(ix, iy, iz);
 
         if (spline_type >= 4) {
-          // ── CubeS₂ Green function (variance-subtraction, Form B) ──
-          const double kfac = spectral_kernel(sqk);
-          const double deconv =
-              std::exp(sig_sx2 * kx * kx + sig_sy2 * ky * ky + sig_sz2 * kz * kz);
-          mesh_green_energy[idx] = kfac * deconv;
-          mesh_green_force[idx] = kfac * deconv;
+          // ── CubeS₂ Green function (variance-subtraction, Form B) — separable synthesis ──
+          // kfac ≡ spectral_kernel(sqk), kfacv ≡ spectral_kernel_virial(sqk), dc ≡ deconv, rebuilt
+          // from the per-axis tables above: exact to fp rounding, with NO exp() in this hot loop.
+          double kfac = 0.0, kfacv = 0.0;
+          for (size_t m = 0; m < n_gauss; ++m) {
+            const double p =
+                Bx[m * static_cast<size_t>(mesh_nx) + static_cast<size_t>(ix)] *
+                By[m * static_cast<size_t>(mesh_ny) + static_cast<size_t>(iy)] *
+                Bz[m * static_cast<size_t>(mesh_nz) + static_cast<size_t>(iz)];
+            kfac += amp[m] * p;
+            kfacv += amp_virial[m] * p;
+          }
+          const double dc = Dx[static_cast<size_t>(ix)] *
+                            Dy[static_cast<size_t>(iy)] *
+                            Dz[static_cast<size_t>(iz)];
+          mesh_green_energy[idx] = kfac * dc;
+          mesh_green_force[idx] = kfac * dc;
           mesh_green_self[idx] = kfac;
-          mesh_green_virial[idx] = spectral_kernel_virial(sqk) * deconv;
+          mesh_green_self_virial[idx] = kfacv;  // bare K_v(k²) for the self-energy stress term
+          mesh_green_virial[idx] = kfacv * dc;
           continue;
         }
 
@@ -1669,7 +1763,7 @@ void SOGKSpace::compute_single(int eflag, int vflag) {
     ensure_fft_plan();                 // sizes grid + (re)creates plan/green tables on box/grid change
     auto g = (SogGpuState *)gpu_;
     if (!g) { g = sog_gpu_create(); gpu_ = g; }
-    int spl = spline_type;
+    int spl = is_quads ? (100 + spline_type) : spline_type;  // SOG_QUADS_4=104 / _6=106
     double qscale = force->qqrd2e * scale;
     double boxlo[3] = {domain->boxlo[0], domain->boxlo[1], domain->boxlo[2]};
     double lx = mesh_lx, ly = mesh_ly, lz = mesh_lz;
@@ -1751,7 +1845,44 @@ void SOGKSpace::compute_single(int eflag, int vflag) {
 
   // ── Charge spreading ──
 
-  if (spline_type >= 4) {
+  if (spline_type >= 4 && is_quads) {
+    // QuadS separable charge spreading: 3-D weight = wx[a]·wy[b]·wz[c] over the
+    // (2ν)³ nodes at offsets quads_offsets(order).
+    const double xi = quads_xi(spline_type);
+    const int n1d = spline_type;              // 2ν
+    const int *offs = quads_offsets(spline_type);
+    for (int i = 0; i < nlocal; ++i) {
+      const double fx = periodic_fraction(x[i][0], domain->boxlo[0], mesh_lx) *
+                        static_cast<double>(mesh_nx);
+      const double fy = periodic_fraction(x[i][1], domain->boxlo[1], mesh_ly) *
+                        static_cast<double>(mesh_ny);
+      const double fz = periodic_fraction(x[i][2], domain->boxlo[2], mesh_lz) *
+                        static_cast<double>(mesh_nz);
+      const int ix0 = static_cast<int>(std::floor(fx));
+      const int iy0 = static_cast<int>(std::floor(fy));
+      const int iz0 = static_cast<int>(std::floor(fz));
+      const double tx = fx - static_cast<double>(ix0);
+      const double ty = fy - static_cast<double>(iy0);
+      const double tz = fz - static_cast<double>(iz0);
+      const double q_scaled = rho_scale * q[i];
+      double wx[6], wy[6], wz[6];
+      quads_weights_1d(tx, xi, spline_type, wx);
+      quads_weights_1d(ty, xi, spline_type, wy);
+      quads_weights_1d(tz, xi, spline_type, wz);
+      for (int a = 0; a < n1d; ++a) {
+        const int igx = wrap_index(ix0 + offs[a], mesh_nx);
+        for (int b = 0; b < n1d; ++b) {
+          const int igy = wrap_index(iy0 + offs[b], mesh_ny);
+          const double wxy = wx[a] * wy[b];
+          for (int c = 0; c < n1d; ++c) {
+            const int igz = wrap_index(iz0 + offs[c], mesh_nz);
+            const size_t idx = mesh_index(igx, igy, igz);
+            mesh_rho[idx] += static_cast<FFT_SCALAR>(q_scaled * wxy * wz[c]);
+          }
+        }
+      }
+    }
+  } else if (spline_type >= 4) {
     // CubeS₂ charge spreading
     const int num_nodes = (spline_type == 4) ? kCubes2NumNodes4 : kCubes2NumNodes6;
     const double xi = (spline_type == 4) ? kCubes2Xi4 : kCubes2Xi6;
@@ -1860,6 +1991,10 @@ void SOGKSpace::compute_single(int eflag, int vflag) {
   double energy_local = 0.0;
   double diag_sum_local = 0.0;
   std::array<double, 6> fv_local = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
+  // Anisotropic self-energy stress accumulator: Σ_mesh K_v(k²)·k_α k_β. Combined with
+  // diag_sum (Σ K) it gives the strain-derivative of the reciprocal self-removal energy
+  // −qscale·qsqsum·Σ K/(2V), which the reciprocal virial omits (~2.5%→~0.5% fix).
+  std::array<double, 6> sv_local = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
 
   for (int iz = 0; iz < mesh_nz; ++iz) {
     const int kz_mode = iz - mesh_nz * (2 * iz / mesh_nz);
@@ -1917,6 +2052,15 @@ void SOGKSpace::compute_single(int eflag, int vflag) {
           fv_local[3] += s2 * rho2 * (-gv * kx * ky);
           fv_local[4] += s2 * rho2 * (-gv * kx * kz);
           fv_local[5] += s2 * rho2 * (-gv * ky * kz);
+          // Anisotropic self-energy stress: Σ bare K_v(k²)·k_α k_β (config-independent,
+          // like diag_sum_local; combined with diag_sum in the virial finalize below).
+          const double gsv = mesh_green_self_virial[idx];
+          sv_local[0] += gsv * kx * kx;
+          sv_local[1] += gsv * ky * ky;
+          sv_local[2] += gsv * kz * kz;
+          sv_local[3] += gsv * kx * ky;
+          sv_local[4] += gsv * kx * kz;
+          sv_local[5] += gsv * ky * kz;
         }
 
         const double vk_re = scaleinv * geff * rho_re;
@@ -1963,7 +2107,53 @@ void SOGKSpace::compute_single(int eflag, int vflag) {
     utils::logmesg(lmp, msg);
   }
 
-  if (spline_type >= 4) {
+  if (spline_type >= 4 && is_quads) {
+    // QuadS separable force/potential interpolation.
+    const double xi = quads_xi(spline_type);
+    const int n1d = spline_type;
+    const int *offs = quads_offsets(spline_type);
+    if (want_potential) vpot.assign(nlocal, 0.0);
+    for (int i = 0; i < nlocal; ++i) {
+      const double fx = periodic_fraction(x[i][0], domain->boxlo[0], mesh_lx) *
+                        static_cast<double>(mesh_nx);
+      const double fy = periodic_fraction(x[i][1], domain->boxlo[1], mesh_ly) *
+                        static_cast<double>(mesh_ny);
+      const double fz = periodic_fraction(x[i][2], domain->boxlo[2], mesh_lz) *
+                        static_cast<double>(mesh_nz);
+      const int ix0 = static_cast<int>(std::floor(fx));
+      const int iy0 = static_cast<int>(std::floor(fy));
+      const int iz0 = static_cast<int>(std::floor(fz));
+      const double tx = fx - static_cast<double>(ix0);
+      const double ty = fy - static_cast<double>(iy0);
+      const double tz = fz - static_cast<double>(iz0);
+      double gx = 0.0, gy = 0.0, gz = 0.0, gpot = 0.0;
+      double wx[6], wy[6], wz[6];
+      quads_weights_1d(tx, xi, spline_type, wx);
+      quads_weights_1d(ty, xi, spline_type, wy);
+      quads_weights_1d(tz, xi, spline_type, wz);
+      for (int a = 0; a < n1d; ++a) {
+        const int igx = wrap_index(ix0 + offs[a], mesh_nx);
+        for (int b = 0; b < n1d; ++b) {
+          const int igy = wrap_index(iy0 + offs[b], mesh_ny);
+          const double wxy = wx[a] * wy[b];
+          for (int c = 0; c < n1d; ++c) {
+            const int igz = wrap_index(iz0 + offs[c], mesh_nz);
+            const size_t idx = mesh_index(igx, igy, igz);
+            const double w = wxy * wz[c];
+            gx += w * static_cast<double>(mesh_gradx[2 * idx]);
+            gy += w * static_cast<double>(mesh_grady[2 * idx]);
+            gz += w * static_cast<double>(mesh_gradz[2 * idx]);
+            if (want_potential) gpot += w * static_cast<double>(mesh_pot[2 * idx]);
+          }
+        }
+      }
+      const double qi = q[i];
+      atom->f[i][0] += -qscale * qi * gx;
+      atom->f[i][1] += -qscale * qi * gy;
+      atom->f[i][2] += -qscale * qi * gz;
+      if (want_potential) vpot[i] = qscale * gpot;
+    }
+  } else if (spline_type >= 4) {
     // CubeS₂ force interpolation
     const int num_nodes = (spline_type == 4) ? kCubes2NumNodes4 : kCubes2NumNodes6;
     const double xi = (spline_type == 4) ? kCubes2Xi4 : kCubes2Xi6;
@@ -2140,6 +2330,24 @@ void SOGKSpace::compute_single(int eflag, int vflag) {
     // Scale Fourier virial: W = 0.5 * V * qscale * Σ s2 * |ρ|² * (ge·I - gv·k⊗k)
     const double virial_scale = 0.5 * volume * qscale;
     for (int j = 0; j < 6; ++j) virial[j] = virial_scale * vf_all[j];
+
+    // Self-energy strain-derivative (the term the reciprocal formula omits, ~2.5%→~0.5%):
+    //   W_self_αβ = (qscale·qsqsum/2V)·(Σ K_v·k_α k_β − δ_αβ·Σ K)
+    // Σ K_v·k_α k_β = sv_all, Σ K = diag_sum_all (both raw mesh sums, no s2). Isotropic
+    // δ part matches the energy's −qsqsum·diag_sum/(2V); the k=0 correction is separate.
+    if (remove_self_interaction) {
+      double sv_all[6] = {0.0};
+      MPI_Allreduce(sv_local.data(), sv_all, 6, MPI_DOUBLE, MPI_SUM, world);
+      double diag_sum_all_v = 0.0;
+      MPI_Allreduce(&diag_sum_local, &diag_sum_all_v, 1, MPI_DOUBLE, MPI_SUM, world);
+      const double self_pref = qscale * qsqsum_all / (2.0 * volume);
+      virial[0] += self_pref * (sv_all[0] - diag_sum_all_v);
+      virial[1] += self_pref * (sv_all[1] - diag_sum_all_v);
+      virial[2] += self_pref * (sv_all[2] - diag_sum_all_v);
+      virial[3] += self_pref * sv_all[3];
+      virial[4] += self_pref * sv_all[4];
+      virial[5] += self_pref * sv_all[5];
+    }
 
     // NOTE: k=0 Q² virial correction is NOT applied here per-channel.
     // It is applied once in the multi-channel wrapper using total Q.

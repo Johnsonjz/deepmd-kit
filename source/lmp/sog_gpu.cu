@@ -23,8 +23,9 @@ struct SogGpuState {
   cufftDoubleComplex *d_rho=nullptr;  // charge mesh / rho_hat (in place)
   cufftDoubleComplex *d_gx=nullptr, *d_gy=nullptr, *d_gz=nullptr, *d_pot=nullptr;
   double *d_ge=nullptr, *d_gf=nullptr, *d_gv=nullptr, *d_gs=nullptr;  // green energy/force/virial/self tables
+  double *d_gsv=nullptr;             // bare K_v(k²) table for the self-energy strain-derivative virial
   double *d_x=nullptr, *d_q=nullptr, *d_force=nullptr, *d_vpot=nullptr;  // per-atom
-  double *d_red=nullptr;              // energy + 6 virial + diag_sum reductions (8 doubles)
+  double *d_red=nullptr;             // energy + 6 recip virial + diag_sum + 6 self-virial (14 doubles)
   int cap_atoms=0;
 };
 
@@ -37,21 +38,35 @@ __device__ __forceinline__ size_t midx(int ix,int iy,int iz,int nx,int ny){
   return (size_t)iz*ny*nx + (size_t)iy*nx + ix;   // matches sog.cpp mesh_index (x fastest)
 }
 
-// ── separable QuadS 1D weights — EXACT port of quads_fft.py::_quads_1d_weights ──
-// QuadS = CubeS2's L/R functions applied SEPARABLY (tensor product). QuadS is ORDER-4 ONLY in this
-// codebase (quads_fft.py has no order-6). xi = 2/sqrt(15) (the general-purpose optimum used by
-// _quads_xi_per_dim, xi^2 = 4/15), NOT 1/sqrt(3). Nodes at offsets {-1,0,1,2}, weights (R(1-t),L(t),R(t),L(1-t)).
-__device__ __forceinline__ double quads_L(double th){ const double xi2 = 4.0/15.0;
-  return -0.5*th*th*th + 0.5*th*th - (9.0*xi2-2.0)/6.0*th + 0.5*xi2; }
-__device__ __forceinline__ double quads_R(double th){ const double xi2 = 4.0/15.0;
-  return (1.0/6.0)*th*th*th + (3.0*xi2-1.0)/6.0*th; }
+// ── separable QuadS 1D weights — correct port of sog_spline.h / quads_spline.py ──
+// True midtown quadrature splines (§A.2/§A.3): ξ○ = 1/√3 (order 4), 0.72879488 (order 6),
+// weights c₁…c_ν with reflection c_i(θ)=c_{1-i}(1-θ). Offsets 1−ν…ν. (The earlier port used
+// CubeS₂'s L and ξ=2/√15 — WRONG; that has been replaced.)
+__device__ const double kQuadsXi6_d = 0.72879488;   // 0.72879488² etc computed inline
+// order 4 (ξ○=1/√3 ⇒ ξ²=1/3): c₁ = -½t³+½t²-(3ξ²-2)/2·t+ξ²/2 ; c₂ = ⅙t³+(3ξ²-1)/6·t
+__device__ __forceinline__ double q_c1_4(double t){ const double x2=1.0/3.0;
+  return -0.5*t*t*t + 0.5*t*t - (3.0*x2-2.0)/2.0*t + 0.5*x2; }
+__device__ __forceinline__ double q_c2_4(double t){ const double x2=1.0/3.0;
+  return (1.0/6.0)*t*t*t + (3.0*x2-1.0)/6.0*t; }
 __device__ __forceinline__ void quads4_w(double t, double *w /*[4]*/){   // offsets -1,0,1,2
-  w[0]=quads_R(1.0-t); w[1]=quads_L(t); w[2]=quads_R(t); w[3]=quads_L(1.0-t);
+  w[0]=q_c2_4(1.0-t); w[1]=q_c1_4(1.0-t); w[2]=q_c1_4(t); w[3]=q_c2_4(t);
 }
-// QuadS order-6 does NOT exist (quads_fft.py is order-4 only) -> order-6 uses CubeS2-6 (baseline).
-// Stub kept only so the NORD=6 template instantiation compiles; it is never used for QuadS.
-__device__ __forceinline__ void quads6_w(double t, double *w /*[6]*/){
-  double w4[4]; quads4_w(t,w4); w[0]=0; w[1]=w4[0]; w[2]=w4[1]; w[3]=w4[2]; w[4]=w4[3]; w[5]=0;
+// order 6 (ξ○=0.72879488): c₁,c₂,c₃ degree-5 (§A.3)
+__device__ __forceinline__ double q_c1_6(double t,double x2,double x4){
+  double t2=t*t,t3=t2*t,t4=t3*t,t5=t4*t;
+  return (1.0/12.0)*t5 - (1.0/6.0)*t4 + (10.0*x2-7.0)/12.0*t3
+       - (3.0*x2-2.0)/3.0*t2 + (5.0*x4-7.0*x2+4.0)/4.0*t - (3.0*x4-4.0*x2)/6.0; }
+__device__ __forceinline__ double q_c2_6(double t,double x2,double x4){
+  double t2=t*t,t3=t2*t,t4=t3*t,t5=t4*t;
+  return -(1.0/24.0)*t5 + (1.0/24.0)*t4 - (10.0*x2-7.0)/24.0*t3
+       + (6.0*x2-1.0)/24.0*t2 - (5.0*x4-7.0*x2+2.0)/8.0*t + (3.0*x4-x2)/24.0; }
+__device__ __forceinline__ double q_c3_6(double t,double x2,double x4){
+  double t3=t*t*t,t5=t3*t*t;
+  return (1.0/120.0)*t5 + (2.0*x2-1.0)/24.0*t3 + (15.0*x4-15.0*x2+4.0)/120.0*t; }
+__device__ __forceinline__ void quads6_w(double t, double *w /*[6]*/){   // offsets -2,-1,0,1,2,3
+  const double x2=kQuadsXi6_d*kQuadsXi6_d, x4=x2*x2;
+  w[0]=q_c3_6(1.0-t,x2,x4); w[1]=q_c2_6(1.0-t,x2,x4); w[2]=q_c1_6(1.0-t,x2,x4);
+  w[3]=q_c1_6(t,x2,x4);     w[4]=q_c2_6(t,x2,x4);     w[5]=q_c3_6(t,x2,x4);
 }
 
 // ── CubeS₂ device port — EXACT port of sog_spline.h (bit-matches CPU sog.cpp) ──
@@ -193,7 +208,7 @@ __global__ void k_spread_quads(int nlocal,const double*x,const double*boxlo,
 // and reduces energy + 6 virial (block-reduced into d_red via atomicAdd).
 __global__ void k_kspace(int nx,int ny,int nz,double lx,double ly,double lz,
     const cufftDoubleComplex*rho,const double*ge,const double*gf,const double*gv,const double*gs,
-    cufftDoubleComplex*gx,cufftDoubleComplex*gy,cufftDoubleComplex*gz,
+    const double*gsv,cufftDoubleComplex*gx,cufftDoubleComplex*gy,cufftDoubleComplex*gz,
     cufftDoubleComplex*pot,int want_pot,double scaleinv,double*red){
   size_t idx=(size_t)blockIdx.x*blockDim.x+threadIdx.x; size_t ngrid=(size_t)nx*ny*nz;
   if(idx>=ngrid) return;
@@ -205,7 +220,8 @@ __global__ void k_kspace(int nx,int ny,int nz,double lx,double ly,double lz,
   double s2=scaleinv*scaleinv;
   // diag_sum for the mesh self-term: Σ green_self over modes where green is non-zero (skip k=0),
   // matching sog.cpp's `if (geff==0 && geff_energy==0) continue; diag_sum += mesh_green_self`.
-  if(!(geff==0.0 && gee==0.0)) atomicAdd(&red[7], gs[idx]);
+  bool active = !(geff==0.0 && gee==0.0);
+  if(active) atomicAdd(&red[7], gs[idx]);
   // energy + virial reductions
   double e = s2*gee*rho2;
   atomicAdd(&red[0], e);
@@ -215,6 +231,12 @@ __global__ void k_kspace(int nx,int ny,int nz,double lx,double ly,double lz,
   atomicAdd(&red[4], s2*rho2*(-gvv*kx*ky));
   atomicAdd(&red[5], s2*rho2*(-gvv*kx*kz));
   atomicAdd(&red[6], s2*rho2*(-gvv*ky*kz));
+  // self-energy stress accumulator: Σ bare K_v(k²)·k_α k_β (config-independent, red[8..13])
+  if(active){
+    double sv=gsv[idx];
+    atomicAdd(&red[8],  sv*kx*kx); atomicAdd(&red[9],  sv*ky*ky); atomicAdd(&red[10], sv*kz*kz);
+    atomicAdd(&red[11], sv*kx*ky); atomicAdd(&red[12], sv*kx*kz); atomicAdd(&red[13], sv*ky*kz);
+  }
   // gradient meshes: grad = i*k * (scaleinv*geff*rho)
   double vkr=scaleinv*geff*rr, vki=scaleinv*geff*ri;
   gx[idx].x=-kx*vki; gx[idx].y=kx*vkr;
@@ -266,18 +288,18 @@ extern "C" void sog_gpu_destroy(SogGpuState*s){
   if(!s) return;
   if(s->plan) cufftDestroy(s->plan);
   cudaFree(s->d_rho);cudaFree(s->d_gx);cudaFree(s->d_gy);cudaFree(s->d_gz);cudaFree(s->d_pot);
-  cudaFree(s->d_ge);cudaFree(s->d_gf);cudaFree(s->d_gv);cudaFree(s->d_gs);
+  cudaFree(s->d_ge);cudaFree(s->d_gf);cudaFree(s->d_gv);cudaFree(s->d_gs);cudaFree(s->d_gsv);
   cudaFree(s->d_x);cudaFree(s->d_q);cudaFree(s->d_force);cudaFree(s->d_vpot);cudaFree(s->d_red);
   delete s;
 }
 
 extern "C" void sog_gpu_setup(SogGpuState*s,int nx,int ny,int nz,
-    const double*ge,const double*gf,const double*gs,const double*gvv){
+    const double*ge,const double*gf,const double*gs,const double*gvv,const double*gsv){
   size_t ng=(size_t)nx*ny*nz;
   if(nx!=s->nx||ny!=s->ny||nz!=s->nz){
     if(s->plan) cufftDestroy(s->plan);
     cudaFree(s->d_rho);cudaFree(s->d_gx);cudaFree(s->d_gy);cudaFree(s->d_gz);cudaFree(s->d_pot);
-    cudaFree(s->d_ge);cudaFree(s->d_gf);cudaFree(s->d_gv);cudaFree(s->d_gs);
+    cudaFree(s->d_ge);cudaFree(s->d_gf);cudaFree(s->d_gv);cudaFree(s->d_gs);cudaFree(s->d_gsv);
     CK(cudaMalloc(&s->d_rho,ng*sizeof(cufftDoubleComplex)));
     CK(cudaMalloc(&s->d_gx,ng*sizeof(cufftDoubleComplex)));
     CK(cudaMalloc(&s->d_gy,ng*sizeof(cufftDoubleComplex)));
@@ -285,6 +307,7 @@ extern "C" void sog_gpu_setup(SogGpuState*s,int nx,int ny,int nz,
     CK(cudaMalloc(&s->d_pot,ng*sizeof(cufftDoubleComplex)));
     CK(cudaMalloc(&s->d_ge,ng*sizeof(double)));CK(cudaMalloc(&s->d_gf,ng*sizeof(double)));
     CK(cudaMalloc(&s->d_gv,ng*sizeof(double)));CK(cudaMalloc(&s->d_gs,ng*sizeof(double)));
+    CK(cudaMalloc(&s->d_gsv,ng*sizeof(double)));
     // cuFFT 3D expects (nz,ny,nx) with x fastest -> pass dims as (nz,ny,nx)
     cufftPlan3d(&s->plan,nz,ny,nx,CUFFT_Z2Z);
     s->nx=nx;s->ny=ny;s->nz=nz;s->ngrid=ng;
@@ -293,6 +316,7 @@ extern "C" void sog_gpu_setup(SogGpuState*s,int nx,int ny,int nz,
   CK(cudaMemcpy(s->d_gf,gf,ng*sizeof(double),cudaMemcpyHostToDevice));
   CK(cudaMemcpy(s->d_gv,gvv,ng*sizeof(double),cudaMemcpyHostToDevice));
   CK(cudaMemcpy(s->d_gs,gs,ng*sizeof(double),cudaMemcpyHostToDevice));
+  CK(cudaMemcpy(s->d_gsv,gsv,ng*sizeof(double),cudaMemcpyHostToDevice));
 }
 
 extern "C" double sog_gpu_compute(SogGpuState*s,int nlocal,const double*x,const double*boxlo,
@@ -303,7 +327,7 @@ extern "C" double sog_gpu_compute(SogGpuState*s,int nlocal,const double*x,const 
     cudaFree(s->d_x);cudaFree(s->d_q);cudaFree(s->d_force);cudaFree(s->d_vpot);
     CK(cudaMalloc(&s->d_x,3*nlocal*sizeof(double)));CK(cudaMalloc(&s->d_q,nlocal*sizeof(double)));
     CK(cudaMalloc(&s->d_force,3*nlocal*sizeof(double)));CK(cudaMalloc(&s->d_vpot,nlocal*sizeof(double)));
-    if(!s->d_red) CK(cudaMalloc(&s->d_red,8*sizeof(double)));
+    if(!s->d_red) CK(cudaMalloc(&s->d_red,14*sizeof(double)));
     s->cap_atoms=nlocal;
   }
   double boxlo3[3]={boxlo[0],boxlo[1],boxlo[2]};
@@ -311,7 +335,7 @@ extern "C" double sog_gpu_compute(SogGpuState*s,int nlocal,const double*x,const 
   CK(cudaMemcpy(d_boxlo,boxlo3,3*sizeof(double),cudaMemcpyHostToDevice));
   CK(cudaMemcpy(s->d_x,x,3*nlocal*sizeof(double),cudaMemcpyHostToDevice));
   CK(cudaMemcpy(s->d_q,q,nlocal*sizeof(double),cudaMemcpyHostToDevice));
-  CK(cudaMemset(s->d_red,0,8*sizeof(double)));
+  CK(cudaMemset(s->d_red,0,14*sizeof(double)));
   double volume=lx*ly*lz, rho_scale=(double)ng/volume, scaleinv=1.0/(double)ng;
 
   int tb=256, gg=(ng+tb-1)/tb, ga=(nlocal+tb-1)/tb;
@@ -328,7 +352,7 @@ extern "C" double sog_gpu_compute(SogGpuState*s,int nlocal,const double*x,const 
   }
   cufftExecZ2Z(s->plan,s->d_rho,s->d_rho,CUFFT_FORWARD);
   k_kspace<<<gg,tb>>>(s->nx,s->ny,s->nz,lx,ly,lz,s->d_rho,s->d_ge,s->d_gf,s->d_gv,s->d_gs,
-                      s->d_gx,s->d_gy,s->d_gz,s->d_pot,want_pot,scaleinv,s->d_red);
+                      s->d_gsv,s->d_gx,s->d_gy,s->d_gz,s->d_pot,want_pot,scaleinv,s->d_red);
   cufftExecZ2Z(s->plan,s->d_gx,s->d_gx,CUFFT_INVERSE);
   cufftExecZ2Z(s->plan,s->d_gy,s->d_gy,CUFFT_INVERSE);
   cufftExecZ2Z(s->plan,s->d_gz,s->d_gz,CUFFT_INVERSE);
@@ -341,7 +365,7 @@ extern "C" double sog_gpu_compute(SogGpuState*s,int nlocal,const double*x,const 
     else        k_gather_cubes2<6><<<ga,tb>>>(nlocal,s->d_x,d_boxlo,lx,ly,lz,s->d_q,qscale,s->nx,s->ny,s->nz,s->d_gx,s->d_gy,s->d_gz,s->d_pot,want_pot,s->d_force,s->d_vpot);
   }
 
-  double red[8]; CK(cudaMemcpy(red,s->d_red,8*sizeof(double),cudaMemcpyDeviceToHost));
+  double red[14]; CK(cudaMemcpy(red,s->d_red,14*sizeof(double),cudaMemcpyDeviceToHost));
   CK(cudaMemcpy(force,s->d_force,3*nlocal*sizeof(double),cudaMemcpyDeviceToHost));
   if(want_pot){
     CK(cudaMemcpy(vpot,s->d_vpot,nlocal*sizeof(double),cudaMemcpyDeviceToHost));
@@ -357,6 +381,17 @@ extern "C" double sog_gpu_compute(SogGpuState*s,int nlocal,const double*x,const 
   double e_self  = self_coeff*qsqsum + (remove_self ? qsqsum*red[7]/(2.0*volume) : 0.0);
   double energy = qscale*(e_kneq0 - e_self);
   for(int j=0;j<6;++j) virial6[j]=0.5*volume*qscale*red[j+1];
+  // Self-energy strain-derivative virial (matches sog.cpp finalize): the omitted term that
+  // fixes the ~2.5%→~0.5% diagonal/shear. W_self_αβ = qscale·qsqsum/(2V)·(Σ K_v·k_α k_β − δ·Σ K).
+  if(remove_self){
+    double self_pref = qscale*qsqsum/(2.0*volume);
+    virial6[0] += self_pref*(red[8]  - red[7]);
+    virial6[1] += self_pref*(red[9]  - red[7]);
+    virial6[2] += self_pref*(red[10] - red[7]);
+    virial6[3] += self_pref* red[11];
+    virial6[4] += self_pref* red[12];
+    virial6[5] += self_pref* red[13];
+  }
   (void)quads;
   return energy;
 }

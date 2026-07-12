@@ -8,6 +8,7 @@
 
 #include <array>
 #include <cmath>
+#include <complex>
 
 namespace LAMMPS_NS {
 
@@ -225,6 +226,117 @@ inline double cubes2_weight_6(const double tx, const double ty, const double tz,
     const double ez = (node.sp_is_neg & 4) ? (1.0 - tz) : tz;
     return cubes2_R(ex, xi) * cubes2_R(ey, xi) * cubes2_R(ez, xi);
   }
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// QuadS — separable quadrature splines. order 4 (64 nodes) & 6 (216 nodes).
+// 3-D weight = ∏_α c_{i_α}(θ_α); offsets 1−ν…ν. Exact separable Fourier
+// influence |Ŵ(k)|²=∏_α|Ŵ_α(k_α)|² (Form-A deconvolution, stable). Weights
+// from midtown-sog.md §A.2/§A.3 (verified against the defining linear system).
+// ══════════════════════════════════════════════════════════════════════
+constexpr double kQuadsXi4 = 0.5773502691896258;   // 1/√3  (C²)
+constexpr double kQuadsXi6 = 0.72879488;           // C⁰ optimal (Table I)
+constexpr int kQuadsNumNodes4 = 64;
+constexpr int kQuadsNumNodes6 = 216;
+constexpr int kQuadsOffsets4[4] = {-1, 0, 1, 2};
+constexpr int kQuadsOffsets6[6] = {-2, -1, 0, 1, 2, 3};
+
+inline double quads_xi(int order) { return (order == 4) ? kQuadsXi4 : kQuadsXi6; }
+inline int quads_nodes_1d(int order) { return order; }               // 2ν
+inline const int *quads_offsets(int order) {
+  return (order == 4) ? kQuadsOffsets4 : kQuadsOffsets6;
+}
+
+// Ascending monomial coefficients c[0..2ν-1] of the base weight c_i(θ,ξ), i=1..ν.
+inline void quads_base_coeffs(int i, double xi, int order, double *c) {
+  const double x2 = xi * xi, x4 = x2 * x2;
+  for (int k = 0; k < order; ++k) c[k] = 0.0;
+  if (order == 4) {
+    if (i == 1) { c[0] = x2 / 2.0; c[1] = -(3.0*x2 - 2.0)/2.0; c[2] = 0.5; c[3] = -0.5; }
+    else        { c[1] = (3.0*x2 - 1.0)/6.0; c[3] = 1.0/6.0; }             // i == 2
+  } else {  // order 6
+    if (i == 1) {
+      c[0] = -(3.0*x4 - 4.0*x2)/6.0; c[1] = (5.0*x4 - 7.0*x2 + 4.0)/4.0;
+      c[2] = -(3.0*x2 - 2.0)/3.0;    c[3] = (10.0*x2 - 7.0)/12.0;
+      c[4] = -1.0/6.0;              c[5] = 1.0/12.0;
+    } else if (i == 2) {
+      c[0] = (3.0*x4 - x2)/24.0;     c[1] = -(5.0*x4 - 7.0*x2 + 2.0)/8.0;
+      c[2] = (6.0*x2 - 1.0)/24.0;    c[3] = -(10.0*x2 - 7.0)/24.0;
+      c[4] = 1.0/24.0;              c[5] = -1.0/24.0;
+    } else {  // i == 3
+      c[1] = (15.0*x4 - 15.0*x2 + 4.0)/120.0; c[3] = (2.0*x2 - 1.0)/24.0; c[5] = 1.0/120.0;
+    }
+  }
+}
+
+// Coefficients of p(1−θ) given ascending coeffs of p(θ): d_j = (−1)^j Σ_{p≥j} c_p·C(p,j).
+inline void quads_reflect_coeffs(const double *c, int n, double *d) {
+  static const double binom[6][6] = {
+    {1,0,0,0,0,0},{1,1,0,0,0,0},{1,2,1,0,0,0},
+    {1,3,3,1,0,0},{1,4,6,4,1,0},{1,5,10,10,5,1}};
+  for (int jj = 0; jj < n; ++jj) {
+    double s = 0.0;
+    for (int p = jj; p < n; ++p) s += c[p] * binom[p][jj];
+    d[jj] = ((jj & 1) ? -1.0 : 1.0) * s;
+  }
+}
+
+// Ascending coeffs of c_offset(θ): off≥1 → base; off≤0 → reflect base c_{1-off}.
+inline void quads_offset_coeffs(int off, double xi, int order, double *c) {
+  if (off >= 1) { quads_base_coeffs(off, xi, order, c); }
+  else { double b[6]; quads_base_coeffs(1 - off, xi, order, b); quads_reflect_coeffs(b, order, c); }
+}
+
+// 1-D weight at fractional t for grid offset `off`.
+inline double quads_weight_1d(double t, int off, double xi, int order) {
+  double c[6]; quads_offset_coeffs(off, xi, order, c);
+  double v = 0.0, tp = 1.0;
+  for (int p = 0; p < order; ++p) { v += c[p] * tp; tp *= t; }
+  return v;
+}
+
+// Fill all 2ν 1-D weights at t (index k ↔ quads_offsets(order)[k]).
+inline void quads_weights_1d(double t, double xi, int order, double *w) {
+  const int *offs = quads_offsets(order);
+  for (int k = 0; k < order; ++k) w[k] = quads_weight_1d(t, offs[k], xi, order);
+}
+
+// I_p(α)=∫₀¹ tᵖ e^{iαt}dt, p=0..pmax (recurrence; Taylor for small |α|).
+inline void quads_Ip(double alpha, int pmax, std::complex<double> *I) {
+  const std::complex<double> j(0.0, 1.0);
+  if (std::abs(alpha) < 1e-3) {
+    const std::complex<double> ia = j * alpha;
+    for (int p = 0; p <= pmax; ++p) {
+      std::complex<double> s(1.0 / (p + 1), 0.0), pw(1.0, 0.0);
+      double fact = 1.0;
+      for (int n = 1; n < 12; ++n) { pw *= ia; fact *= n; s += pw / (fact * (p + n + 1)); }
+      I[p] = s;
+    }
+  } else {
+    const std::complex<double> eia = std::exp(j * alpha);
+    const std::complex<double> inv = 1.0 / (j * alpha);
+    I[0] = (eia - 1.0) * inv;
+    for (int p = 1; p <= pmax; ++p) I[p] = (eia - double(p) * I[p - 1]) * inv;
+  }
+}
+
+// Exact separable 1-D window influence |Ŵ_α(k)|² at signed mode m, grid size N.
+// Ŵ_α = Σ_off e^{+iα·off}·∫c_off(θ)e^{−iαθ}dθ = Σ_off e^{+iα·off}·conj(Σ_p c_p I_p(α)).
+inline double quads_influence_1d(int m, int N, double xi, int order) {
+  const double alpha = 2.0 * M_PI * double(m) / double(N);
+  std::complex<double> I[6];
+  quads_Ip(alpha, order - 1, I);
+  const int *offs = quads_offsets(order);
+  const std::complex<double> j(0.0, 1.0);
+  std::complex<double> phi(0.0, 0.0);
+  double c[6];
+  for (int k = 0; k < order; ++k) {
+    quads_offset_coeffs(offs[k], xi, order, c);
+    std::complex<double> g(0.0, 0.0);
+    for (int p = 0; p < order; ++p) g += c[p] * I[p];
+    phi += std::exp(j * alpha * double(offs[k])) * std::conj(g);
+  }
+  return phi.real() * phi.real() + phi.imag() * phi.imag();
 }
 
 }  // namespace LAMMPS_NS

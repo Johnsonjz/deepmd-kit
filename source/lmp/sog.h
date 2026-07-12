@@ -70,6 +70,7 @@ class SOGKSpace : public KSpace {
 
   // ── Spline / grid method selection ──
   int spline_type;       // 0 = B-spline order 5 (legacy), 4 = CubeS2 4th, 6 = CubeS2 6th
+  bool is_quads = false; // false = CubeS₂ (non-separable); true = QuadS (separable, Form-A)
   int grid_method;       // 0 = SOG bandwidth (new), 1 = PPPM iteration (legacy)
   double phi_max_user;   // user-specified φ_max override (>0 means active, −1 = auto)
   double phi_accuracy_user;  // target rel-accuracy ε for the φ_max general method (−1 = default)
@@ -105,6 +106,7 @@ class SOGKSpace : public KSpace {
   std::vector<double> mesh_green_energy;
   std::vector<double> mesh_green_force;
   std::vector<double> mesh_green_self;
+  std::vector<double> mesh_green_self_virial;  // bare K_v(k²): self-energy strain-derivative virial
   std::vector<double> mesh_green_virial;  // K_virial(k²)/|Φ(k)|²
 
   // ── Box-independent sinc tables ──
