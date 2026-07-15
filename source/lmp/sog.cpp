@@ -904,17 +904,16 @@ void SOGKSpace::ensure_fft_plan() {
       for (double bw : bandwidth)
         if (bw < bw_min) bw_min = bw;
       const double sigma_min = std::sqrt(bw_min);
-      // (C_ν, p_ν) = HONEST FORCE-rel error law from calibrate_phi_max_anchors.py (2026-07-10):
-      // φ_max pinned by BISECTION of the true FFT-vs-direct force-rel curve on a PANEL of random
-      // systems × kernels, then pooled log-log refit. The single-parameter (Δ/σ_min) law collapses
-      // tightly for force-rel (CV ~5%); energy-rel does not (15-30%). These REPLACE the old back-fit
-      // constants (2.10e-3/7.59, 1.90e-3/3.69) that were tuned so ε=1e-4 reproduced φ=0.10/0.0675 —
-      // the true force-rel at φ=0.10 (order-6 cons) is ~2e-3, NOT 1e-4 (optimistic ~30×). With these
-      // honest constants ε=1e-4 gives φ=0.068 (order-6) / 0.032 (order-4) on the cons kernel → a finer
-      // mesh (75×150×150). PRODUCTION pins explicit phi_max=0.10 (force-rel ~2e-3, validated adequate:
-      // RDF/density match DPA + experiment); auto-derive here targets genuine 1e-4 accuracy.
-      const double C_nu = (spline_type == 6) ? 1.681e-2 : 4.465e-2; // honest force-rel prefactor (bisection panel)
-      const double p_nu = (spline_type == 6) ? 6.533 : 3.956;       // honest force-rel convergence exponent
+      // (C_ν, p_ν) = THEORY-ENFORCED force-rel error law: p_nu = 2*nu from Proposition 5;
+      // C_nu refit with p FIXED from calibrate_phi_max_anchors.py + phi_max_anchors.json
+      // (pooled MEDIAN over random systems × kernels, 2026-07-13).  The old free-p back-fit
+      // (p ~3.96/6.53) was optimistic ~30× in force-rel at φ=0.10.  With honest p=2ν,
+      // ε=1e-4 → φ=0.032 (order-4) / 0.066 (order-6) on the cons kernel.  PRODUCTION pins
+      // explicit phi_max=0.10 (force-rel ~2e-3, validated adequate: RDF/density match DPA +
+      // experiment); auto-derive here targets genuine 1e-4 accuracy.
+      const double C_nu = (spline_type == 6) ? 1.377e-2 : 4.953e-2; // force-rel prefactor, p=2ν fixed
+      const double p_nu = (spline_type == 6) ? 6.0 : 4.0;           // p = 2ν (theory-enforced)
+      const double eps_default = 1.0e-4;                            // canonical target force-rel accuracy
       const double eps_default = 1.0e-4;                            // canonical target force-rel accuracy
       const double eps = (phi_accuracy_user > 0.0) ? phi_accuracy_user : eps_default;
       const double ds = std::pow(eps / C_nu, 1.0 / p_nu);          // Δ/σ_min at target ε

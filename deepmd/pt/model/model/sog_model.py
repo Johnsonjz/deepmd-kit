@@ -172,6 +172,9 @@ class SOGEnergyModel(DPModelCommon, SOGEnergyModel_):
         # Optional charge neutrality penalty (None = disabled, use physical k=0 instead)
         if getattr(fitting, "charge_neutral_lambda", None) is not None:
             sog_args["charge_neutral_lambda"] = float(fitting.charge_neutral_lambda)
+        # Hard per-frame charge neutrality (q = q - per_frame_mean(q))
+        if getattr(fitting, "charge_neutral", False):
+            sog_args["charge_neutral"] = True
 
         kernel = sog_lib.Sog(
             sog_arguments=sog_args,

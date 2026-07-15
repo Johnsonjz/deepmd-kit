@@ -155,6 +155,7 @@ class SOGEnergyFittingNet(LRFittingNet):
         cubes2_phi_max: float | None = None,
         remove_self_interaction: bool = False,
         charge_neutral_lambda: float | None = None,
+        charge_neutral: bool = False,
         external_kspace: bool = False,
         use_cubes2_fft: bool = False,
         **kwargs: Any,
@@ -197,6 +198,10 @@ class SOGEnergyFittingNet(LRFittingNet):
         self._sigma_user_set = sigma is not None
         self.use_cubes2_fft = bool(use_cubes2_fft)
         self.charge_neutral_lambda = charge_neutral_lambda
+        self.charge_neutral = bool(charge_neutral)
+        # SOG lib handles neutrality via its own charge_neutral flag;
+        # disable DeepMD's _corr_head so there is one control point.
+        self._enable_corr_head = False
         if sigma is None:
             sigma_value = float(SOG_DEFAULT_SIGMA)  # placeholder, may be recomputed via rcut
         else:
@@ -312,6 +317,7 @@ class SOGEnergyFittingNet(LRFittingNet):
         data["use_cubes2_fft"] = bool(self.use_cubes2_fft)
         if self.charge_neutral_lambda is not None:
             data["charge_neutral_lambda"] = self.charge_neutral_lambda
+        data["charge_neutral"] = bool(self.charge_neutral)
         return data
 
     @classmethod
@@ -327,6 +333,7 @@ class SOGEnergyFittingNet(LRFittingNet):
         obj = super().deserialize(data)
 
         obj.charge_neutral_lambda = data.get("charge_neutral_lambda", None)
+        obj.charge_neutral = bool(data.get("charge_neutral", False))
 
         with torch.no_grad():
             if bandwidth_tensor is not None:

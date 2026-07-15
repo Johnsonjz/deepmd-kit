@@ -2131,6 +2131,12 @@ def fitting_sog_energy() -> list[Argument]:
     doc_remove_self_interaction = (
         "Whether to remove self interaction term in long-range correction."
     )
+    doc_charge_neutral = (
+        "Whether to enforce hard per-frame charge neutrality by subtracting "
+        "the per-frame mean from latent charges before long-range computation. "
+        "This mirrors DeepMD's _corr_head and guarantees sum_i q_i = 0 exactly "
+        "for each frame and channel, rather than adding a soft penalty."
+    )
 
     return [
         Argument(
@@ -2310,6 +2316,13 @@ def fitting_sog_energy() -> list[Argument]:
             default=False,
             doc=doc_only_pt_supported + doc_remove_self_interaction,
         ),
+        Argument(
+            "charge_neutral",
+            bool,
+            optional=True,
+            default=False,
+            doc=doc_only_pt_supported + doc_charge_neutral,
+        ),
     ]
 
 
@@ -2349,6 +2362,12 @@ def fitting_les_energy() -> list[Argument]:
     doc_n_dl = "NUFFT long-range grid density control factor."
     doc_remove_self_interaction = (
         "Whether to remove self interaction term in long-range correction."
+    )
+    doc_charge_neutral = (
+        "Whether to enforce hard per-frame charge neutrality by subtracting "
+        "the per-frame mean from latent charges before long-range computation. "
+        "This mirrors DeepMD's _corr_head and guarantees sum_i q_i = 0 exactly "
+        "for each frame and channel, rather than adding a soft penalty."
     )
 
     return [

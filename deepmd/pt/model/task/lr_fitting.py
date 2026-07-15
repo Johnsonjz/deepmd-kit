@@ -160,6 +160,9 @@ class LRFittingNet(Fitting):
         )
         self.remove_vaccum_contribution = remove_vaccum_contribution
         self.bias_atom_q_bound = 3.0
+        # When True (default), _corr_head enforces per-frame charge neutrality.
+        # Set to False when neutrality is handled downstream (e.g., SOG lib's charge_neutral).
+        self._enable_corr_head = True
 
         self.sr_net_dim_out = self._sr_net_out_dim()
         self.lr_net_dim_out = self._lr_net_out_dim()
@@ -654,7 +657,8 @@ class LRFittingNet(Fitting):
         mask = self.emask(atype).to(torch.bool)
         sr_out = torch.where(mask[:, :, None], sr_out, 0.0)
         lr_out = torch.where(mask[:, :, None], lr_out, 0.0)
-        lr_out = self._corr_head(lr_out)
+        if self._enable_corr_head:
+            lr_out = self._corr_head(lr_out)
         results.update({"sr": sr_out, "lr": lr_out})
         return results
 
