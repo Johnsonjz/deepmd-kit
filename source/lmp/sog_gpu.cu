@@ -27,6 +27,15 @@ struct SogGpuState {
   double *d_x=nullptr, *d_q=nullptr, *d_force=nullptr, *d_vpot=nullptr;  // per-atom
   double *d_red=nullptr;             // energy + 6 recip virial + diag_sum + 6 self-virial (14 doubles)
   int cap_atoms=0;
+
+  // GPU timing (cudaEvent-based, accumulated per N steps)
+  cudaEvent_t evt_spread_start=0, evt_spread_stop=0;
+  cudaEvent_t evt_fftfwd_start=0, evt_fftfwd_stop=0;
+  cudaEvent_t evt_kspace_start=0, evt_kspace_stop=0;
+  cudaEvent_t evt_fftinv_start=0, evt_fftinv_stop=0;
+  cudaEvent_t evt_gather_start=0, evt_gather_stop=0;
+  double acc_spread=0, acc_fftfwd=0, acc_kspace=0, acc_fftinv=0, acc_gather=0;
+  int timing_count=0, timing_interval=100;  // report every N steps
 };
 
 // ── helpers ──
@@ -339,10 +348,19 @@ extern "C" double sog_gpu_compute(SogGpuState*s,int nlocal,const double*x,const 
   double volume=lx*ly*lz, rho_scale=(double)ng/volume, scaleinv=1.0/(double)ng;
 
   int tb=256, gg=(ng+tb-1)/tb, ga=(nlocal+tb-1)/tb;
+  // ── Create timing events lazily ──
+  if (!s->evt_spread_start) {
+    cudaEventCreate(&s->evt_spread_start); cudaEventCreate(&s->evt_spread_stop);
+    cudaEventCreate(&s->evt_fftfwd_start); cudaEventCreate(&s->evt_fftfwd_stop);
+    cudaEventCreate(&s->evt_kspace_start); cudaEventCreate(&s->evt_kspace_stop);
+    cudaEventCreate(&s->evt_fftinv_start); cudaEventCreate(&s->evt_fftinv_stop);
+    cudaEventCreate(&s->evt_gather_start); cudaEventCreate(&s->evt_gather_stop);
+  }
   k_zero_complex<<<gg,tb>>>(s->d_rho,ng);
   bool quads = (spline==SOG_QUADS_4||spline==SOG_QUADS_6);
   int nord = (spline==SOG_CUBES2_6||spline==SOG_QUADS_6)?6:4;
-  // CubeS2 (default, bit-matches CPU sog) vs separable QuadS (spline==104/106).
+  // ── Phase 1: Spread ──
+  cudaEventRecord(s->evt_spread_start, 0);
   if(quads){
     if(nord==4) k_spread_quads<4><<<ga,tb>>>(nlocal,s->d_x,d_boxlo,lx,ly,lz,s->d_q,rho_scale,s->nx,s->ny,s->nz,s->d_rho);
     else        k_spread_quads<6><<<ga,tb>>>(nlocal,s->d_x,d_boxlo,lx,ly,lz,s->d_q,rho_scale,s->nx,s->ny,s->nz,s->d_rho);
@@ -350,19 +368,49 @@ extern "C" double sog_gpu_compute(SogGpuState*s,int nlocal,const double*x,const 
     if(nord==4) k_spread_cubes2<4><<<ga,tb>>>(nlocal,s->d_x,d_boxlo,lx,ly,lz,s->d_q,rho_scale,s->nx,s->ny,s->nz,s->d_rho);
     else        k_spread_cubes2<6><<<ga,tb>>>(nlocal,s->d_x,d_boxlo,lx,ly,lz,s->d_q,rho_scale,s->nx,s->ny,s->nz,s->d_rho);
   }
+  cudaEventRecord(s->evt_spread_stop, 0);
+  // ── Phase 2: FFT forward ──
+  cudaEventRecord(s->evt_fftfwd_start, 0);
   cufftExecZ2Z(s->plan,s->d_rho,s->d_rho,CUFFT_FORWARD);
+  cudaEventRecord(s->evt_fftfwd_stop, 0);
+  // ── Phase 3: Kspace (green multiply + energy/virial reductions) ──
+  cudaEventRecord(s->evt_kspace_start, 0);
   k_kspace<<<gg,tb>>>(s->nx,s->ny,s->nz,lx,ly,lz,s->d_rho,s->d_ge,s->d_gf,s->d_gv,s->d_gs,
                       s->d_gsv,s->d_gx,s->d_gy,s->d_gz,s->d_pot,want_pot,scaleinv,s->d_red);
+  cudaEventRecord(s->evt_kspace_stop, 0);
+  // ── Phase 4: FFT inverse (3 or 4 transforms) ──
+  cudaEventRecord(s->evt_fftinv_start, 0);
   cufftExecZ2Z(s->plan,s->d_gx,s->d_gx,CUFFT_INVERSE);
   cufftExecZ2Z(s->plan,s->d_gy,s->d_gy,CUFFT_INVERSE);
   cufftExecZ2Z(s->plan,s->d_gz,s->d_gz,CUFFT_INVERSE);
   if(want_pot) cufftExecZ2Z(s->plan,s->d_pot,s->d_pot,CUFFT_INVERSE);
+  cudaEventRecord(s->evt_fftinv_stop, 0);
+  // ── Phase 5: Gather ──
+  cudaEventRecord(s->evt_gather_start, 0);
   if(quads){
     if(nord==4) k_gather_quads<4><<<ga,tb>>>(nlocal,s->d_x,d_boxlo,lx,ly,lz,s->d_q,qscale,s->nx,s->ny,s->nz,s->d_gx,s->d_gy,s->d_gz,s->d_pot,want_pot,s->d_force,s->d_vpot);
     else        k_gather_quads<6><<<ga,tb>>>(nlocal,s->d_x,d_boxlo,lx,ly,lz,s->d_q,qscale,s->nx,s->ny,s->nz,s->d_gx,s->d_gy,s->d_gz,s->d_pot,want_pot,s->d_force,s->d_vpot);
   } else {
     if(nord==4) k_gather_cubes2<4><<<ga,tb>>>(nlocal,s->d_x,d_boxlo,lx,ly,lz,s->d_q,qscale,s->nx,s->ny,s->nz,s->d_gx,s->d_gy,s->d_gz,s->d_pot,want_pot,s->d_force,s->d_vpot);
     else        k_gather_cubes2<6><<<ga,tb>>>(nlocal,s->d_x,d_boxlo,lx,ly,lz,s->d_q,qscale,s->nx,s->ny,s->nz,s->d_gx,s->d_gy,s->d_gz,s->d_pot,want_pot,s->d_force,s->d_vpot);
+  }
+  cudaEventRecord(s->evt_gather_stop, 0);
+  // ── Accumulate timing ──
+  { float ms;
+    cudaEventSynchronize(s->evt_spread_stop); cudaEventElapsedTime(&ms,s->evt_spread_start,s->evt_spread_stop); s->acc_spread += ms;
+    cudaEventSynchronize(s->evt_fftfwd_stop); cudaEventElapsedTime(&ms,s->evt_fftfwd_start,s->evt_fftfwd_stop); s->acc_fftfwd += ms;
+    cudaEventSynchronize(s->evt_kspace_stop); cudaEventElapsedTime(&ms,s->evt_kspace_start,s->evt_kspace_stop); s->acc_kspace += ms;
+    cudaEventSynchronize(s->evt_fftinv_stop); cudaEventElapsedTime(&ms,s->evt_fftinv_start,s->evt_fftinv_stop); s->acc_fftinv += ms;
+    cudaEventSynchronize(s->evt_gather_stop); cudaEventElapsedTime(&ms,s->evt_gather_start,s->evt_gather_stop); s->acc_gather += ms;
+  }
+  ++s->timing_count;
+  if (s->timing_count >= s->timing_interval && s->timing_count > 0) {
+    int n = s->timing_count;
+    printf("SOG_GPU_TIMING (n=%d): spread=%.3f fft_fwd=%.3f kspace=%.3f fft_inv=%.3f gather=%.3f ms/step  grid=%dx%dx%d=%zu spline=%s\n",
+           n, s->acc_spread/n, s->acc_fftfwd/n, s->acc_kspace/n, s->acc_fftinv/n, s->acc_gather/n,
+           s->nx, s->ny, s->nz, ng, quads ? (nord==6?"QuadS-6":"QuadS-4") : (nord==6?"CubeS2-6":"CubeS2-4"));
+    s->acc_spread=s->acc_fftfwd=s->acc_kspace=s->acc_fftinv=s->acc_gather=0;
+    s->timing_count=0;
   }
 
   double red[14]; CK(cudaMemcpy(red,s->d_red,14*sizeof(double),cudaMemcpyDeviceToHost));

@@ -12,9 +12,11 @@
 
 namespace LAMMPS_NS {
 
-// ── B-spline order (legacy) ──
+// ── B-spline order (legacy fastsog, order 5 only) ──
+// For generalized B-spline (orders 4/5/6), see sog_bspline_weights_1d_order() in sog.cpp.
+// This fastsog copy uses std::array<double,5> for CUDA compatibility (sog_gpu.cu includes this header).
+
 constexpr int kSog_BSplineOrder = 5;
-constexpr int kSog_AssignOrder = kSog_BSplineOrder;  // used by both .cpp files
 
 inline void fastsog_bspline_weights_1d(const double frac,
                                         std::array<double, 5> &w) {
