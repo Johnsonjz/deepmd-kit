@@ -1,0 +1,171 @@
+LAMMPS (22 Jul 2025 - Update 4)
+units           metal
+boundary        p p p
+atom_style      charge
+plugin load     /root/code/deepmd-kit/source/build_local_fixed/lmp/plugin/libdeepmd_lmp.so
+Loading plugin: deepmd pair style  by Han Wang
+Loading plugin: deepspin pair style  by Duo Zhang
+Loading plugin: compute deeptensor/atom  by Han Wang
+Loading plugin: fix dplr  by Han Wang
+Loading plugin: kspace pppm/dplr  by Han Wang
+Loading plugin: kspace les  by DeepMD contributors
+Loading plugin: kspace sog  by DeepMD contributors
+Loading plugin: fix sog/response  by DeepMD contributors
+neighbor        2.0 bin
+neigh_modify    every 10 delay 0 check no
+comm_modify     cutoff 10.0
+read_data       /root/code/deepmd-example/water-scan0/lmp/sop_sog_conservative/water_2x4x4_charge.data
+Reading data file ...
+  orthogonal box = (0 0 0) to (24.8894 49.7788 49.7788)
+  1 by 1 by 1 MPI processor grid
+  reading atoms ...
+  6144 atoms
+  reading velocities ...
+  6144 velocities
+  read_data CPU = 0.028 seconds
+mass            1 15.999
+mass            2 1.008
+pair_style      deepmd /root/code/deepmd-example/water-scan0/sog_k0/nlayers1/sog/sog_n1_neutral_frozen.pth latent_charge_to_q yes
+Summary of lammps deepmd module ...
+  >>> Info of deepmd-kit:
+  runtime model summary is available after pair_coeff/model initialization
+  >>> Info of lammps module:
+  use deepmd-kit at:  /usr/local
+  source:             
+  source branch:      sog-lmp
+  source commit:      96ffc5b4
+  source commit at:   2026-07-15 08:41:27 +0000
+  build with inc:     /root/code/dp_dev/lib/python3.14/site-packages/torch/include;/root/code/dp_dev/lib/python3.14/site-packages/torch/include/torch/csrc/api/include
+  build with lib:     /root/code/dp_dev/lib/python3.14/site-packages/torch/lib
+pair_coeff      * * O H
+kspace_style sog 1e-6 1.6297670882677646 2.180230445405648 12 n_dl 3.89720202 amp 29.2281782 75.6040668 202.173692 540.315084 1452.20413 3857.25858 10245.4217 27213.2823 72282.3085 191991.986 509957.740 1354519.54 bandwidth 3.25834950 13.8809516 36.6628639 96.4459275 236.597073 628.434810 1669.21132 4433.66022 11776.4256 31278.8441 83083.6690 220681.920 remove_self_interaction yes spline cubes2_6 phi_max 0.16
+fix             fcorr all sog/response model /root/code/deepmd-example/water-scan0/sog_k0/nlayers1/sog/sog_n1_neutral_frozen.pth fused yes
+fix_modify      fcorr virial yes
+fix             nvefix all nve
+velocity        all create 300.0 98765432 mom yes rot yes dist gaussian
+timestep        0.0005
+thermo_style    custom step temp pe ke etotal press vol density
+thermo          1
+dump            df all custom 1 dump_tmp.lmp id type x y z q fx fy fz
+dump_modify     df sort id
+run             1
+
+CITE-CITE-CITE-CITE-CITE-CITE-CITE-CITE-CITE-CITE-CITE-CITE-CITE
+
+Your simulation uses code contributions which should be cited:
+
+- USER-DEEPMD package:
+
+@article{Wang_ComputPhysCommun_2018_v228_p178,
+  author = {Wang, Han and Zhang, Linfeng and Han, Jiequn and E, Weinan},
+  doi = {10.1016/j.cpc.2018.03.016},
+  url = {https://doi.org/10.1016/j.cpc.2018.03.016},
+  year = 2018,
+  month = {jul},
+  publisher = {Elsevier {BV}},
+  volume = 228,
+  journal = {Comput. Phys. Commun.},
+  title = {{DeePMD-kit: A deep learning package for many-body potential energy representation and molecular dynamics}},
+  pages = {178--184}
+}
+@article{Zeng_JChemPhys_2023_v159_p054801,
+  title  = {{DeePMD-kit v2: A software package for deep potential models}},
+  author =   {Jinzhe Zeng and Duo Zhang and Denghui Lu and Pinghui Mo and Zeyu Li
+         and Yixiao Chen and Mari{\'a}n Rynik and Li'ang Huang and Ziyao Li and 
+         Shaochen Shi and Yingze Wang and Haotian Ye and Ping Tuo and Jiabin
+         Yang and Ye Ding and Yifan Li and Davide Tisi and Qiyu Zeng and Han 
+         Bao and Yu Xia and Jiameng Huang and Koki Muraoka and Yibo Wang and 
+         Junhan Chang and Fengbo Yuan and Sigbj{\o}rn L{\o}land Bore and Chun
+         Cai and Yinnian Lin and Bo Wang and Jiayan Xu and Jia-Xin Zhu and 
+         Chenxing Luo and Yuzhi Zhang and Rhys E A Goodall and Wenshuo Liang
+         and Anurag Kumar Singh and Sikai Yao and Jingchao Zhang and Renata
+         Wentzcovitch and Jiequn Han and Jie Liu and Weile Jia and Darrin M
+         York and Weinan E and Roberto Car and Linfeng Zhang and Han Wang},
+  journal =  {J. Chem. Phys.},
+  volume =   159,
+  issue =    5,  
+  year =    2023,
+  pages  =   054801,
+  doi =      {10.1063/5.0155600},
+}
+@Article{Zeng_JChemTheoryComput_2025_v21_p4375,
+  author =   {Jinzhe Zeng and Duo Zhang and Anyang Peng and Xiangyu Zhang and Sensen
+             He and Yan Wang and Xinzijian Liu and Hangrui Bi and Yifan Li and Chun
+             Cai and Chengqian Zhang and Yiming Du and Jia-Xin Zhu and Pinghui Mo
+             and Zhengtao Huang and Qiyu Zeng and Shaochen Shi and Xuejian Qin and
+             Zhaoxi Yu and Chenxing Luo and Ye Ding and Yun-Pei Liu and Ruosong Shi
+             and Zhenyu Wang and Sigbj{\o}rn L{\o}land Bore and Junhan Chang and
+             Zhe Deng and Zhaohan Ding and Siyuan Han and Wanrun Jiang and Guolin
+             Ke and Zhaoqing Liu and Denghui Lu and Koki Muraoka and Hananeh Oliaei
+             and Anurag Kumar Singh and Haohui Que and Weihong Xu and Zhangmancang
+             Xu and Yong-Bin Zhuang and Jiayu Dai and Timothy J. Giese and Weile
+             Jia and Ben Xu and Darrin M. York and Linfeng Zhang and Han Wang},
+    title =    {{DeePMD-kit v3: A Multiple-Backend Framework for Machine Learning
+             Potentials}},
+  journal =  {J. Chem. Theory Comput.},
+  year =     2025,
+  volume =   21,
+  number =   9,
+  pages =    {4375--4385},
+  doi =      {10.1021/acs.jctc.5c00340},
+}
+
+CITE-CITE-CITE-CITE-CITE-CITE-CITE-CITE-CITE-CITE-CITE-CITE-CITE
+
+SOG external amp: 29.2281782000 75.6040668000 202.1736920000 540.3150840000 1452.2041300000 3857.2585800000 10245.4217000000 27213.2823000000 72282.3085000000 191991.9860000000 509957.7400000000 1354519.5400000000
+SOG external bandwidth: 3.2583495000 13.8809516000 36.6628639000 96.4459275000 236.5970730000 628.4348100000 1669.2113200000 4433.6602200000 11776.4256000000 31278.8441000000 83083.6690000000 220681.9200000000
+SOG amp_sum=2172367.062231 self_coeff=0.000000
+WARNING: Using kspace solver on system with no charge (src/kspace.cpp:322)
+SOG initialization ...
+  b = 1.62977, sigma = 2.18023, M = 12
+  n_dl = 3.8972, accuracy = 1e-06
+  w0 = 1.0195218, rcut = 5
+  SOG-bandwidth grid: phi_max=0.1600 delta=0.8 -> 32x63x63
+Generated 0 of 1 mixed pair_coeff terms from geometric mixing rule
+Neighbor list info ...
+  update: every = 10 steps, delay = 0 steps, check = no
+  max neighbors/atom: 2000, page size: 100000
+  master list distance cutoff = 7
+  ghost atom cutoff = 10
+  binsize = 3.5, bins = 8 15 15
+  1 neighbor lists, perpetual/occasional/extra = 1 0 0
+  (1) pair deepmd, perpetual
+      attributes: full, newton on
+      pair build: full/bin/atomonly
+      stencil: full/bin/3d
+      bin: standard
+  SOG diag: qscale=1.43996450e+01 volume=6.167416e+04 virial_scale=4.44043036e+05 want_energy=true want_virial=true vflag=2 spline_type=6
+Per MPI rank memory allocation (min/avg/max) = 20.27 | 20.27 | 20.27 Mbytes
+   Step          Temp          PotEng         KinEng         TotEng         Press          Volume        Density    
+         0   300           -958743.54      238.21352     -958505.33     -4618.3216      61674.164      0.99336763   
+         1   300.11187     -958743.65      238.30235     -958505.34     -4598.615       61674.164      0.99336763   
+Loop time of 116.092 on 1 procs for 1 steps with 6144 atoms
+
+Performance: 0.000 ns/day, 64495.678 hours/ns, 0.009 timesteps/s, 52.923 atom-step/s
+155.1% CPU use with 1 MPI tasks x no OpenMP threads
+
+MPI task timing breakdown:
+Section |  min time  |  avg time  |  max time  |%varavg| %total
+---------------------------------------------------------------
+Pair    | 49.071     | 49.071     | 49.071     |   0.0 | 42.27
+Kspace  | 0.11695    | 0.11695    | 0.11695    |   0.0 |  0.10
+Neigh   | 0          | 0          | 0          |   0.0 |  0.00
+Comm    | 0.00015174 | 0.00015174 | 0.00015174 |   0.0 |  0.00
+Output  | 0.012355   | 0.012355   | 0.012355   |   0.0 |  0.01
+Modify  | 66.892     | 66.892     | 66.892     |   0.0 | 57.62
+Other   |            | 5.254e-05  |            |       |  0.00
+
+Nlocal:           6144 ave        6144 max        6144 min
+Histogram: 1 0 0 0 0 0 0 0 0 0
+Nghost:          15361 ave       15361 max       15361 min
+Histogram: 1 0 0 0 0 0 0 0 0 0
+Neighs:              0 ave           0 max           0 min
+Histogram: 1 0 0 0 0 0 0 0 0 0
+FullNghs:       871616 ave      871616 max      871616 min
+Histogram: 1 0 0 0 0 0 0 0 0 0
+
+Total # of neighbors = 871616
+Ave neighs/atom = 141.86458
+Neighbor list builds = 0
+Dangerous builds not checked
+Total wall time: 0:02:57

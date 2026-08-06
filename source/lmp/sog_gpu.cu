@@ -25,7 +25,7 @@ struct SogGpuState {
   double *d_ge=nullptr, *d_gf=nullptr, *d_gv=nullptr, *d_gs=nullptr;  // green energy/force/virial/self tables
   double *d_gsv=nullptr;             // bare K_v(k²) table for the self-energy strain-derivative virial
   double *d_x=nullptr, *d_q=nullptr, *d_force=nullptr, *d_vpot=nullptr;  // per-atom
-  double *d_red=nullptr;             // energy + 6 recip virial + diag_sum + 6 self-virial (14 doubles)
+  double *d_red=nullptr;             // energy + 6 fv_local + diag_sum + 6 self-virial + 6 r⊗F (20 doubles)
   int cap_atoms=0;
 
   // GPU timing (cudaEvent-based, accumulated per N steps)
@@ -167,7 +167,7 @@ __global__ void k_gather_cubes2(int nlocal,const double*x,const double*boxlo,
     double lx,double ly,double lz,const double*q,double qscale,
     int nx,int ny,int nz,const cufftDoubleComplex*gx,const cufftDoubleComplex*gy,
     const cufftDoubleComplex*gz,const cufftDoubleComplex*pot,int want_pot,
-    double*force,double*vpot){
+    double*force,double*vpot,double*red){
   int i=blockIdx.x*blockDim.x+threadIdx.x; if(i>=nlocal) return;
   double fx=periodic_frac(x[3*i+0],boxlo[0],lx)*nx;
   double fy=periodic_frac(x[3*i+1],boxlo[1],ly)*ny;
@@ -186,8 +186,18 @@ __global__ void k_gather_cubes2(int nlocal,const double*x,const double*boxlo,
     if(want_pot) gp+=w*pot[id].x;
   }
   double qi=q[i];
-  force[3*i+0]=-qscale*qi*ggx; force[3*i+1]=-qscale*qi*ggy; force[3*i+2]=-qscale*qi*ggz;
+  double fxs=-qscale*qi*ggx, fys=-qscale*qi*ggy, fzs=-qscale*qi*ggz;
+  force[3*i+0]=fxs; force[3*i+1]=fys; force[3*i+2]=fzs;
   if(want_pot) vpot[i]=qscale*gp;
+  // r⊗F virial: exact, captures all position-dependent strain effects
+  // that the analytic Fourier formula misses (matching CPU vv_rf).
+  // red[14..19] holds Σ r_iα · F_iβ.
+  atomicAdd(&red[14], x[3*i+0]*fxs);  // r_x * F_x (xx)
+  atomicAdd(&red[15], x[3*i+1]*fys);  // r_y * F_y (yy)
+  atomicAdd(&red[16], x[3*i+2]*fzs);  // r_z * F_z (zz)
+  atomicAdd(&red[17], x[3*i+0]*fys);  // r_x * F_y (xy)
+  atomicAdd(&red[18], x[3*i+0]*fzs);  // r_x * F_z (xz)
+  atomicAdd(&red[19], x[3*i+1]*fzs);  // r_y * F_z (yz)
 }
 
 // ── kernels ──
@@ -259,7 +269,7 @@ __global__ void k_gather_quads(int nlocal,const double*x,const double*boxlo,
     double lx,double ly,double lz,const double*q,double qscale,
     int nx,int ny,int nz,const cufftDoubleComplex*gx,const cufftDoubleComplex*gy,
     const cufftDoubleComplex*gz,const cufftDoubleComplex*pot,int want_pot,
-    double*force,double*vpot){
+    double*force,double*vpot,double*red){
   int i=blockIdx.x*blockDim.x+threadIdx.x; if(i>=nlocal) return;
   double fx=periodic_frac(x[3*i+0],boxlo[0],lx)*nx;
   double fy=periodic_frac(x[3*i+1],boxlo[1],ly)*ny;
@@ -278,8 +288,18 @@ __global__ void k_gather_quads(int nlocal,const double*x,const double*boxlo,
         ggx+=w*gx[id].x; ggy+=w*gy[id].x; ggz+=w*gz[id].x;
         if(want_pot) gp+=w*pot[id].x; }}}
   double qi=q[i];
-  force[3*i+0]=-qscale*qi*ggx; force[3*i+1]=-qscale*qi*ggy; force[3*i+2]=-qscale*qi*ggz;
+  double fxs=-qscale*qi*ggx, fys=-qscale*qi*ggy, fzs=-qscale*qi*ggz;
+  force[3*i+0]=fxs; force[3*i+1]=fys; force[3*i+2]=fzs;
   if(want_pot) vpot[i]=qscale*gp;
+  // r⊗F virial: exact, captures all position-dependent strain effects
+  // that the analytic Fourier formula misses (matching CPU vv_rf).
+  // red[14..19] holds Σ r_iα · F_iβ.
+  atomicAdd(&red[14], x[3*i+0]*fxs);  // r_x * F_x (xx)
+  atomicAdd(&red[15], x[3*i+1]*fys);  // r_y * F_y (yy)
+  atomicAdd(&red[16], x[3*i+2]*fzs);  // r_z * F_z (zz)
+  atomicAdd(&red[17], x[3*i+0]*fys);  // r_x * F_y (xy)
+  atomicAdd(&red[18], x[3*i+0]*fzs);  // r_x * F_z (xz)
+  atomicAdd(&red[19], x[3*i+1]*fzs);  // r_y * F_z (yz)
 }
 
 __global__ void k_zero_complex(cufftDoubleComplex*a,size_t n){
@@ -336,7 +356,7 @@ extern "C" double sog_gpu_compute(SogGpuState*s,int nlocal,const double*x,const 
     cudaFree(s->d_x);cudaFree(s->d_q);cudaFree(s->d_force);cudaFree(s->d_vpot);
     CK(cudaMalloc(&s->d_x,3*nlocal*sizeof(double)));CK(cudaMalloc(&s->d_q,nlocal*sizeof(double)));
     CK(cudaMalloc(&s->d_force,3*nlocal*sizeof(double)));CK(cudaMalloc(&s->d_vpot,nlocal*sizeof(double)));
-    if(!s->d_red) CK(cudaMalloc(&s->d_red,14*sizeof(double)));
+    if(!s->d_red) CK(cudaMalloc(&s->d_red,20*sizeof(double)));
     s->cap_atoms=nlocal;
   }
   double boxlo3[3]={boxlo[0],boxlo[1],boxlo[2]};
@@ -344,7 +364,7 @@ extern "C" double sog_gpu_compute(SogGpuState*s,int nlocal,const double*x,const 
   CK(cudaMemcpy(d_boxlo,boxlo3,3*sizeof(double),cudaMemcpyHostToDevice));
   CK(cudaMemcpy(s->d_x,x,3*nlocal*sizeof(double),cudaMemcpyHostToDevice));
   CK(cudaMemcpy(s->d_q,q,nlocal*sizeof(double),cudaMemcpyHostToDevice));
-  CK(cudaMemset(s->d_red,0,14*sizeof(double)));
+  CK(cudaMemset(s->d_red,0,20*sizeof(double)));
   double volume=lx*ly*lz, rho_scale=(double)ng/volume, scaleinv=1.0/(double)ng;
 
   int tb=256, gg=(ng+tb-1)/tb, ga=(nlocal+tb-1)/tb;
@@ -388,11 +408,11 @@ extern "C" double sog_gpu_compute(SogGpuState*s,int nlocal,const double*x,const 
   // ── Phase 5: Gather ──
   cudaEventRecord(s->evt_gather_start, 0);
   if(quads){
-    if(nord==4) k_gather_quads<4><<<ga,tb>>>(nlocal,s->d_x,d_boxlo,lx,ly,lz,s->d_q,qscale,s->nx,s->ny,s->nz,s->d_gx,s->d_gy,s->d_gz,s->d_pot,want_pot,s->d_force,s->d_vpot);
-    else        k_gather_quads<6><<<ga,tb>>>(nlocal,s->d_x,d_boxlo,lx,ly,lz,s->d_q,qscale,s->nx,s->ny,s->nz,s->d_gx,s->d_gy,s->d_gz,s->d_pot,want_pot,s->d_force,s->d_vpot);
+    if(nord==4) k_gather_quads<4><<<ga,tb>>>(nlocal,s->d_x,d_boxlo,lx,ly,lz,s->d_q,qscale,s->nx,s->ny,s->nz,s->d_gx,s->d_gy,s->d_gz,s->d_pot,want_pot,s->d_force,s->d_vpot,s->d_red);
+    else        k_gather_quads<6><<<ga,tb>>>(nlocal,s->d_x,d_boxlo,lx,ly,lz,s->d_q,qscale,s->nx,s->ny,s->nz,s->d_gx,s->d_gy,s->d_gz,s->d_pot,want_pot,s->d_force,s->d_vpot,s->d_red);
   } else {
-    if(nord==4) k_gather_cubes2<4><<<ga,tb>>>(nlocal,s->d_x,d_boxlo,lx,ly,lz,s->d_q,qscale,s->nx,s->ny,s->nz,s->d_gx,s->d_gy,s->d_gz,s->d_pot,want_pot,s->d_force,s->d_vpot);
-    else        k_gather_cubes2<6><<<ga,tb>>>(nlocal,s->d_x,d_boxlo,lx,ly,lz,s->d_q,qscale,s->nx,s->ny,s->nz,s->d_gx,s->d_gy,s->d_gz,s->d_pot,want_pot,s->d_force,s->d_vpot);
+    if(nord==4) k_gather_cubes2<4><<<ga,tb>>>(nlocal,s->d_x,d_boxlo,lx,ly,lz,s->d_q,qscale,s->nx,s->ny,s->nz,s->d_gx,s->d_gy,s->d_gz,s->d_pot,want_pot,s->d_force,s->d_vpot,s->d_red);
+    else        k_gather_cubes2<6><<<ga,tb>>>(nlocal,s->d_x,d_boxlo,lx,ly,lz,s->d_q,qscale,s->nx,s->ny,s->nz,s->d_gx,s->d_gy,s->d_gz,s->d_pot,want_pot,s->d_force,s->d_vpot,s->d_red);
   }
   cudaEventRecord(s->evt_gather_stop, 0);
   // ── Accumulate timing ──
@@ -405,15 +425,17 @@ extern "C" double sog_gpu_compute(SogGpuState*s,int nlocal,const double*x,const 
   }
   ++s->timing_count;
   if (s->timing_count >= s->timing_interval && s->timing_count > 0) {
-    int n = s->timing_count;
-    printf("SOG_GPU_TIMING (n=%d): spread=%.3f fft_fwd=%.3f kspace=%.3f fft_inv=%.3f gather=%.3f ms/step  grid=%dx%dx%d=%zu spline=%s\n",
-           n, s->acc_spread/n, s->acc_fftfwd/n, s->acc_kspace/n, s->acc_fftinv/n, s->acc_gather/n,
-           s->nx, s->ny, s->nz, ng, quads ? (nord==6?"QuadS-6":"QuadS-4") : (nord==6?"CubeS2-6":"CubeS2-4"));
+    if (getenv("SOG_GPU_TIMING")) {
+      int n = s->timing_count;
+      printf("SOG_GPU_TIMING (n=%d): spread=%.3f fft_fwd=%.3f kspace=%.3f fft_inv=%.3f gather=%.3f ms/step  grid=%dx%dx%d=%zu spline=%s\n",
+             n, s->acc_spread/n, s->acc_fftfwd/n, s->acc_kspace/n, s->acc_fftinv/n, s->acc_gather/n,
+             s->nx, s->ny, s->nz, ng, quads ? (nord==6?"QuadS-6":"QuadS-4") : (nord==6?"CubeS2-6":"CubeS2-4"));
+    }
     s->acc_spread=s->acc_fftfwd=s->acc_kspace=s->acc_fftinv=s->acc_gather=0;
     s->timing_count=0;
   }
 
-  double red[14]; CK(cudaMemcpy(red,s->d_red,14*sizeof(double),cudaMemcpyDeviceToHost));
+  double red[20]; CK(cudaMemcpy(red,s->d_red,20*sizeof(double),cudaMemcpyDeviceToHost));
   CK(cudaMemcpy(force,s->d_force,3*nlocal*sizeof(double),cudaMemcpyDeviceToHost));
   if(want_pot){
     CK(cudaMemcpy(vpot,s->d_vpot,nlocal*sizeof(double),cudaMemcpyDeviceToHost));
@@ -428,17 +450,25 @@ extern "C" double sog_gpu_compute(SogGpuState*s,int nlocal,const double*x,const 
   double e_kneq0 = 0.5*volume*red[0];
   double e_self  = self_coeff*qsqsum + (remove_self ? qsqsum*red[7]/(2.0*volume) : 0.0);
   double energy = qscale*(e_kneq0 - e_self);
-  for(int j=0;j<6;++j) virial6[j]=0.5*volume*qscale*red[j+1];
-  // Self-energy strain-derivative virial (matches sog.cpp finalize): the omitted term that
-  // fixes the ~2.5%→~0.5% diagonal/shear. W_self_αβ = qscale·qsqsum/(2V)·(Σ K_v·k_α k_β − δ·Σ K).
+  // ── Analytic Fourier virial: the COMPLETE strain-derivative of E_k ──
+  // W_αβ = ½·V·qscale · Σ s²·|ρ̂(k)|²·(G_E·δ_αβ − K_v·k_α·k_β)
+  // where G_E = Σ a_m e^{−½β_m k²}, K_v = Σ a_m·β_m e^{−½β_m k²}.
+  // The strain-derivative of |ρ̂(k)|² is identically ZERO under fractional-
+  // coordinate charge spreading + Form-B deconvolution. The r⊗F approach
+  // (red[14..19]) is INCOMPLETE — it omits the box-explicit strain term.
+  // This matches fastsog.cpp, PPPM vg, and the CPU sog.cpp analytic path.
+  // red[1..6] = fv_local; red[14..19] = r⊗F (retained for diagnostics).
+  for(int j=0;j<6;++j) virial6[j]=0.5*volume*qscale*red[1+j];
+  // Self-energy strain-derivative virial (matches sog.cpp + fastsog.cpp).
+  // W_self_αβ = qscale·qsqsum/(2V)·(Σ K_v·k_α k_β − δ·Σ K).  No /3 factor.
   if(remove_self){
-    double self_pref = qscale*qsqsum/(2.0*volume);
-    virial6[0] += self_pref*(red[8]  - red[7]);
-    virial6[1] += self_pref*(red[9]  - red[7]);
-    virial6[2] += self_pref*(red[10] - red[7]);
-    virial6[3] += self_pref* red[11];
-    virial6[4] += self_pref* red[12];
-    virial6[5] += self_pref* red[13];
+    double sv_pref = qscale*qsqsum/(2.0*volume);
+    virial6[0] += sv_pref*(red[8]  - red[7]);
+    virial6[1] += sv_pref*(red[9]  - red[7]);
+    virial6[2] += sv_pref*(red[10] - red[7]);
+    virial6[3] += sv_pref* red[11];
+    virial6[4] += sv_pref* red[12];
+    virial6[5] += sv_pref* red[13];
   }
   (void)quads;
   return energy;

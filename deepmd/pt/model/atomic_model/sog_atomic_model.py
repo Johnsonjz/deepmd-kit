@@ -195,6 +195,12 @@ class SOGEnergyAtomicModel(BaseAtomicModel):
             "energy": energy_ret["energy"],
             "latent_charge": energy_ret["latent_charge"],
         }
+        # Per-frame per-channel charge neutralization: canonical single-point
+        # so all downstream paths (forward_lower, forward_lower_energy_charge,
+        # charge_response_lower) receive zero-mean charges without redundant
+        # corrections. The C++ neutralization workaround can then be removed.
+        q = ret["latent_charge"]
+        ret["latent_charge"] = q - q.mean(dim=-2, keepdim=True)
         if "middle_output" in energy_ret:
             ret["middle_output"] = energy_ret["middle_output"]
         return ret

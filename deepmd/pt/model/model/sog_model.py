@@ -14,6 +14,7 @@ from deepmd.pt.model.model.model import (
     BaseModel,
 )
 from deepmd.pt.model.model.transform_output import (
+    atomic_virial_corr,
     communicate_extended_output,
     fit_output_to_model_output,
 )
@@ -51,13 +52,6 @@ class SOGEnergyModel(DPModelCommon, SOGEnergyModel_):
         DPModelCommon.__init__(self)
         SOGEnergyModel_.__init__(self, *args, **kwargs)
         self._hessian_enabled = False
-        # Fuse the short-range and long-range (charge-response) force/virial backward
-        # into ONE descriptor backward during training (mathematically identical to the
-        # two-pass path; see _forward_lower_sog_fused). Disable to fall back to two-pass.
-        # Env override SOG_FUSED_LR=0 forces the two-pass path (for A/B benchmarking).
-        import os as _os
-
-        self._fused_lr_backward = _os.environ.get("SOG_FUSED_LR", "1") != "0"
         # Persist the direct-kernel SOG object across forward calls so the
         # Gaussian's _kgrid_base_cache (integer meshgrid + zero_mask) survives.
         # Keyed by (device_type, device_index, dtype_str) — rebuild on device/dtype change.
@@ -140,39 +134,25 @@ class SOGEnergyModel(DPModelCommon, SOGEnergyModel_):
         )
 
         nlayers = getattr(self.atomic_model.descriptor, "nlayers", 1) if hasattr(self.atomic_model, "descriptor") else 1
-        # Auto-detect FFT vs direct:
-        # Explicit n_dl without cubes2_phi_max → direct k-sum (training/validation).
-        _has_n_dl = getattr(fitting, "n_dl", None) is not None
-        _has_phi = getattr(fitting, "cubes2_phi_max", None) is not None
-        _use_fft = bool(getattr(fitting, "use_cubes2_fft", False))
-        if _has_n_dl and not _has_phi:
-            _use_fft = False
-        # Build sog_arguments dict
+
         sog_args: dict = {
-            "use_atomwise": False,
             "amp": amp_internal_runtime,
-                "bandwidth": bw2_runtime,
-                "kernel_param_mode": "internal",
-                "kernel_tensor_mode": "external",
-                "remove_self_interaction": bool(fitting.remove_self_interaction),
-                "nufft": False,
-                "use_nufft": False,
-                "use_cubes2_fft": _use_fft,
-                "nlayers": nlayers,
-                "norm_factor": E2_PER_ANGSTROM_TO_EV,
-                "trainable_kernel": False,
-                "b": float(fitting.b),
-            }
-        # Prefer cubes2_phi_max (new API), fall back to n_dl (legacy)
+            "bandwidth": bw2_runtime,
+            "kernel_param_mode": "internal",
+            "kernel_tensor_mode": "external",
+            "remove_self_interaction": bool(fitting.remove_self_interaction),
+            "use_atomwise": False,
+            "use_cubes2_fft": bool(getattr(fitting, "use_cubes2_fft", False)),
+            "nlayers": nlayers,
+            "trainable_kernel": False,
+            "b": float(fitting.b),
+        }
         if getattr(fitting, "cubes2_phi_max", None) is not None:
             sog_args["cubes2_phi_max"] = float(fitting.cubes2_phi_max)
         elif getattr(fitting, "n_dl", None) is not None:
             sog_args["n_dl"] = float(fitting.n_dl)
-        # else: auto-default from SOG lib's Table III
-        # Optional charge neutrality penalty (None = disabled, use physical k=0 instead)
         if getattr(fitting, "charge_neutral_lambda", None) is not None:
             sog_args["charge_neutral_lambda"] = float(fitting.charge_neutral_lambda)
-        # Hard per-frame charge neutrality (q = q - per_frame_mean(q))
         if getattr(fitting, "charge_neutral", False):
             sog_args["charge_neutral"] = True
 
@@ -183,110 +163,7 @@ class SOGEnergyModel(DPModelCommon, SOGEnergyModel_):
         self._sog_direct_kernel_cache[cache_key] = kernel
         return kernel
 
-    def _compute_sog_frame_correction_bundle(
-        self,
-        base_coord: torch.Tensor,
-        latent_charge: torch.Tensor,
-        box: torch.Tensor,
-        nloc: int,
-        *,
-        need_force: bool,
-        need_virial: bool,
-    ) -> dict[str, torch.Tensor]:
-        # base_coord: [nf, nall, 3] — the graph tensor that BOTH the local positions
-        #   (a slice) AND latent_charge (via the fitting net) derive from. Differentiating
-        #   E_lr w.r.t. base_coord therefore captures the explicit ∂E_lr/∂r AND the
-        #   charge-response ∂E_lr/∂q·∂q/∂r term (conservative force). Grad'ing w.r.t. a
-        #   detached slice (the old behaviour) dropped the charge-response term.
-        runtime_device = base_coord.device
-        real_dtype = base_coord.dtype
-
-        latent_charge = latent_charge.to(device=runtime_device, dtype=real_dtype)
-        box = box.to(device=runtime_device, dtype=real_dtype)
-        if need_virial:
-            # Make box a leaf so a single backward yields ∂E_lr/∂h (the box-strain
-            # virial Ξ_rec) alongside the force — avoids a second kernel call.
-            box = box.detach().clone().requires_grad_(True)
-
-        nf, nall, _ = base_coord.shape
-        nq = latent_charge.shape[-1]
-        batch = torch.arange(nf, device=runtime_device, dtype=torch.int64).repeat_interleave(nloc)
-
-        # ── section timer ──
-        _do_timer2 = SOGEnergyModel._diag_step <= 10
-        import time as _time2
-        if _do_timer2 and runtime_device.type == "cuda":
-            torch.cuda.synchronize()
-            _t0b = _time2.perf_counter()
-        kernel = self._build_sog_lib_direct_kernel(
-            runtime_device,
-            real_dtype,
-        )
-
-        # E_lr is the reciprocal-space sum over the LOCAL atoms; positions and charges
-        # are slices/functions of base_coord so autograd flows back through base_coord.
-        positions = base_coord[:, :nloc, :]
-        q_loc = latent_charge[:, :nloc, :]
-        corr = kernel(
-            positions=positions.reshape(nf * nloc, 3),
-            cell=box,
-            batch=batch,
-            latent_charges=q_loc.reshape(nf * nloc, nq),
-            compute_energy=True,
-            compute_bec=False,
-        )["E_lr"]
-        assert corr is not None
-        corr_redu = corr.reshape(nf, 1)
-        if _do_timer2 and runtime_device.type == "cuda":
-            torch.cuda.synchronize()
-            _t_kern2 = _time2.perf_counter() - _t0b
-            print(f"[SOG-DIAG] twopass kernel-fwd: {_t_kern2*1000:.1f} ms")
-        out: dict[str, torch.Tensor] = {"corr_redu": corr_redu}
-
-        if need_force or need_virial:
-            grad_inputs = [base_coord] + ([box] if need_virial else [])
-            if _do_timer2 and runtime_device.type == "cuda":
-                torch.cuda.synchronize()
-                _t1b = _time2.perf_counter()
-            grads = torch.autograd.grad(
-                [corr_redu],
-                grad_inputs,
-                grad_outputs=[torch.ones_like(corr_redu)],
-                create_graph=self.training,
-                retain_graph=True,
-            )
-            if _do_timer2 and runtime_device.type == "cuda":
-                torch.cuda.synchronize()
-                _t_grad2 = _time2.perf_counter() - _t1b
-                print(f"[SOG-DIAG] twopass LR-grad: {_t_grad2*1000:.1f} ms  (kernel={_t_kern2*1000:.1f} ms)")
-            force_ext = -grads[0]
-            assert force_ext is not None
-            out["force_ext"] = force_ext  # [nf, nall, 3] — full charge-response force
-            if need_virial:
-                box_grad = grads[1]
-                assert box_grad is not None
-                out["box_grad"] = box_grad  # ∂E_lr/∂h at fixed r & q (→ Ξ_rec)
-                out["box_leaf"] = box       # the box tensor h that box_grad is w.r.t.
-        return out
-
-    def _compute_sog_strain_virial(
-        self,
-        base_coord: torch.Tensor,
-        force_ext: torch.Tensor,
-        box_grad: torch.Tensor,
-        box_leaf: torch.Tensor,
-    ) -> torch.Tensor:
-        # Complete LR virial (DPLR Eq. 22-24) via decomposition, NO extra kernel call:
-        #   position part  F_full ⊗ r   — F_full is the conservative LR force, so this
-        #                                  carries the charge-response term Ξ_c; and
-        #   box part       -∂E_lr/∂h · h  (Ξ_rec), from the same backward as the force.
-        # Signs match deepmd's energy_derv_c convention; verified vs strain finite diff.
-        nf = base_coord.shape[0]
-        pos_vir = torch.einsum("fak,faj->fkj", force_ext, base_coord)  # [nf,3,3]
-        box_vir = -torch.einsum("fga,fgb->fab", box_grad, box_leaf)     # [nf,3,3]
-        return (pos_vir + box_vir).reshape(nf, 1, 9)
-
-    # ── Fused SR+LR training path ──────────────────────────────────────────────────
+    # ── Fused SR+LR path ───────────────────────────────────────────────────────────
     def _sog_lr_reduced_energy(
         self,
         base_coord: torch.Tensor,
@@ -323,47 +200,6 @@ class SOGEnergyModel(DPModelCommon, SOGEnergyModel_):
         assert corr is not None
         return corr.reshape(nf, 1)
 
-    _diag_step = 0  # incremented each call for per-step tracing
-
-    def _use_fused_lr(
-        self,
-        atomic_ret: dict[str, torch.Tensor],
-        runtime_box: torch.Tensor | None,
-        do_atomic_virial: bool,
-    ) -> bool:
-        """Whether to take the fused single-backward SR+LR path this call."""
-        # ── diagnostic gate tracer (SOG_DIAG=1 to enable) ──
-        _print = SOGEnergyModel._diag_step < 3 and __import__("os").environ.get("SOG_DIAG", "") == "1"
-        SOGEnergyModel._diag_step += 1
-        reasons: list[str] = []
-        if not self._fused_lr_backward:
-            reasons.append("_fused_lr_backward=False")
-        if not self.training:
-            reasons.append("not training")
-        if do_atomic_virial:
-            reasons.append("do_atomic_virial")
-        if runtime_box is None:
-            reasons.append("runtime_box=None")
-        if "latent_charge" not in atomic_ret:
-            reasons.append("no latent_charge")
-        fitting = self.atomic_model.fitting_net
-        if fitting is not None and bool(fitting.external_kspace):
-            reasons.append("external_kspace")
-        if not (self.do_grad_r("energy") or self.do_grad_c("energy")):
-            reasons.append("no grad_r/c")
-        ok = len(reasons) == 0
-        if _print:
-            print(f"[SOG-DIAG] _use_fused_lr → {ok}  (fw={self._fused_lr_backward} train={self.training} "
-                  f"avirial={do_atomic_virial} box={'ok' if runtime_box is not None else 'None'} "
-                  f"lq={'ok' if 'latent_charge' in atomic_ret else 'NO'} "
-                  f"extk={bool(fitting.external_kspace) if fitting else 'no_fit'} "
-                  f"grad_rc={self.do_grad_r('energy') or self.do_grad_c('energy')})" +
-                  (f"  REJECT: {','.join(reasons)}" if reasons else ""))
-        # ── end diagnostic ──
-        if reasons:
-            return False
-        return True
-
     def _forward_lower_sog_fused(
         self,
         atomic_ret: dict[str, torch.Tensor],
@@ -371,17 +207,17 @@ class SOGEnergyModel(DPModelCommon, SOGEnergyModel_):
         box_local: torch.Tensor,
         nloc: int,
         input_prec: str,
+        do_atomic_virial: bool = False,
     ) -> dict[str, torch.Tensor]:
-        """Fused SR+LR training path: ONE combined descriptor backward for the total
-        (short-range + long-range charge-response) force and virial. Mathematically
-        identical to ``fit_output_to_model_output`` + ``_apply_frame_correction_lower``
-        because grad is linear: grad(E_sr+E_lr,·)=grad(E_sr,·)+grad(E_lr,·). Removes the
-        second full-descriptor backward that dominated the ~7× training slowdown.
+        """Fused SR+LR path: ONE combined descriptor backward for the total
+        (short-range + long-range charge-response) energy, force, and virial.
+        grad is linear: grad(E_sr+E_lr,·)=grad(E_sr,·)+grad(E_lr,·), so a single
+        ``autograd.grad`` on ``E_sr_redu + E_lr_redu`` yields the full conservative
+        (charge-response) force.
 
-        Conservativity is preserved: the single ``autograd.grad`` differentiates
-        ``E_sr_redu + E_lr_redu`` w.r.t. ``cc_ext``, and ``E_lr_redu`` carries
-        ``latent_charge``'s graph back through the descriptor, so the charge-response
-        term ∂E_lr/∂q·∂q/∂r is captured automatically (never detach latent_charge/cc_ext).
+        Conservativity is preserved because ``E_lr_redu`` carries ``latent_charge``'s
+        graph back through the descriptor — the charge-response term ∂E_lr/∂q·∂q/∂r
+        is captured automatically (never detach latent_charge/cc_ext).
         """
         redu_prec = env.GLOBAL_PT_ENER_FLOAT_PRECISION
         atom_energy = atomic_ret["energy"]
@@ -401,17 +237,7 @@ class SOGEnergyModel(DPModelCommon, SOGEnergyModel_):
         if need_virial:
             box_leaf = box_local.detach().clone().requires_grad_(True)
 
-        # ── section timer (SOG_DIAG=1 to enable) ──
-        _do_timer = SOGEnergyModel._diag_step <= 6 and __import__("os").environ.get("SOG_DIAG", "") == "1"
-        import time as _time
-        if _do_timer and cc_ext.device.type == "cuda":
-            torch.cuda.synchronize()
-            _t0 = _time.perf_counter()
         corr_redu = self._sog_lr_reduced_energy(cc_ext, latent_charge, box_leaf, nloc)
-        if _do_timer and cc_ext.device.type == "cuda":
-            torch.cuda.synchronize()
-            _t_kern = _time.perf_counter() - _t0
-            print(f"[SOG-DIAG] kernel-fwd: {_t_kern*1000:.1f} ms")
         e_tot_redu = e_sr_redu + corr_redu.to(redu_prec)  # [nf, 1]
 
         model_ret: dict[str, torch.Tensor] = dict(atomic_ret.items())
@@ -421,9 +247,6 @@ class SOGEnergyModel(DPModelCommon, SOGEnergyModel_):
             grad_inputs = [cc_ext]
             if need_virial:
                 grad_inputs = [cc_ext, box_leaf]
-            if _do_timer and cc_ext.device.type == "cuda":
-                torch.cuda.synchronize()
-                _t1 = _time.perf_counter()
             grads = torch.autograd.grad(
                 [e_tot_redu],
                 grad_inputs,
@@ -431,10 +254,6 @@ class SOGEnergyModel(DPModelCommon, SOGEnergyModel_):
                 create_graph=self.training,
                 retain_graph=True,
             )
-            if _do_timer and cc_ext.device.type == "cuda":
-                torch.cuda.synchronize()
-                _t_grad = _time.perf_counter() - _t1
-                print(f"[SOG-DIAG] fused-grad: {_t_grad*1000:.1f} ms  (kernel={_t_kern*1000:.1f} ms)")
             force_ext = -grads[0]
             assert force_ext is not None
             model_ret["energy_derv_r"] = force_ext.unsqueeze(-2)  # [nf, nall, 1, 3]
@@ -445,6 +264,10 @@ class SOGEnergyModel(DPModelCommon, SOGEnergyModel_):
                 pos_vir = torch.einsum(
                     "fak,faj->fakj", force_ext, cc_ext
                 ).reshape(nf, nall, 1, 9)
+                if do_atomic_virial:
+                    pos_vir = pos_vir + atomic_virial_corr(cc_ext, atom_energy).reshape(
+                        nf, nall, 1, 9
+                    ).to(pos_vir.dtype)
                 # reciprocal box-strain Ξ_rec (global), spread over local atoms so the
                 # framework's ghost re-sum recovers the correct global virial
                 box_vir_redu = (
@@ -459,94 +282,6 @@ class SOGEnergyModel(DPModelCommon, SOGEnergyModel_):
                     energy_derv_c.to(redu_prec), dim=1
                 )
         return self._output_type_cast(model_ret, input_prec)
-
-    def _apply_frame_correction_lower(
-        self,
-        model_ret: dict[str, torch.Tensor],
-        extended_coord: torch.Tensor,
-        extended_atype: torch.Tensor,
-        nlist: torch.Tensor,
-        box: torch.Tensor | None,
-        do_atomic_virial: bool,
-        mapping: torch.Tensor | None = None,
-        fparam: torch.Tensor | None = None,
-        aparam: torch.Tensor | None = None,
-        comm_dict: dict[str, torch.Tensor] | None = None,
-    ) -> dict[str, torch.Tensor]:
-        fitting = self.atomic_model.fitting_net
-        if fitting is not None and bool(fitting.external_kspace):
-            return model_ret
-
-        # TorchScript export is used for frozen inference models where the
-        # long-range correction is expected to be provided externally.
-        if torch.jit.is_scripting():
-            return model_ret
-
-        if box is None or "latent_charge" not in model_ret:
-            return model_ret
-
-        nf, nloc, _ = nlist.shape
-        box_local = box.view(nf, 3, 3)
-        latent_charge = model_ret["latent_charge"]
-        need_force = self.do_grad_r("energy") or self.do_grad_c("energy")
-        need_virial = self.do_grad_c("energy")
-
-        corr_bundle = self._compute_sog_frame_correction_bundle(
-            extended_coord,
-            latent_charge,
-            box_local,
-            nloc,
-            need_force=need_force,
-            need_virial=need_virial,
-        )
-        corr_redu = corr_bundle["corr_redu"]
-        model_ret["energy_redu"] = model_ret["energy_redu"] + corr_redu.to(
-            model_ret["energy_redu"].dtype
-        ).view_as(model_ret["energy_redu"])
-
-        if need_force:
-            # force_ext: [nf, nall, 3], full charge-response force over extended atoms.
-            # It is added to the extended energy_derv_r; the framework later reduces
-            # ghost contributions to local atoms via communicate_extended_output.
-            force_ext = corr_bundle["force_ext"]
-            if "energy_derv_r" in model_ret:
-                model_ret["energy_derv_r"] = model_ret[
-                    "energy_derv_r"
-                ] + force_ext.unsqueeze(-2).to(model_ret["energy_derv_r"].dtype).view_as(
-                    model_ret["energy_derv_r"]
-                )
-
-            if need_virial:
-                # Complete LR virial (DPLR Ξ_rec + Ξ_c) = F_full⊗r + box-strain, no
-                # atomic-model recompute. communicate_extended_output re-sums the atomic
-                # energy_derv_c into the reduced virial, so inject the global term into
-                # the atomic virial (spread over local atoms); also set the redu key for
-                # the forward_lower path that skips communicate.
-                virial_redu = self._compute_sog_strain_virial(
-                    extended_coord,
-                    corr_bundle["force_ext"],
-                    corr_bundle["box_grad"],
-                    corr_bundle["box_leaf"],
-                )  # [nf, 1, 9]
-                if "energy_derv_c" in model_ret:
-                    nall = model_ret["energy_derv_c"].shape[1]
-                    corr_c = torch.zeros(
-                        (nf, nall, 1, 9),
-                        dtype=model_ret["energy_derv_c"].dtype,
-                        device=model_ret["energy_derv_c"].device,
-                    )
-                    corr_c[:, :nloc, :, :] = (virial_redu / nloc).unsqueeze(1).to(
-                        corr_c.dtype
-                    )
-                    model_ret["energy_derv_c"] = model_ret["energy_derv_c"] + corr_c
-                if "energy_derv_c_redu" in model_ret:
-                    model_ret["energy_derv_c_redu"] = model_ret[
-                        "energy_derv_c_redu"
-                    ] + virial_redu.to(model_ret["energy_derv_c_redu"].dtype).view_as(
-                        model_ret["energy_derv_c_redu"]
-                    )
-
-        return model_ret
 
     @torch.jit.export
     def forward_common_lower(
@@ -594,42 +329,43 @@ class SOGEnergyModel(DPModelCommon, SOGEnergyModel_):
         if runtime_box is None and comm_dict is not None and "box" in comm_dict:
             runtime_box = comm_dict["box"]
 
-        if not torch.jit.is_scripting() and self._use_fused_lr(
-            atomic_ret, runtime_box, do_atomic_virial
-        ):
-            # ONE combined SR+LR descriptor backward (training). Removes the second
-            # full-descriptor backward; conservativity preserved (see the method docstring).
-            assert runtime_box is not None
-            nf_l, nloc_l = nlist.shape[0], nlist.shape[1]
-            return self._forward_lower_sog_fused(
+        fitting = self.atomic_model.fitting_net
+        external_k = fitting is not None and bool(getattr(fitting, "external_kspace", False))
+
+        # ── External kspace or TorchScript export → SR only (no in-model LR) ──
+        if external_k or torch.jit.is_scripting():
+            model_ret = fit_output_to_model_output(
                 atomic_ret,
+                self.atomic_output_def(),
                 cc_ext,
-                runtime_box.view(nf_l, 3, 3),
-                nloc_l,
-                input_prec,
+                do_atomic_virial=do_atomic_virial,
+                create_graph=self.training,
+                mask=atomic_ret.get("mask"),
+                extended_coord_corr=extended_coord_corr,
+            )
+            return self._output_type_cast(model_ret, input_prec)
+
+        # ── Validate prerequisites for in-model LR correction ──
+        if runtime_box is None:
+            raise ValueError(
+                "SOG model requires a periodic box for long-range correction. "
+                "Set external_kspace=True in the fitting net if LR is provided externally."
+            )
+        if "latent_charge" not in atomic_ret:
+            raise ValueError(
+                "SOG model requires latent_charge in atomic_ret for long-range correction. "
+                "The fitting net must produce latent_charge."
             )
 
-        model_ret = fit_output_to_model_output(
+        # ── Fused SR+LR: single backward for total energy/force/virial ──
+        nf_l, nloc_l = nlist.shape[0], nlist.shape[1]
+        return self._forward_lower_sog_fused(
             atomic_ret,
-            self.atomic_output_def(),
             cc_ext,
+            runtime_box.view(nf_l, 3, 3),
+            nloc_l,
+            input_prec,
             do_atomic_virial=do_atomic_virial,
-            create_graph=self.training,
-            mask=atomic_ret["mask"] if "mask" in atomic_ret else None,
-            extended_coord_corr=extended_coord_corr,
-        )
-        model_ret = self._output_type_cast(model_ret, input_prec)
-        return self._apply_frame_correction_lower(
-            model_ret,
-            cc_ext,
-            extended_atype,
-            nlist,
-            runtime_box,
-            do_atomic_virial,
-            mapping=mapping,
-            fparam=fp,
-            aparam=ap,
-            comm_dict=comm_dict,
         )
 
     @torch.jit.export
@@ -713,7 +449,7 @@ class SOGEnergyModel(DPModelCommon, SOGEnergyModel_):
         )
         atom_energy = atomic_ret["energy"]           # [nf, nloc, 1], differentiable to the input coord
         energy_redu = atom_energy.sum(dim=1)         # [nf, 1]
-        latent_charge = atomic_ret["latent_charge"]  # [nf, nloc, nq]
+        latent_charge = atomic_ret["latent_charge"]  # [nf, nloc, nq]; zero-mean done in forward_common_atomic
         return {
             "energy": energy_redu,
             "latent_charge": latent_charge,
@@ -767,6 +503,7 @@ class SOGEnergyModel(DPModelCommon, SOGEnergyModel_):
             do_atomic_virial=do_atomic_virial,
         )
         model_ret = self._output_type_cast(model_ret, input_prec)
+        # (zero-mean latent_charge now done in forward_common_atomic — single canonical point)
         if self.get_fitting_net() is not None:
             model_predict = {}
             model_predict["atom_energy"] = model_ret["energy"]
@@ -818,6 +555,7 @@ class SOGEnergyModel(DPModelCommon, SOGEnergyModel_):
             extended_coord_corr=None,
             box=box,
         )
+        # (zero-mean latent_charge now done in forward_common_atomic — single canonical point)
         if self.get_fitting_net() is not None:
             model_predict = {}
             model_predict["atom_energy"] = model_ret["energy"]

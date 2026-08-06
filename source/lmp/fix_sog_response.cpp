@@ -265,6 +265,16 @@ void FixSOGResponse::post_force(int vflag) {
     f[ii][2] += dfcorr[ii * 3 + 2];
   }
 
+  // ── Diagnostic dump of dvcorr (SR+CR virial, 9-component row-major F⊗r) ──
+  if (getenv("SOG_DUMP_VIRIAL") && comm->me == 0) {
+    double dfnorm = 0.0;
+    for (size_t ii = 0; ii < dfcorr.size(); ++ii) dfnorm += dfcorr[ii] * dfcorr[ii];
+    utils::logmesg(lmp, fmt::format("SOG_VIRIAL_FIX nlocal={} dfnorm={:.14e}\n", nlocal, dfnorm));
+    utils::logmesg(lmp, fmt::format("SOG_VIRIAL_FIX dvcorr: {:.14e} {:.14e} {:.14e} {:.14e} {:.14e} {:.14e} {:.14e} {:.14e} {:.14e}\n",
+        dvcorr[0], dvcorr[1], dvcorr[2], dvcorr[3], dvcorr[4],
+        dvcorr[5], dvcorr[6], dvcorr[7], dvcorr[8]));
+  }
+
   // ── Global virial (no DPLR extra outer-product term — the model's
   //    charge_response_virial already contains F⊗r) ──
   if (evflag) {
@@ -283,7 +293,7 @@ int FixSOGResponse::pack_reverse_comm(int n, int first, double *buf) {
   int offset = first * 3;
   int last = offset + n * 3;
   for (int i = offset; i < last; ++i) { buf[i - offset] = dfcorr_buff[i]; }
-  return 3;
+  return last - offset;  // n * 3 doubles packed
 }
 
 void FixSOGResponse::unpack_reverse_comm(int n, int *list, double *buf) {

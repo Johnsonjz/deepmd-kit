@@ -565,6 +565,8 @@ void PairDeepMD::compute(int eflag, int vflag) {
     for (int ii = 0; ii < nlocal; ++ii) {
       q[ii] = dcharge[ii * ncharge_channels];
     }
+    // (charge neutralization is now canonicalized in the model's forward_common_atomic;
+    //  the frozen TorchScript graph bakes the zero-mean operation, so no C++ workaround needed)
   }
 
   // get force

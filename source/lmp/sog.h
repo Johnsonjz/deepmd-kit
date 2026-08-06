@@ -45,10 +45,6 @@ class SOGKSpace : public KSpace {
   void setup() override;
   void compute(int eflag, int vflag) override;
   void compute_single(int eflag, int vflag);
-  void apply_k0_correction_single_channel(int eflag, int vflag);
-  void apply_k0_correction_multi_channel(double &energy_acc, double virial_acc[6],
-                                         int eflag, int vflag,
-                                         double qsum_total, double qsqsum_total);
   double memory_usage() override;
 
   // Per-atom electrostatic potential v_i = ∂E_k/∂q_i (filled in compute_single when

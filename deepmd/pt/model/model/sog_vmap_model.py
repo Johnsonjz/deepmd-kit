@@ -1,5 +1,8 @@
 # SPDX-License-Identifier: LGPL-3.0-or-later
 import math
+from typing import (
+    Any,
+)
 
 import pytorch_finufft
 import torch
@@ -47,95 +50,102 @@ class SOGVmapModel(SOGEnergyModel):
             isign=1,
         )
 
-    def _compute_sog_frame_correction_bundle(
+    def __init__(
         self,
-        coord: torch.Tensor,
+        *args: Any,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        self._kgrid_base_cache: dict = {}
+
+    @staticmethod
+    def _device_key(device: torch.device) -> str:
+        if device.index is None:
+            return device.type
+        return f"{device.type}:{device.index}"
+
+    @staticmethod
+    def _trim_cache(cache: dict[Any, Any], max_size: int = 8) -> None:
+        if len(cache) > max_size:
+            oldest_key = next(iter(cache.keys()))
+            cache.pop(oldest_key, None)
+
+    def _get_cached_kgrid_base(
+        self,
+        nk: tuple[int, int, int],
+        runtime_device: torch.device,
+        real_dtype: torch.dtype,
+    ) -> tuple[torch.Tensor, torch.Tensor, tuple[int, int, int]]:
+        cache_key = (
+            self._device_key(runtime_device),
+            str(real_dtype),
+            int(nk[0]),
+            int(nk[1]),
+            int(nk[2]),
+        )
+        cached = self._kgrid_base_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        n1 = torch.arange(-nk[0], nk[0] + 1, device=runtime_device, dtype=real_dtype)
+        n2 = torch.arange(-nk[1], nk[1] + 1, device=runtime_device, dtype=real_dtype)
+        n3 = torch.arange(-nk[2], nk[2] + 1, device=runtime_device, dtype=real_dtype)
+        kx_grid, ky_grid, kz_grid = torch.meshgrid(n1, n2, n3, indexing="ij")
+        k_grid_int = torch.stack((kx_grid, ky_grid, kz_grid), dim=0)
+        zero_mask = (k_grid_int[0] == 0) & (k_grid_int[1] == 0) & (k_grid_int[2] == 0)
+        output_shape = tuple(int(x) for x in kx_grid.shape)
+
+        out = (k_grid_int, zero_mask, output_shape)
+        self._kgrid_base_cache[cache_key] = out
+        self._trim_cache(self._kgrid_base_cache)
+        return out
+
+    def _sog_lr_reduced_energy(
+        self,
+        base_coord: torch.Tensor,
         latent_charge: torch.Tensor,
         box: torch.Tensor,
-        *,
-        need_force: bool,
-        need_virial: bool,
-    ) -> dict[str, torch.Tensor]:
-        if coord.dim() != 3:
-            raise ValueError(
-                f"`coord` should be [nf, nloc, 3], got shape {tuple(coord.shape)}"
-            )
-        if latent_charge.dim() != 3:
-            raise ValueError(
-                f"`latent_charge` should be [nf, nloc, nq], got shape {tuple(latent_charge.shape)}"
-            )
-        if coord.shape[:2] != latent_charge.shape[:2]:
-            raise ValueError(
-                "`coord` and `latent_charge` local dimensions mismatch: "
-                f"{tuple(coord.shape[:2])} vs {tuple(latent_charge.shape[:2])}"
-            )
-
-        fitting = self.get_fitting_net()
-        runtime_device = coord.device
-        real_dtype = coord.dtype
+        nloc: int,
+    ) -> torch.Tensor:
+        """NUFFT-based reciprocal-space LR energy, reduced per frame -> [nf, 1].
+        Full autograd graph intact — the fused path's ``autograd.grad`` backprops
+        through FINUFFT to capture both SR and LR force/virial in a single backward.
+        """
+        runtime_device = base_coord.device
+        real_dtype = base_coord.dtype
         complex_dtype = (
             torch.complex128 if real_dtype == torch.float64 else torch.complex64
         )
-        latent_charge = latent_charge.to(device=runtime_device, dtype=real_dtype)
+
+        coord = base_coord[:, :nloc, :]
+        latent_charge = latent_charge[:, :nloc, :].to(device=runtime_device, dtype=real_dtype)
         box = box.to(device=runtime_device, dtype=real_dtype)
+
         if box.dim() != 3 or box.shape[-2:] != (3, 3):
             raise ValueError(
                 f"`box` should be [nf, 3, 3], got shape {tuple(box.shape)}"
             )
 
+        fitting = self.get_fitting_net()
         remove_self_interaction = bool(fitting.remove_self_interaction)
         amp = torch.as_tensor(
-            fitting.amp,
-            dtype=real_dtype,
-            device=runtime_device,
+            fitting.amp, dtype=real_dtype, device=runtime_device
         ).reshape(-1)
         bandwidth = torch.as_tensor(
-            fitting.bandwidth,
-            dtype=real_dtype,
-            device=runtime_device,
+            fitting.bandwidth, dtype=real_dtype, device=runtime_device
         )
-        if amp.numel() == 0:
-            raise ValueError("Invalid SOG `amp` value in fitting net.")
-        if not torch.isfinite(amp).all():
-            raise ValueError("Invalid SOG `amp` value in fitting net.")
-        if bandwidth.ndim != 1 or bandwidth.numel() == 0:
-            raise ValueError("Invalid SOG `bandwidth` in fitting net.")
-        if not torch.isfinite(bandwidth).all():
-            raise ValueError("Invalid SOG `bandwidth` in fitting net.")
-        if torch.any(bandwidth <= 0.0):
-            raise ValueError("SOG `bandwidth` should be positive.")
 
-        if amp.numel() == 1 and bandwidth.numel() > 1:
-            amp = amp.expand_as(bandwidth)
-        elif amp.numel() != bandwidth.numel():
-            raise ValueError(
-                "SOG `amp` should be scalar or have the same length as `bandwidth`."
-            )
         n_dl = float(fitting.n_dl)
-        if (not math.isfinite(n_dl)) or n_dl <= 0.0:
-            raise ValueError("`n_dl` should be a positive finite number.")
         pi_tensor = torch.tensor(torch.pi, dtype=real_dtype, device=runtime_device)
         two_pi = 2.0 * pi_tensor
         n_dl_tensor = torch.as_tensor(n_dl, dtype=real_dtype, device=runtime_device)
         k_sq_max = (two_pi / n_dl_tensor) ** 2
         coulomb_to_ev = torch.as_tensor(
-            E2_PER_ANGSTROM_TO_EV,
-            dtype=real_dtype,
-            device=runtime_device,
+            E2_PER_ANGSTROM_TO_EV, dtype=real_dtype, device=runtime_device
         )
 
-        nf, nloc, _ = coord.shape
+        nf = coord.shape[0]
         corr = torch.zeros((nf, 1), dtype=real_dtype, device=runtime_device)
-        force_local = (
-            torch.zeros((nf, nloc, 3), dtype=real_dtype, device=runtime_device)
-            if need_force
-            else None
-        )
-        virial_local = (
-            torch.zeros((nf, nloc, 1, 9), dtype=real_dtype, device=runtime_device)
-            if need_virial
-            else None
-        )
 
         volume_all = torch.det(box)
         if torch.any(torch.abs(volume_all) <= torch.finfo(real_dtype).eps):
@@ -155,26 +165,26 @@ class SOGVmapModel(SOGEnergyModel):
 
         norms_all = torch.norm(box, dim=2)
         nk_per_frame = [
-            tuple(max(1, int(v.item() / n_dl)) for v in norms_all[ff]) for ff in range(nf)
+            tuple(max(1, int(v.item() / n_dl)) for v in norms_all[ff])
+            for ff in range(nf)
         ]
         frame_groups: dict[tuple[int, int, int], list[int]] = {}
         for ff, nk in enumerate(nk_per_frame):
             frame_groups.setdefault(nk, []).append(ff)
 
-        vmap_op = getattr(torch, "vmap", None)
-        can_use_vmap = (vmap_op is not None) and (not torch.jit.is_scripting())
         bw2 = bandwidth.square().view(1, 1, 1, -1)
         amp = amp.view(1, 1, 1, -1)
+
         for nk, frame_ids in frame_groups.items():
             k_grid_int, zero_mask, output_shape = self._get_cached_kgrid_base(
-                nk,
-                runtime_device,
-                real_dtype,
+                nk, runtime_device, real_dtype
             )
             zero_mask_expand = zero_mask.unsqueeze(0)
 
             cell_inv_group = cell_inv_all[frame_ids]
-            g_cart_group = two_pi * torch.einsum("bik,k...->bi...", cell_inv_group, k_grid_int)
+            g_cart_group = two_pi * torch.einsum(
+                "bik,k...->bi...", cell_inv_group, k_grid_int
+            )
             k_sq_group = torch.sum(g_cart_group**2, dim=1)
             k_in_cutoff = k_sq_group <= k_sq_max
 
@@ -183,146 +193,33 @@ class SOGVmapModel(SOGEnergyModel):
                 zero_mask_expand | (~k_in_cutoff), 0.0
             )
 
-            if can_use_vmap and len(frame_ids) > 1:
-                coord_group = coord[frame_ids]
-                q_t_group = q_all[frame_ids].contiguous()
-                volume_group = volume_all[frame_ids]
-                nufft_points_group = nufft_points_all[frame_ids].contiguous()
+            for local_idx, ff in enumerate(frame_ids):
+                q_t = q_all[ff]
+                volume = volume_all[ff]
+                nufft_points = nufft_points_all[ff]
+                kfac = kfac_group[local_idx]
 
-                charge_group = (
-                    torch.complex(q_t_group, torch.zeros_like(q_t_group))
+                charge = (
+                    torch.complex(q_t, torch.zeros_like(q_t))
                     .to(dtype=complex_dtype)
                     .contiguous()
                 )
-
-                recon_group = vmap_op(
-                    self._finufft_type1_shifted_single,
-                    in_dims=(0, 0, None),
-                    out_dims=0,
-                )(
-                    nufft_points_group,
-                    charge_group,
-                    output_shape,
+                recon = pytorch_finufft.functional.finufft_type1(
+                    nufft_points,
+                    charge,
+                    output_shape=output_shape,
+                    eps=1e-4,
+                    isign=-1,
                 )
+                # FINUFFT coefficients are in FFT order; align to centered mode ordering.
+                recon = torch.fft.fftshift(recon, dim=(1, 2, 3))
 
-                rho_sq_group = recon_group.real.square() + recon_group.imag.square()
-                corr_group = (
-                    (kfac_group.unsqueeze(1) * rho_sq_group).sum(dim=(1, 2, 3, 4))
-                    / (2.0 * volume_group)
-                )
-                corr[frame_ids, 0] = corr_group
-
-                if need_force:
-                    conv_group = kfac_group.unsqueeze(1).to(dtype=complex_dtype) * recon_group
-                    grad_conv_group = (
-                        1j * g_cart_group.unsqueeze(2).to(dtype=complex_dtype)
-                    ) * conv_group.unsqueeze(1)
-                    # Convert back to FINUFFT FFT order before type-2 evaluation.
-                    grad_conv_group = torch.fft.ifftshift(grad_conv_group, dim=(3, 4, 5))
-
-                    grad_field_group = vmap_op(
-                        self._finufft_type2_single,
-                        in_dims=(0, 0),
-                        out_dims=0,
-                    )(
-                        nufft_points_group,
-                        grad_conv_group,
-                    )
-
-                    force_group = (
-                        -(q_t_group.unsqueeze(1) * grad_field_group.real.to(dtype=real_dtype))
-                        .sum(dim=2)
-                        .transpose(1, 2)
-                    )
-                    force_group = force_group / volume_group.view(-1, 1, 1)
-                    force_local[frame_ids] = force_group
-
-                    if need_virial:
-                        virial_local[frame_ids] = torch.einsum(
-                            "bai,baj->baij",
-                            force_group,
-                            coord_group,
-                        ).reshape(len(frame_ids), nloc, 1, 9)
+                rho_sq = recon.real.square() + recon.imag.square()
+                corr[ff, 0] = (kfac.unsqueeze(0) * rho_sq).sum() / (2.0 * volume)
 
                 if remove_self_interaction:
-                    diag_sum_group = kfac_group.sum(dim=(1, 2, 3)) / (2.0 * volume_group)
-                    corr[frame_ids, 0] -= (
-                        latent_charge[frame_ids].square().sum(dim=(1, 2)) * diag_sum_group
-                    )
-            else:
-                for local_idx, ff in enumerate(frame_ids):
-                    r_raw = coord[ff]
-                    q_t = q_all[ff]
-                    volume = volume_all[ff]
-                    nufft_points = nufft_points_all[ff]
-                    g_cart = g_cart_group[local_idx]
-                    kfac = kfac_group[local_idx]
+                    diag_sum = kfac.sum() / (2.0 * volume)
+                    corr[ff, 0] -= torch.sum(latent_charge[ff] ** 2) * diag_sum
 
-                    charge = (
-                        torch.complex(q_t, torch.zeros_like(q_t))
-                        .to(dtype=complex_dtype)
-                        .contiguous()
-                    )
-                    recon = pytorch_finufft.functional.finufft_type1(
-                        nufft_points,
-                        charge,
-                        output_shape=output_shape,
-                        eps=1e-4,
-                        isign=-1,
-                    )
-                    # FINUFFT coefficients are returned in FFT order; align to centered
-                    # mode ordering (-nk..nk) used by k_grid_int/kfac/g_cart.
-                    recon = torch.fft.fftshift(recon, dim=(1, 2, 3))
-
-                    rho_sq = recon.real.square() + recon.imag.square()
-                    corr[ff, 0] = (kfac.unsqueeze(0) * rho_sq).sum() / (2.0 * volume)
-
-                    conv = None
-                    if need_force:
-                        conv = kfac.unsqueeze(0).to(dtype=complex_dtype) * recon
-
-                    if need_force:
-                        assert conv is not None
-                        grad_conv = (
-                            1j * g_cart.unsqueeze(1).to(dtype=complex_dtype)
-                        ) * conv.unsqueeze(0)
-                        # Convert back to FINUFFT FFT order before type-2 evaluation.
-                        grad_conv = torch.fft.ifftshift(grad_conv, dim=(2, 3, 4))
-                        grad_field = pytorch_finufft.functional.finufft_type2(
-                            nufft_points,
-                            grad_conv,
-                            eps=1e-4,
-                            isign=1,
-                        )
-                        force_frame = (
-                            -(q_t.unsqueeze(0) * grad_field.real.to(dtype=real_dtype))
-                            .sum(dim=1)
-                            .transpose(0, 1)
-                        )
-                        force_frame = force_frame / volume
-                        force_local[ff] = force_frame
-
-                        if need_virial:
-                            virial_local[ff] = torch.einsum(
-                                "ai,aj->aij",
-                                force_frame,
-                                r_raw,
-                            ).reshape(nloc, 1, 9)
-
-                    if remove_self_interaction:
-                        diag_sum = kfac.sum() / (2.0 * volume)
-                        corr[ff, 0] -= torch.sum(latent_charge[ff] ** 2) * diag_sum
-
-        # Convert electrostatic unit from e^2/A to eV.
         corr = corr * coulomb_to_ev
-        if force_local is not None:
-            force_local = force_local * coulomb_to_ev
-        if virial_local is not None:
-            virial_local = virial_local * coulomb_to_ev
-
-        out: dict[str, torch.Tensor] = {"corr_redu": corr}
-        if force_local is not None:
-            out["force_local"] = force_local
-        if virial_local is not None:
-            out["virial_local"] = virial_local
-        return out
+        return corr  # [nf, 1]

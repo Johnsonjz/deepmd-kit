@@ -1,0 +1,22 @@
+LAMMPS (22 Jul 2025 - Update 4)
+units           metal
+boundary        p p p
+atom_style      charge
+plugin load     /root/code/deepmd-kit/source/build_local/lmp/plugin/libdeepmd_lmp.so
+Open of file /root/code/deepmd-kit/source/build_local/lmp/plugin/libdeepmd_lmp.so failed: libdeepmd_cc.so: cannot open shared object file: No such file or directory
+neighbor        2.0 bin
+neigh_modify    every 10 delay 0 check no
+read_data       /root/code/deepmd-example/water-scan0/lmp/replicate/data/water_2x4x4_charge.data
+Reading data file ...
+  orthogonal box = (0 0 0) to (24.8894 49.7788 49.7788)
+  1 by 1 by 1 MPI processor grid
+  reading atoms ...
+  6144 atoms
+  reading velocities ...
+  6144 velocities
+  read_data CPU = 0.039 seconds
+mass            1 15.999
+mass            2 1.008
+pair_style      deepmd /root/code/deepmd-example/water-scan0/sog_k0/nlayers2/sog/sog_n2_frozen.pth latent_charge_to_q yes
+ERROR: Unrecognized pair style 'deepmd' (src/force.cpp:275)
+Last input line: pair_style deepmd /root/code/deepmd-example/water-scan0/sog_k0/nlayers2/sog/sog_n2_frozen.pth latent_charge_to_q yes

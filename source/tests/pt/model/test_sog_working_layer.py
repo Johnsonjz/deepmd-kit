@@ -103,7 +103,9 @@ class TestSOGWorkingLayer(unittest.TestCase):
             device=env.DEVICE,
         )
 
-    def test_frame_correction_applies_once_per_frame(self) -> None:
+    def test_sr_lr_energy_decomposition(self) -> None:
+        """Verify energy_redu == sum(atom_energy) + LR energy."""
+        self.model.eval()
         coord3 = self.coord.view(self.nf, self.nloc, 3)
         cell33 = self.cell.view(self.nf, 3, 3)
         (
@@ -129,18 +131,19 @@ class TestSOGWorkingLayer(unittest.TestCase):
             comm_dict={"box": cell33},
         )
 
-        frame_corr = self.model._compute_sog_frame_correction(
-            extended_coord[:, : self.nloc, :],
+        # SR energy from atom_energy sum
+        sr_energy = lower_ret["energy"].sum(dim=1)
+        # LR energy via the same method the fused path uses
+        lr_energy = self.model._sog_lr_reduced_energy(
+            extended_coord,
             lower_ret["latent_charge"],
             cell33,
-        ).to(lower_ret["energy_redu"].dtype)
-        expected_energy_redu = lower_ret["energy"].sum(dim=1) + frame_corr
+            self.nloc,
+        ).to(sr_energy.dtype)
+        expected = sr_energy + lr_energy
 
         torch.testing.assert_close(
-            lower_ret["energy_redu"],
-            expected_energy_redu,
-            rtol=1e-8,
-            atol=1e-8,
+            lower_ret["energy_redu"], expected, rtol=1e-8, atol=1e-8
         )
 
     def test_forward_and_forward_lower_consistency(self) -> None:
