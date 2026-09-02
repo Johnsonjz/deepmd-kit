@@ -564,13 +564,12 @@ class RepFlowLayer(torch.nn.Module):
         sub_edge_update_ik = torch.matmul(edge_ebd, sub_edge_ik)
         sub_edge_update_ij = torch.matmul(edge_ebd, sub_edge_ij)
 
-        result_update = (
-            bias
-            + sub_node_update.unsqueeze(2).unsqueeze(3)
-            + sub_edge_update_ik.unsqueeze(2)
-            + sub_edge_update_ij.unsqueeze(3)
-            + sub_angle_update
-        )
+        # sequential accumulation: avoids materializing a full
+        # (nf, nloc, a_sel, a_sel, dim) temporary per broadcast term
+        result_update = sub_angle_update + bias
+        result_update = result_update + sub_node_update.unsqueeze(2).unsqueeze(3)
+        result_update = result_update + sub_edge_update_ik.unsqueeze(2)
+        result_update = result_update + sub_edge_update_ij.unsqueeze(3)
         return result_update
 
     def optim_angle_update_dynamic(
@@ -614,13 +613,11 @@ class RepFlowLayer(torch.nn.Module):
         sub_edge_update_ik = torch.index_select(sub_edge_update_ik, 0, eik2a_index)
         sub_edge_update_ij = torch.index_select(sub_edge_update_ij, 0, eij2a_index)
 
-        result_update = (
-            bias
-            + sub_node_update
-            + sub_edge_update_ik
-            + sub_edge_update_ij
-            + sub_angle_update
-        )
+        # sequential accumulation: lower peak memory
+        result_update = sub_angle_update + bias
+        result_update = result_update + sub_node_update
+        result_update = result_update + sub_edge_update_ik
+        result_update = result_update + sub_edge_update_ij
         return result_update
 
     def optim_edge_update(
@@ -653,9 +650,10 @@ class RepFlowLayer(torch.nn.Module):
         # nf * nloc * nnei * node/edge_dim
         sub_edge_update = torch.matmul(edge_ebd, edge)
 
-        result_update = (
-            bias + sub_node_update.unsqueeze(2) + sub_edge_update + sub_node_ext_update
-        )
+        # sequential accumulation: lower peak memory
+        result_update = bias + sub_edge_update
+        result_update = result_update + sub_node_update.unsqueeze(2)
+        result_update = result_update + sub_node_ext_update
         return result_update
 
     def optim_edge_update_dynamic(

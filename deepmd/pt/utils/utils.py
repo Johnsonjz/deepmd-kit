@@ -165,10 +165,14 @@ class SiLUT(torch.nn.Module):
         self.const = float(silu(threshold))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        sig = torch.sigmoid(x)
-        silu = x * sig
-        tanh = torch.tanh(self.slope * (x - self.threshold)) + self.const
-        return torch.where(x >= self.threshold, tanh, silu)
+        # Bit-identical to where(x>=thr, tanh(slope*(x-thr))+const, x*sigmoid(x))
+        # but avoids full-size tanh/where temporaries: the tanh branch is
+        # computed only on the (sparse) masked subset, written in place.
+        out = x * torch.sigmoid(x)
+        mask = x >= self.threshold
+        sel = x[mask]
+        out[mask] = torch.tanh(self.slope * (sel - self.threshold)) + self.const
+        return out
 
 
 class ActivationFn(torch.nn.Module):

@@ -1925,11 +1925,6 @@ void SOGKSpace::compute_single(int eflag, int vflag) {
   // −qscale·qsqsum·Σ K/(2V), which the reciprocal virial omits (~2.5%→~0.5% fix).
   std::array<double, 6> sv_local = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
 
-  // r⊗F virial accumulator: W_rec_αβ = Σ_i r_iα · F_iβ (k-space forces).
-  // Replaces the analytic Fourier virial formula which is incomplete —
-  // it misses the strain-derivative of |ρ̂(k)|².
-  double vv_rf[6] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
-
   for (int iz = 0; iz < mesh_nz; ++iz) {
     const int kz_mode = iz - mesh_nz * (2 * iz / mesh_nz);
     const double kz = twopi_over_z * static_cast<double>(kz_mode);
@@ -2088,14 +2083,6 @@ void SOGKSpace::compute_single(int eflag, int vflag) {
       atom->f[i][0] += fxs_q;
       atom->f[i][1] += fys_q;
       atom->f[i][2] += fzs_q;
-      if (want_virial) {
-        vv_rf[0] += x[i][0] * fxs_q;
-        vv_rf[1] += x[i][1] * fys_q;
-        vv_rf[2] += x[i][2] * fzs_q;
-        vv_rf[3] += x[i][0] * fys_q;
-        vv_rf[4] += x[i][0] * fzs_q;
-        vv_rf[5] += x[i][1] * fzs_q;
-      }
       if (want_potential) vpot[i] = qscale * gpot;
     }
   } else if (spline_type >= 4) {
@@ -2161,17 +2148,6 @@ void SOGKSpace::compute_single(int eflag, int vflag) {
       atom->f[i][1] += fys;
       atom->f[i][2] += fzs;
 
-      // r⊗F virial (reciprocal part): exact, captures all position-dependent
-      // strain effects that the analytic Fourier formula misses.
-      if (want_virial) {
-        vv_rf[0] += x[i][0] * fxs;
-        vv_rf[1] += x[i][1] * fys;
-        vv_rf[2] += x[i][2] * fzs;
-        vv_rf[3] += x[i][0] * fys;
-        vv_rf[4] += x[i][0] * fzs;
-        vv_rf[5] += x[i][1] * fzs;
-      }
-
       // Mesh part of the per-atom potential v_i = ∂E_k/∂q_i (same qscale as the
       // force). Self-energy contributions are added after diag_sum_all is reduced.
       if (want_potential) vpot[i] = qscale * gpot;
@@ -2228,15 +2204,6 @@ void SOGKSpace::compute_single(int eflag, int vflag) {
       atom->f[i][0] += fxs;
       atom->f[i][1] += fys;
       atom->f[i][2] += fzs;
-
-      if (want_virial) {
-        vv_rf[0] += x[i][0] * fxs;
-        vv_rf[1] += x[i][1] * fys;
-        vv_rf[2] += x[i][2] * fzs;
-        vv_rf[3] += x[i][0] * fys;
-        vv_rf[4] += x[i][0] * fzs;
-        vv_rf[5] += x[i][1] * fzs;
-      }
     }
   }
 
@@ -2292,8 +2259,8 @@ void SOGKSpace::compute_single(int eflag, int vflag) {
     // where G_E = Σ a_m e^{−½β_m k²}, K_v = Σ a_m·β_m e^{−½β_m k²}.
     // The strain-derivative of |ρ̂(k)|² is identically ZERO under fractional-
     // coordinate charge spreading + Form-B deconvolution (verified via analytic
-    // geometry proof + toy FD numerics, 1e-9). The r⊗F approach (vv_rf) is
-    // therefore INCOMPLETE — it omits the box-explicit strain term that the
+    // geometry proof + toy FD numerics, 1e-9). A Σ r⊗F formulation is therefore
+    // INCOMPLETE — it omits the box-explicit strain term that the
     // analytic formula captures via d(1/V)/dε, d(k²)/dε, and dG_E/d(k²).
     // This formula matches fastsog.cpp:1657-1660, PPPM vg, and the Python
     // autograd virial (mesh_reciprocal_virial + direct k-sum FD).
@@ -2330,10 +2297,6 @@ void SOGKSpace::compute_single(int eflag, int vflag) {
         return fmt::format("{:.14e} {:.14e} {:.14e} {:.14e} {:.14e} {:.14e}",
                            v[0], v[1], v[2], v[3], v[4], v[5]);
       };
-      // vv_rf = r⊗F kspace virial (retained for diagnostic comparison)
-      double vv_all_dump[6] = {0.0};
-      MPI_Allreduce(vv_rf, vv_all_dump, 6, MPI_DOUBLE, MPI_SUM, world);
-      utils::logmesg(lmp, fmt::format("SOG_VIRIAL_KSPACE vv_rf: {}\n", fmt_v6(vv_all_dump)));
       // vf_all = analytic Fourier virial (NOW PRODUCTION; was diagnostic-only)
       double vf_all_dump[6] = {0.0};
       MPI_Allreduce(fv_local.data(), vf_all_dump, 6, MPI_DOUBLE, MPI_SUM, world);
@@ -2549,7 +2512,7 @@ void SOGKSpace::enumerate_direct_kvecs()
      3. Energy   E = (qscale/V) · 2 · Σ_{k half} K(k²) · |S(k)|²  − self
      4. Forces   F_i = q_i · (qscale/V) · 2 · Σ_k K(k²) · k ·
                        [cos(k·r_i)·S_im[k] − sin(k·r_i)·S_re[k]]
-     5. Virial   from per-atom stress r_i ⊗ F_i
+     5. Virial   analytic Fourier form (rbsog-npt.md eq 82): W_αβ = [K·δ_αβ − K_v·k_α·k_β]·|S|²
 ------------------------------------------------------------------------- */
 void SOGKSpace::compute_direct(int eflag, int vflag)
 {
@@ -2645,6 +2608,17 @@ void SOGKSpace::compute_direct(int eflag, int vflag)
     double kx_cart = kx_d[ik] * dkx, ky_cart = ky_d[ik] * dky, kz_cart = kz_d[ik] * dkz;
     double weight = prefac_f * kfac_d[ik];
 
+    // Fourier virial (analytic, rbsog-npt.md eq 82): W_αβ = [K·δ_αβ − K_v·k_α·k_β]·|S|²
+    if (want_virial) {
+      const double kv = kfac_virial_d[ik];
+      vv[0] += (kfac - kv * kx_cart * kx_cart) * Ssq;
+      vv[1] += (kfac - kv * ky_cart * ky_cart) * Ssq;
+      vv[2] += (kfac - kv * kz_cart * kz_cart) * Ssq;
+      vv[3] += -kv * kx_cart * ky_cart * Ssq;
+      vv[4] += -kv * kx_cart * kz_cart * Ssq;
+      vv[5] += -kv * ky_cart * kz_cart * Ssq;
+    }
+
     for (int i = 0; i < nlocal; ++i) {
       double cx = csx[i], cy = csy[i], cz = csz[i];
       double vx = sx * snx[i], vy = sy * sny[i], vz = sz * snz[i];
@@ -2686,20 +2660,12 @@ void SOGKSpace::compute_direct(int eflag, int vflag)
     f[i][2] += fz[i];
   }
 
-  // ── Virial: r ⊗ F accumulation ──
+  // ── Virial: analytic Fourier form (rbsog-npt.md eq 82), NOT r⊗F ──
+  // `vv` is accumulated over the half-sphere k-vectors using the already-MPI-reduced
+  // structure factors (identical on every rank), so it needs no Allreduce — same
+  // convention as `etot` above.
   if (want_virial) {
-    for (int i = 0; i < nlocal; ++i) {
-      vv[0] += x[i][0] * fx[i];
-      vv[1] += x[i][1] * fy[i];
-      vv[2] += x[i][2] * fz[i];
-      vv[3] += x[i][0] * fy[i];
-      vv[4] += x[i][0] * fz[i];
-      vv[5] += x[i][1] * fz[i];
-    }
-    // MPI reduce virial
-    double vv_all[6];
-    MPI_Allreduce(vv, vv_all, 6, MPI_DOUBLE, MPI_SUM, world);
-    for (int j = 0; j < 6; ++j) virial[j] = vv_all[j];
+    for (int j = 0; j < 6; ++j) virial[j] = prefac_en * vv[j];
   }
 }
 
