@@ -832,8 +832,27 @@ class Trainer:
             else:
                 raise ValueError(f"Not supported optimizer type '{self.opt_type}'")
 
+            parameters = self.wrapper.parameters()
+            sog_lr_scale = float(self.opt_param.get("sog_lr_scale", 1.0))
+            if self.opt_type in ("Adam", "AdamW") and sog_lr_scale != 1.0:
+                # Give the SOG kernel coefficients (amp/bandwidth) their own,
+                # scaled-down learning rate so the non-unique Gaussian
+                # decomposition evolves slowly (avoids k-grid blow-up).
+                sog_params = []
+                other_params = []
+                for name, p in self.wrapper.named_parameters():
+                    if name.endswith(".amp") or name.endswith(".bandwidth"):
+                        sog_params.append(p)
+                    else:
+                        other_params.append(p)
+                if sog_params:
+                    parameters = [
+                        {"params": sog_params, "lr": initial_lr * sog_lr_scale},
+                        {"params": other_params, "lr": initial_lr},
+                    ]
             self.optimizer = self._create_optimizer(
                 cls,
+                parameters=parameters,
                 lr=initial_lr,
                 weight_decay=weight_decay,
                 **extra,
@@ -910,6 +929,7 @@ class Trainer:
     def _create_optimizer(
         self,
         optimizer_class: type[torch.optim.Optimizer],
+        parameters=None,
         **kwargs: Any,
     ) -> torch.optim.Optimizer:
         """
@@ -919,6 +939,9 @@ class Trainer:
         ----------
         optimizer_class : type[torch.optim.Optimizer]
             The optimizer class to instantiate.
+        parameters : iterable, optional
+            Iterable of parameters or param-groups to optimize. Defaults to
+            ``self.wrapper.parameters()``.
         **kwargs : Any
             Keyword arguments forwarded to the optimizer constructor.
 
@@ -927,13 +950,15 @@ class Trainer:
         torch.optim.Optimizer
             Constructed optimizer instance.
         """
+        if parameters is None:
+            parameters = self.wrapper.parameters()
         if self.zero_stage == 1:
             return ZeroRedundancyOptimizer(
-                self.wrapper.parameters(),
+                parameters,
                 optimizer_class=optimizer_class,
                 **kwargs,
             )
-        return optimizer_class(self.wrapper.parameters(), **kwargs)
+        return optimizer_class(parameters, **kwargs)
 
     def _get_inner_module(self) -> ModelWrapper:
         """Unwrap DDP if needed. FSDP2 is in-place so no unwrapping required."""
@@ -1016,7 +1041,12 @@ class Trainer:
                 fout1.write(print_str)
                 fout1.flush()
             if self.opt_type in ["Adam", "AdamW", "AdaMuon", "HybridMuon"]:
-                cur_lr = self.scheduler.get_last_lr()[0]
+                # Report the MAIN (unscaled) group's lr. When sog_lr_scale != 1
+                # the optimizer has two groups [sog (scaled-down), main]; the
+                # last group is the main one. Using [0] would report the SOG
+                # kernel's scaled lr and corrupt the loss prefactor curriculum
+                # (coef = lr/starter_lr interpolates pref_e/f/v).
+                cur_lr = self.scheduler.get_last_lr()[-1]
                 pref_lr = cur_lr
                 model_pred, loss, more_loss = self.wrapper(
                     **input_dict, cur_lr=pref_lr, label=label_dict, task_key=task_key

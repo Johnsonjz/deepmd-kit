@@ -31,6 +31,7 @@ from deepmd.pt.utils.exclude_mask import (
     AtomExcludeMask,
 )
 from deepmd.pt.utils.utils import (
+    ActivationFn,
     to_numpy_array,
     to_torch_tensor,
 )
@@ -75,6 +76,11 @@ class LRFittingNet(Fitting):
         Dimension of case specific embedding.
     activation_function : str
         Activation function.
+    activation_function_lr : str, optional
+        Activation applied at the LR fitting net's readout (output) layer, before
+        the per-type charge bias is added. When unset (None), the LR readout is
+        linear (identity) and behaves like the SR readout. Set to e.g. "tanh" to
+        bound the latent charge output to a finite range.
     precision : str
         Numerical precision.
     mixed_types : bool
@@ -119,6 +125,7 @@ class LRFittingNet(Fitting):
         numb_aparam: int = 0,
         dim_case_embd: int = 0,
         activation_function: str = "tanh",
+        activation_function_lr: str | None = None,
         precision: str = DEFAULT_PRECISION,
         mixed_types: bool = True,
         rcond: float | None = None,
@@ -146,6 +153,14 @@ class LRFittingNet(Fitting):
         self.default_fparam = default_fparam
         self.dim_case_embd = dim_case_embd
         self.activation_function = activation_function
+        # The LR net produces the latent charge. `activation_function_lr`, when set,
+        # is applied at the LR *readout* (output) layer — before the per-type charge
+        # bias is added — so the charge can be bounded (e.g. tanh). When unset, the
+        # LR readout is linear (identity), i.e. it behaves like the SR readout.
+        self.activation_function_lr = activation_function_lr
+        # Always a concrete nn.Module (identity when unset) so TorchScript freeze
+        # does not need to handle an Optional[Module] attribute.
+        self.lr_readout_activate = ActivationFn(activation_function_lr)
         self.precision = precision
         self.prec = PRECISION_DICT[self.precision]
         self.rcond = rcond
@@ -159,7 +174,10 @@ class LRFittingNet(Fitting):
             all(self.trainable) if isinstance(self.trainable, list) else self.trainable
         )
         self.remove_vaccum_contribution = remove_vaccum_contribution
-        self.bias_atom_q_bound = 3.0
+        # Soft-bound on the per-type charge bias. Must exceed the largest formal
+        # charge (P^5+ = 5 in Li6PS5Cl) so bias_atom_q can be initialized to the
+        # formal charges; the LR net then learns only the response correction.
+        self.bias_atom_q_bound = 6.0
         # When True (default), _corr_head enforces per-frame charge neutrality.
         # Set to False when neutrality is handled downstream (e.g., SOG lib's charge_neutral).
         self._enable_corr_head = True
@@ -369,6 +387,7 @@ class LRFittingNet(Fitting):
             "dim_case_embd": self.dim_case_embd,
             "default_fparam": self.default_fparam,
             "activation_function": self.activation_function,
+            "activation_function_lr": self.activation_function_lr,
             "precision": self.precision,
             "mixed_types": self.mixed_types,
             "nets_sr": self.filter_layers_sr.serialize(),
@@ -653,6 +672,10 @@ class LRFittingNet(Fitting):
             middle_output=results,
             bias_tensor=None,
         )
+        # Readout activation (e.g. tanh) applied to the LR net output BEFORE the
+        # per-type charge bias is added, so q = act(net(x)) + bias_atom_q stays in a
+        # bounded range. Identity when `activation_function_lr` is unset.
+        lr_out = self.lr_readout_activate(lr_out)
         lr_out = lr_out + self._get_lr_bias(atype)
         mask = self.emask(atype).to(torch.bool)
         sr_out = torch.where(mask[:, :, None], sr_out, 0.0)

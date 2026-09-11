@@ -3474,6 +3474,18 @@ def optimizer_adamw() -> list[Argument]:
             default=0.001,
             doc=doc_only_pt_supported + doc_weight_decay,
         ),
+        Argument(
+            "sog_lr_scale",
+            float,
+            optional=True,
+            default=1.0,
+            doc=doc_only_pt_supported
+            + "Scale factor for the learning rate of the SOG kernel parameters "
+            "(amp/bandwidth). The SOG Gaussian-decomposition coefficients are "
+            "non-unique for different kernel functions and should evolve slowly, "
+            "so their learning rate is multiplied by this factor (<1 to slow "
+            "them down). Only meaningful for sog_energy fitting nets.",
+        ),
     ]
 
 

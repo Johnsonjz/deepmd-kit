@@ -123,17 +123,31 @@ class SOGEnergyModel(DPModelCommon, SOGEnergyModel_):
             # model's device, which can change across save/load or DDP).
             fitting = self.atomic_model.fitting_net
             cached.gaussian.amp = fitting.amp.to(device=runtime_device, dtype=real_dtype)
-            cached.gaussian.bandwidth = fitting.bandwidth.to(device=runtime_device, dtype=real_dtype)
+            cached.gaussian.bandwidth = fitting.get_bandwidth_sq().to(
+                device=runtime_device, dtype=real_dtype
+            )
             return cached
 
         fitting = self.atomic_model.fitting_net
-        bw2_runtime = fitting.bandwidth.to(device=runtime_device, dtype=real_dtype)
+        bw2_runtime = fitting.get_bandwidth_sq().to(
+            device=runtime_device, dtype=real_dtype
+        )
         amp_internal_runtime = fitting.amp.to(
             device=runtime_device,
             dtype=real_dtype,
         )
 
-        nlayers = getattr(self.atomic_model.descriptor, "nlayers", 1) if hasattr(self.atomic_model, "descriptor") else 1
+        nlayers = None
+        if hasattr(self.atomic_model, "descriptor"):
+            nlayers = getattr(self.atomic_model.descriptor, "nlayers", None)
+            if nlayers is None:
+                for _sub in ("repflows", "repformers"):
+                    _blk = getattr(self.atomic_model.descriptor, _sub, None)
+                    if _blk is not None and hasattr(_blk, "nlayers"):
+                        nlayers = _blk.nlayers
+                        break
+        if nlayers is None:
+            nlayers = 1
 
         sog_args: dict = {
             "amp": amp_internal_runtime,

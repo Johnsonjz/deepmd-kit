@@ -58,7 +58,18 @@ class SOGEnergyAtomicModel(BaseAtomicModel):
 
         # Apply SOG library defaults: if sigma was not explicitly set by user,
         # compute it from the descriptor's r_cut (sigma = r_cut * nlayers / RCUT_TO_SIGMA).
-        nlayers_sog = getattr(self.descriptor, "nlayers", 1)
+        # nlayers is the number of message-passing layers, which sets the
+        # receptive field (= nlayers * rcut). Standard descriptors have a single
+        # layer; repformer (dpa2) / repflow (dpa3) bury it in a sub-block.
+        nlayers_sog = getattr(self.descriptor, "nlayers", None)
+        if nlayers_sog is None:
+            for _sub in ("repflows", "repformers"):
+                _blk = getattr(self.descriptor, _sub, None)
+                if _blk is not None and hasattr(_blk, "nlayers"):
+                    nlayers_sog = _blk.nlayers
+                    break
+        if nlayers_sog is None:
+            nlayers_sog = 1
         self.fitting_net.recompute_from_rcut(self.rcut, nlayers_sog)
 
         super().init_out_stat()

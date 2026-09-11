@@ -136,6 +136,7 @@ class SOGEnergyFittingNet(LRFittingNet):
         numb_aparam: int = 0,
         dim_case_embd: int = 0,
         activation_function: str = "tanh",
+        activation_function_lr: str | None = None,
         precision: str = DEFAULT_PRECISION,
         mixed_types: bool = True,
         rcond: float | None = None,
@@ -175,6 +176,7 @@ class SOGEnergyFittingNet(LRFittingNet):
             numb_aparam=numb_aparam,
             dim_case_embd=dim_case_embd,
             activation_function=activation_function,
+            activation_function_lr=activation_function_lr,
             precision=precision,
             mixed_types=mixed_types,
             rcond=rcond,
@@ -217,25 +219,26 @@ class SOGEnergyFittingNet(LRFittingNet):
 
         if bandwidth is None:
             b_base = torch.tensor(b_value, dtype=dtype, device=device)
+            # Store the *pre-square* bandwidth σ·b^m as the trainable parameter;
+            # it is squared on use so the kernel's bw² ≥ 0 and exp(-k²·bw²/2)
+            # never degenerates into an exponential exp(+k²·|bw²|/2).
             bw_tensor = sigma_value * torch.pow(
                 b_base,
                 torch.arange(m_value, dtype=dtype, device=device),
             )
-            # Keep bandwidth as bw^2 so the kernel uses
-            # amp_m * bandwidth_m * exp(-0.5 * bandwidth_m * k^2).
-            bandwidth_tensor = bw_tensor.square()
         else:
-            bandwidth_tensor = torch.as_tensor(bandwidth, dtype=dtype, device=device).reshape(-1)
-        if bandwidth_tensor.numel() == 0:
+            bw_tensor = torch.as_tensor(bandwidth, dtype=dtype, device=device).reshape(-1)
+        if bw_tensor.numel() == 0:
             raise ValueError("`bandwidth` should not be empty.")
-        if not torch.isfinite(bandwidth_tensor).all():
+        if not torch.isfinite(bw_tensor).all():
             raise ValueError("`bandwidth` should be finite.")
-        if torch.any(bandwidth_tensor <= 0.0):
-            raise ValueError("`bandwidth` values should be positive.")
+
+        # Squared bandwidth consumed by the kernel (guaranteed non-negative).
+        bandwidth_sq = bw_tensor.square()
 
         if amp is None:
             coef1 = float(4.0 * np.pi * np.log(b_value))
-            amp_tensor = torch.full_like(bandwidth_tensor, coef1)
+            amp_tensor = torch.full_like(bw_tensor, coef1)
         else:
             amp_tensor = torch.as_tensor(amp, dtype=dtype, device=device).reshape(-1)
         if amp_tensor.numel() == 0:
@@ -243,14 +246,14 @@ class SOGEnergyFittingNet(LRFittingNet):
         if not torch.isfinite(amp_tensor).all():
             raise ValueError("`amp` should be finite.")
 
-        if amp_tensor.numel() == 1 and bandwidth_tensor.numel() > 1:
-            amp_tensor = amp_tensor.expand_as(bandwidth_tensor).clone()
-        elif amp_tensor.numel() != bandwidth_tensor.numel():
+        if amp_tensor.numel() == 1 and bw_tensor.numel() > 1:
+            amp_tensor = amp_tensor.expand_as(bw_tensor).clone()
+        elif amp_tensor.numel() != bw_tensor.numel():
             raise ValueError(
                 "`amp` should be scalar or have the same length as `bandwidth`."
             )
         # Store amp as sog-lib internal amplitude (already includes bw^2 factor).
-        amp_tensor *= bandwidth_tensor
+        amp_tensor *= bandwidth_sq
 
         # Grid control: prefer cubes2_phi_max, fall back to n_dl (deprecated)
         if n_dl is not None:
@@ -269,7 +272,7 @@ class SOGEnergyFittingNet(LRFittingNet):
             requires_grad=bool(self.trainable),
         )
         self.bandwidth = torch.nn.Parameter(
-            bandwidth_tensor,
+            bw_tensor,
             requires_grad=bool(self.trainable),
         )
         self.b = b_value
@@ -308,6 +311,10 @@ class SOGEnergyFittingNet(LRFittingNet):
         data["b"] = float(self.b)
         data["sigma"] = float(self.sigma)
         data["M"] = int(self.M)
+        # ``bandwidth`` is stored as the pre-square σ·b^m parameter; the kernel
+        # squares it on use.  Mark the format so legacy (squared) checkpoints can
+        # be up-converted on load.
+        data["bandwidth_raw"] = True
         if self.cubes2_phi_max is not None:
             data["cubes2_phi_max"] = self.cubes2_phi_max
         if self.n_dl is not None:
@@ -345,8 +352,13 @@ class SOGEnergyFittingNet(LRFittingNet):
                     raise ValueError("`bandwidth` should not be empty.")
                 if not torch.isfinite(bw).all():
                     raise ValueError("`bandwidth` should be finite.")
+                if not data.get("bandwidth_raw", False):
+                    # Legacy checkpoints stored the *squared* bandwidth (bw²);
+                    # recover the pre-square σ·b^m parameter (bw² ≥ 0 ⇒ sqrt is
+                    # well-defined).
+                    bw = bw.sqrt()
                 if torch.any(bw <= 0.0):
-                    raise ValueError("`bandwidth` values should be positive.")
+                    raise ValueError("`bandwidth` (pre-square) values should be positive.")
 
                 if obj.bandwidth.shape != bw.shape:
                     obj.bandwidth = torch.nn.Parameter(
@@ -388,6 +400,15 @@ class SOGEnergyFittingNet(LRFittingNet):
     def _kernel_params(self) -> tuple[torch.Tensor, torch.Tensor]:
         return self.amp, self.bandwidth
 
+    def get_bandwidth_sq(self) -> torch.Tensor:
+        """Squared bandwidth bw² (guaranteed non-negative) consumed by the kernel.
+
+        ``self.bandwidth`` stores the *pre-square* σ·b^m parameter so it can be
+        trained freely without ever producing a negative (exponential-degenerate)
+        kernel bandwidth.
+        """
+        return self.bandwidth.square()
+
     def recompute_from_rcut(self, rcut: float, nlayers: int = 1) -> None:
         """Recompute sigma, amp, bandwidth from the descriptor's r_cut.
 
@@ -406,7 +427,7 @@ class SOGEnergyFittingNet(LRFittingNet):
             b_base,
             torch.arange(self.M, dtype=self.amp.dtype, device=self.amp.device),
         )
-        new_bandwidth = bw_tensor.square()
+        new_bandwidth = bw_tensor.square()   # bw² (non-negative)
         coef1 = float(4.0 * np.pi * np.log(self.b))
         new_amp = torch.full_like(new_bandwidth, coef1)
         new_amp *= new_bandwidth  # convert to sog-lib internal amplitude
@@ -417,7 +438,7 @@ class SOGEnergyFittingNet(LRFittingNet):
             requires_grad=bool(self.trainable),
         )
         self.bandwidth = torch.nn.Parameter(
-            new_bandwidth.to(device=self.bandwidth.device, dtype=self.bandwidth.dtype),
+            bw_tensor.to(device=self.bandwidth.device, dtype=self.bandwidth.dtype),
             requires_grad=bool(self.trainable),
         )
 
