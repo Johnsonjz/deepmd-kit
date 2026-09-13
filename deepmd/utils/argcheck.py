@@ -2215,6 +2215,16 @@ def fitting_sog_energy() -> list[Argument]:
             default="tanh",
             doc=doc_activation_function,
         ),
+        Argument(
+            "activation_function_lr",
+            [str, type(None)],
+            optional=True,
+            default=None,
+            doc=doc_only_pt_supported
+            + "Activation function applied at the LR (latent-charge) readout layer. "
+            + "When set (e.g. `tanh`) it bounds the per-atom charge before the bias is "
+            + "added; when unset the LR readout is linear.",
+        ),
         Argument("precision", str, optional=True, default="default", doc=doc_precision),
         Argument("resnet_dt", bool, optional=True, default=True, doc=doc_resnet_dt),
         Argument(
@@ -2264,14 +2274,14 @@ def fitting_sog_energy() -> list[Argument]:
             "b",
             [float, list[float]],
             optional=True,
-            default=1.6297670882677647,
+            default=2.0,
             doc=doc_only_pt_supported + doc_b,
         ),
         Argument(
             "sigma",
-            [float, list[float]],
+            [float, list[float], type(None)],
             optional=True,
-            default=2.180230445405648,
+            default=None,
             doc=doc_only_pt_supported + doc_sigma,
         ),
         Argument(
