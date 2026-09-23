@@ -275,12 +275,52 @@ class SOGEnergyFittingNet(LRFittingNet):
             bw_tensor,
             requires_grad=bool(self.trainable),
         )
+        # Checkpoint format marker: v2 = bandwidth stored PRE-SQUARE (σ·b^m).
+        # Travels with state_dict so legacy (squared) checkpoints can be
+        # detected and converted on load (see ``_load_from_state_dict``) —
+        # mirror of sog-lib ``Gaussian._bw_format_version``.
+        self.register_buffer("_bw_format_version", torch.tensor(2))
         self.b = b_value
         self.sigma = sigma_value
         self.M = m_value
         self.remove_self_interaction = bool(remove_self_interaction)
         self.external_kspace = bool(external_kspace)
         self._nufft_fallback_warned = False
+
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ):
+        # Backward compatibility: legacy checkpoints (no ``_bw_format_version``
+        # marker) stored ``bandwidth`` in the *squared* form bw², while this
+        # module stores the pre-square σ·b^m parameter and squares it on use
+        # (``get_bandwidth_sq``).  Loading a legacy value silently would
+        # produce bw⁴.  Detect the missing marker and sqrt-recover the
+        # pre-square parameter (legacy bw² ≥ 0, so the root is well-defined).
+        # New-format checkpoints load normally; loading a NEW checkpoint into
+        # OLD code fails loudly on the unexpected marker key under strict=True.
+        bw_key = prefix + "bandwidth"
+        if bw_key in state_dict and prefix + "_bw_format_version" not in state_dict:
+            state_dict = state_dict.copy()
+            bw = state_dict[bw_key]
+            if bw is not None:
+                state_dict[bw_key] = bw.clamp(min=0).sqrt()
+            state_dict[prefix + "_bw_format_version"] = torch.tensor(2)
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
 
     def output_def(self) -> FittingOutputDef:
         return FittingOutputDef(
@@ -408,6 +448,32 @@ class SOGEnergyFittingNet(LRFittingNet):
         kernel bandwidth.
         """
         return self.bandwidth.square()
+
+    def lammps_kernel_params(self) -> dict[str, object]:
+        """SOG kernel parameters in the LAMMPS ``kspace_style sog`` convention.
+
+        The C++ plugin consumes ``bandwidth`` as the *squared* bandwidth bw²
+        (``K(k²) = Σ amp·exp(-½·bw²·k²)``).  This exporter ALWAYS emits the
+        squared values via :meth:`get_bandwidth_sq`, regardless of the internal
+        storage format, so generated input files stay correct across format
+        changes.  Prefer this over reading the raw ``.bandwidth`` attribute.
+        """
+        return {
+            "b": float(self.b),
+            "sigma": float(self.sigma),
+            "M": int(self.M),
+            "amp": to_numpy_array(self.amp).reshape(-1).tolist(),
+            "bandwidth": to_numpy_array(self.get_bandwidth_sq())
+            .reshape(-1)
+            .tolist(),
+            "remove_self_interaction": bool(self.remove_self_interaction),
+            "n_dl": float(self.n_dl) if self.n_dl is not None else None,
+            "cubes2_phi_max": (
+                float(self.cubes2_phi_max)
+                if self.cubes2_phi_max is not None
+                else None
+            ),
+        }
 
     def recompute_from_rcut(self, rcut: float, nlayers: int = 1) -> None:
         """Recompute sigma, amp, bandwidth from the descriptor's r_cut.
