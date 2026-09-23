@@ -1586,7 +1586,7 @@ class Trainer:
         checkpoint_files = [
             f
             for f in checkpoint_dir.glob("*.pt")
-            if not f.is_symlink() and f.name.startswith(self.save_ckpt)
+            if not f.is_symlink() and f.name.startswith(Path(self.save_ckpt).name)
         ]
         if len(checkpoint_files) > self.max_ckpt_keep:
             checkpoint_files.sort(key=lambda x: x.stat().st_mtime)
