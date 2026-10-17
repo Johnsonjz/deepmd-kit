@@ -223,6 +223,30 @@ __/fix_dplr.cpp.s:
 	cd /data/home/public/jiangzhen/dp/deepmd-kit/source/build_pt_gcc13 && $(MAKE) $(MAKESILENT) -f lmp/plugin/CMakeFiles/deepmd_lmp.dir/build.make lmp/plugin/CMakeFiles/deepmd_lmp.dir/__/fix_dplr.cpp.s
 .PHONY : __/fix_dplr.cpp.s
 
+__/fix_sog_response.o: __/fix_sog_response.cpp.o
+.PHONY : __/fix_sog_response.o
+
+# target to build an object file
+__/fix_sog_response.cpp.o:
+	cd /data/home/public/jiangzhen/dp/deepmd-kit/source/build_pt_gcc13 && $(MAKE) $(MAKESILENT) -f lmp/plugin/CMakeFiles/deepmd_lmp.dir/build.make lmp/plugin/CMakeFiles/deepmd_lmp.dir/__/fix_sog_response.cpp.o
+.PHONY : __/fix_sog_response.cpp.o
+
+__/fix_sog_response.i: __/fix_sog_response.cpp.i
+.PHONY : __/fix_sog_response.i
+
+# target to preprocess a source file
+__/fix_sog_response.cpp.i:
+	cd /data/home/public/jiangzhen/dp/deepmd-kit/source/build_pt_gcc13 && $(MAKE) $(MAKESILENT) -f lmp/plugin/CMakeFiles/deepmd_lmp.dir/build.make lmp/plugin/CMakeFiles/deepmd_lmp.dir/__/fix_sog_response.cpp.i
+.PHONY : __/fix_sog_response.cpp.i
+
+__/fix_sog_response.s: __/fix_sog_response.cpp.s
+.PHONY : __/fix_sog_response.s
+
+# target to generate assembly for a file
+__/fix_sog_response.cpp.s:
+	cd /data/home/public/jiangzhen/dp/deepmd-kit/source/build_pt_gcc13 && $(MAKE) $(MAKESILENT) -f lmp/plugin/CMakeFiles/deepmd_lmp.dir/build.make lmp/plugin/CMakeFiles/deepmd_lmp.dir/__/fix_sog_response.cpp.s
+.PHONY : __/fix_sog_response.cpp.s
+
 __/les.o: __/les.cpp.o
 .PHONY : __/les.o
 
@@ -366,6 +390,30 @@ __/sog.s: __/sog.cpp.s
 __/sog.cpp.s:
 	cd /data/home/public/jiangzhen/dp/deepmd-kit/source/build_pt_gcc13 && $(MAKE) $(MAKESILENT) -f lmp/plugin/CMakeFiles/deepmd_lmp.dir/build.make lmp/plugin/CMakeFiles/deepmd_lmp.dir/__/sog.cpp.s
 .PHONY : __/sog.cpp.s
+
+__/sog_gpu.o: __/sog_gpu.cu.o
+.PHONY : __/sog_gpu.o
+
+# target to build an object file
+__/sog_gpu.cu.o:
+	cd /data/home/public/jiangzhen/dp/deepmd-kit/source/build_pt_gcc13 && $(MAKE) $(MAKESILENT) -f lmp/plugin/CMakeFiles/deepmd_lmp.dir/build.make lmp/plugin/CMakeFiles/deepmd_lmp.dir/__/sog_gpu.cu.o
+.PHONY : __/sog_gpu.cu.o
+
+__/sog_gpu.i: __/sog_gpu.cu.i
+.PHONY : __/sog_gpu.i
+
+# target to preprocess a source file
+__/sog_gpu.cu.i:
+	cd /data/home/public/jiangzhen/dp/deepmd-kit/source/build_pt_gcc13 && $(MAKE) $(MAKESILENT) -f lmp/plugin/CMakeFiles/deepmd_lmp.dir/build.make lmp/plugin/CMakeFiles/deepmd_lmp.dir/__/sog_gpu.cu.i
+.PHONY : __/sog_gpu.cu.i
+
+__/sog_gpu.s: __/sog_gpu.cu.s
+.PHONY : __/sog_gpu.s
+
+# target to generate assembly for a file
+__/sog_gpu.cu.s:
+	cd /data/home/public/jiangzhen/dp/deepmd-kit/source/build_pt_gcc13 && $(MAKE) $(MAKESILENT) -f lmp/plugin/CMakeFiles/deepmd_lmp.dir/build.make lmp/plugin/CMakeFiles/deepmd_lmp.dir/__/sog_gpu.cu.s
+.PHONY : __/sog_gpu.cu.s
 
 # target to build an object file
 cmake_pch.hxx.gch:
@@ -569,6 +617,9 @@ help:
 	@echo "... __/fix_dplr.o"
 	@echo "... __/fix_dplr.i"
 	@echo "... __/fix_dplr.s"
+	@echo "... __/fix_sog_response.o"
+	@echo "... __/fix_sog_response.i"
+	@echo "... __/fix_sog_response.s"
 	@echo "... __/les.o"
 	@echo "... __/les.i"
 	@echo "... __/les.s"
@@ -587,6 +638,9 @@ help:
 	@echo "... __/sog.o"
 	@echo "... __/sog.i"
 	@echo "... __/sog.s"
+	@echo "... __/sog_gpu.o"
+	@echo "... __/sog_gpu.i"
+	@echo "... __/sog_gpu.s"
 	@echo "... cmake_pch.hxx.gch"
 	@echo "... cmake_pch.hxx.i"
 	@echo "... cmake_pch.hxx.s"

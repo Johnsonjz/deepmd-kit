@@ -29,7 +29,8 @@ inline void build_comm_dict(torch::Dict<std::string, torch::Tensor>& comm_dict,
                             const InputNlist& lmp_list,
                             int** sendlist,
                             int* sendnum,
-                            int* recvnum) {
+                            int* recvnum,
+                            int* firstrecv_override = nullptr) {
   int nswap = lmp_list.nswap;
   auto int32_option =
       torch::TensorOptions().device(torch::kCPU).dtype(torch::kInt32);
@@ -40,8 +41,18 @@ inline void build_comm_dict(torch::Dict<std::string, torch::Tensor>& comm_dict,
       torch::from_blob(static_cast<void*>(sendlist), {nswap}, int64_option);
   torch::Tensor sendnum_tensor =
       torch::from_blob(sendnum, {nswap}, int32_option);
-  torch::Tensor recvnum_tensor =
-      torch::from_blob(recvnum, {nswap}, int32_option);
+  // Keep the public TorchScript border_op signature unchanged while carrying
+  // LAMMPS' true receive offsets.  Row 0 is recvnum (legacy layout); row 1 is
+  // firstrecv.  Older single-rank operators that only read data_ptr<int>()
+  // still see the original recvnum row, while the MPI operator can honor
+  // overlapping/non-contiguous receive ranges.
+  torch::Tensor recvnum_tensor = torch::empty({2, nswap}, int32_option);
+  int* recvmeta = recvnum_tensor.data_ptr<int>();
+  int* firstrecv = firstrecv_override ? firstrecv_override : lmp_list.firstrecv;
+  for (int s = 0; s < nswap; ++s) {
+    recvmeta[s] = recvnum[s];
+    recvmeta[nswap + s] = firstrecv ? firstrecv[s] : 0;
+  }
   torch::Tensor sendproc_tensor =
       torch::from_blob(lmp_list.sendproc, {nswap}, int32_option);
   torch::Tensor recvproc_tensor =
@@ -125,8 +136,21 @@ inline void build_comm_dict_with_virtual_atoms(
   for (int s = 0; s < nswap; ++s) {
     remapped_sendlist_ptrs[s] = remapped_sendlist[s].data();
   }
+  std::vector<int> remapped_firstrecv(nswap, 0);
+  for (int s = 0; s < nswap; ++s) {
+    const int first = lmp_list.firstrecv[s];
+    const int count = lmp_list.recvnum[s];
+    for (int k = 0; k < count; ++k) {
+      const int mapped = fwd_map[first + k];
+      if (mapped >= 0) {
+        remapped_firstrecv[s] = mapped;
+        break;
+      }
+    }
+  }
   build_comm_dict(comm_dict, lmp_list, remapped_sendlist_ptrs.data(),
-                  remapped_sendnum.data(), remapped_recvnum.data());
+                  remapped_sendnum.data(), remapped_recvnum.data(),
+                  remapped_firstrecv.data());
 }
 
 }  // namespace deepmd

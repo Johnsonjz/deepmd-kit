@@ -54,7 +54,7 @@ if(CMAKE_INSTALL_COMPONENT STREQUAL "Unspecified" OR NOT CMAKE_INSTALL_COMPONENT
      NOT IS_SYMLINK "$ENV{DESTDIR}${CMAKE_INSTALL_PREFIX}/lib/libdeepmd_lmp.so")
     file(RPATH_CHANGE
          FILE "$ENV{DESTDIR}${CMAKE_INSTALL_PREFIX}/lib/libdeepmd_lmp.so"
-         OLD_RPATH "/data/home/public/.conda/envs/mlip/lib/python3.10/site-packages/torch/lib/../../torch.libs:/data/home/public/jiangzhen/dp/deepmd-kit/source/build_pt_gcc13/api_cc:/data/home/public/jiangzhen/dp/deepmd-kit/source/build_pt_gcc13/lib:/data/home/public/.conda/envs/mlip/lib/python3.10/site-packages/torch/lib:"
+         OLD_RPATH "/data/home/public/.conda/envs/mlip/lib/python3.10/site-packages/torch/lib/../../torch.libs:/usr/local/cuda/lib64:/data/home/public/jiangzhen/dp/deepmd-kit/source/build_pt_gcc13/api_cc:/data/home/public/jiangzhen/dp/deepmd-kit/source/build_pt_gcc13/lib:/data/home/public/.conda/envs/mlip/lib/python3.10/site-packages/torch/lib:"
          NEW_RPATH "\$ORIGIN:/data/home/public/.conda/envs/mlip/lib/python3.10/site-packages/torch/lib")
     if(CMAKE_INSTALL_DO_STRIP)
       execute_process(COMMAND "/opt/rh/gcc-toolset-13/root/usr/bin/strip" "$ENV{DESTDIR}${CMAKE_INSTALL_PREFIX}/lib/libdeepmd_lmp.so")

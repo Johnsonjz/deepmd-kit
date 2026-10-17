@@ -34,5 +34,26 @@ double sog_gpu_compute(SogGpuState *s, int nlocal,
                        int spline, int want_potential,
                        double *force, double *virial6, double *vpot,
                        double self_coeff, double qsqsum, int remove_self);
+
+// Local brick operations used by the PPPM-style distributed backend.  Grid
+// indices are global and may extend below zero or above N-1 in the ghost
+// layers.  The host owns Grid3d communication and the distributed FFT; CUDA
+// performs only particle-local spreading and adjoint gathering.
+void sog_gpu_spread_brick(SogGpuState *s, int nlocal,
+                          const double *x, const double *boxlo,
+                          double lx, double ly, double lz,
+                          const double *q, double rho_scale, int spline,
+                          int nx, int ny, int nz,
+                          int nxlo, int nxhi, int nylo, int nyhi,
+                          int nzlo, int nzhi, double *rho_brick);
+
+void sog_gpu_gather_brick(SogGpuState *s, int nlocal,
+                          const double *x, const double *boxlo,
+                          double lx, double ly, double lz,
+                          const double *q, double qscale, int spline,
+                          int nx, int ny, int nz,
+                          int nxlo, int nxhi, int nylo, int nyhi,
+                          int nzlo, int nzhi, const double *u_brick,
+                          double *force, double *vpot);
 }
 #endif  // SOG_GPU_CUH

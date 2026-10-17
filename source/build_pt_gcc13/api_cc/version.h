@@ -4,8 +4,8 @@
 
 const std::string global_install_prefix="/data/home/public/jiangzhen/dp/deepmd-kit/build/sog_lmp_stable";
 const std::string global_git_summ="";
-const std::string global_git_hash="f3bd2d40f";
-const std::string global_git_date="2026-06-02 23:06:21 +0800";
+const std::string global_git_hash="2d0709516";
+const std::string global_git_date="2026-09-23 12:54:11 +0800";
 const std::string global_git_branch="sog-lmp";
 const std::string global_tf_include_dir="";
 const std::string global_tf_lib="";

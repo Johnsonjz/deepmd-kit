@@ -118,7 +118,12 @@ if(DEFINED LAMMPS_SOURCE_ROOT OR DEFINED LAMMPS_VERSION)
   file(GLOB SOG_GPU_SRC ../sog_gpu.cu)
   if(SOG_GPU_SRC)
     enable_language(CUDA)
-    set(CMAKE_CUDA_ARCHITECTURES "80")
+    # Allow the build to select the target GPU. Keep Ampere as the default for
+    # older production nodes, while Ada/Hopper builds can pass
+    # -DCMAKE_CUDA_ARCHITECTURES explicitly.
+    if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+      set(CMAKE_CUDA_ARCHITECTURES "80")
+    endif()
     list(APPEND LMP_SRC ${SOG_GPU_SRC})
     set(CUDA_cufft_LIBRARY "/usr/local/cuda/lib64/libcufft.so")
   endif()

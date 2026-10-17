@@ -31,9 +31,12 @@
 #include "error.h"
 #include "fft3d_wrap.h"
 #include "force.h"
+#include "grid3d.h"
 #include "math_const.h"
+#include "neighbor.h"
 #include "pair.h"
 #include "pair_deepmd.h"
+#include "remap_wrap.h"
 
 #include <algorithm>
 #include <array>
@@ -80,6 +83,26 @@ int wrap_index(int i, const int n) {
   i %= n;
   if (i < 0) i += n;
   return i;
+}
+
+void sog_procs2grid2d(int nprocs, int nx, int ny, int &px, int &py) {
+  int bestsurf = 2 * (nx + ny);
+  int bestboxx = 0, bestboxy = 0;
+  for (int ipx = 1; ipx <= nprocs; ++ipx) {
+    if (nprocs % ipx) continue;
+    const int ipy = nprocs / ipx;
+    if (ipx > nx || ipy > ny) continue;
+    const int boxx = (nx + ipx - 1) / ipx;
+    const int boxy = (ny + ipy - 1) / ipy;
+    const int surf = boxx + boxy;
+    if (surf < bestsurf || (surf == bestsurf && boxx * boxy > bestboxx * bestboxy)) {
+      bestsurf = surf;
+      bestboxx = boxx;
+      bestboxy = boxy;
+      px = ipx;
+      py = ipy;
+    }
+  }
 }
 
 // ── B-spline weights (generalized to arbitrary order n) ──
@@ -398,7 +421,13 @@ SOGKSpace::SOGKSpace(LAMMPS *lmp)
   triclinic_support = 0;
 }
 
-SOGKSpace::~SOGKSpace() { destroy_fft_plan(); }
+SOGKSpace::~SOGKSpace() {
+  destroy_fft_plan();
+  if (gpu_) {
+    sog_gpu_destroy(static_cast<SogGpuState *>(gpu_));
+    gpu_ = nullptr;
+  }
+}
 
 // ──────────────────────────────────────────────────────────────────────
 // settings / parameters
@@ -422,6 +451,7 @@ void SOGKSpace::settings(int narg, char **arg) {
   grid_method = 0;   // SOG bandwidth
   phi_max_user = -1.0;  // auto-compute
   phi_accuracy_user = -1.0;  // default per-order ε
+  gpu_mpi_mode = 0;  // replicated; select root explicitly for the one-solve MPI backend
 
   // The leading positional header 'accuracy b sigma M [n_dl]' is OPTIONAL and fully
   // backward-compatible. It is only needed to AUTO-GENERATE the kernel; when amp+bandwidth are
@@ -556,6 +586,19 @@ void SOGKSpace::settings(int narg, char **arg) {
       else
         error->all(FLERR, "sog use_gpu expects yes or no");
       iarg += 2;
+    } else if (key == "gpu_mpi") {
+      if (iarg + 1 >= narg)
+        error->all(FLERR, "sog missing gpu_mpi value");
+      const std::string val(arg[iarg + 1]);
+      if (val == "replicated")
+        gpu_mpi_mode = 0;
+      else if (val == "root")
+        gpu_mpi_mode = 1;
+      else if (val == "distributed")
+        gpu_mpi_mode = 2;
+      else
+        error->all(FLERR, "sog gpu_mpi expects replicated, root, or distributed");
+      iarg += 2;
     } else if (key == "direct") {
       // Enable exact direct k-space summation (no mesh/FFT).
       // "direct yes [kmax]" — kmax overrides auto (σ_min-based, tail ≲ 1e-12).
@@ -618,7 +661,7 @@ void SOGKSpace::settings(int narg, char **arg) {
             tok == "amp" || tok == "bandwidth" || tok == "remove_self_interaction" ||
             tok == "use_finufft" || tok == "spline" || tok == "mesh_oversample" ||
             tok == "mesh_alias_extent" || tok == "grid_method" || tok == "phi_max" ||
-            tok == "use_gpu" || tok == "phi_accuracy")
+            tok == "use_gpu" || tok == "gpu_mpi" || tok == "phi_accuracy")
           break;
         char *ep = nullptr; double v = strtod(arg[iarg], &ep);
         if (ep == arg[iarg] || !std::isfinite(v)) break;
@@ -633,7 +676,7 @@ void SOGKSpace::settings(int narg, char **arg) {
             tok == "amp" || tok == "bandwidth" || tok == "remove_self_interaction" ||
             tok == "use_finufft" || tok == "spline" || tok == "mesh_oversample" ||
             tok == "mesh_alias_extent" || tok == "grid_method" || tok == "phi_max" ||
-            tok == "use_gpu" || tok == "phi_accuracy")
+            tok == "use_gpu" || tok == "gpu_mpi" || tok == "phi_accuracy")
           break;
         char *ep = nullptr; double v = strtod(arg[iarg], &ep);
         if (ep == arg[iarg] || !std::isfinite(v)) break;
@@ -853,6 +896,7 @@ void SOGKSpace::setup() { ensure_fft_plan(); }
 // ──────────────────────────────────────────────────────────────────────
 
 void SOGKSpace::destroy_fft_plan() {
+  destroy_distributed_plan();
   if (mesh_fft != nullptr) {
     delete mesh_fft;
     mesh_fft = nullptr;
@@ -1045,7 +1089,8 @@ void SOGKSpace::ensure_fft_plan() {
     mesh_ly = ly;
     mesh_lz = lz;
     precompute_green_functions();
-    if (enable_gpu) {
+    if (enable_gpu && gpu_mpi_mode != 2 &&
+        (gpu_mpi_mode == 0 || comm->nprocs == 1 || comm->me == 0)) {
       if (!gpu_) gpu_ = sog_gpu_create();
       sog_gpu_setup((SogGpuState*)gpu_, mesh_nx, mesh_ny, mesh_nz,
                     mesh_green_energy.data(), mesh_green_force.data(),
@@ -1084,7 +1129,7 @@ void SOGKSpace::ensure_fft_plan() {
   mesh_fft = new FFT3d(lmp, world, mesh_nx, mesh_ny, mesh_nz, 0, mesh_nx - 1,
                         0, mesh_ny - 1, 0, mesh_nz - 1, 0, mesh_nx - 1, 0,
                         mesh_ny - 1, 0, mesh_nz - 1, 0, 0, &tmp,
-                        collective_flag);
+                        collective_flag, 0);
 
   // CubeS₂ (Form B) needs no spline-influence precompute: precompute_green_functions() builds the
   // separable variance-subtraction Green tables directly from amp/bandwidth. Only the legacy B-spline
@@ -1095,7 +1140,8 @@ void SOGKSpace::ensure_fft_plan() {
     precompute_sinc_tables();
   }
   precompute_green_functions();
-  if (enable_gpu) {
+  if (enable_gpu && gpu_mpi_mode != 2 &&
+      (gpu_mpi_mode == 0 || comm->nprocs == 1 || comm->me == 0)) {
     if (!gpu_) gpu_ = sog_gpu_create();
     sog_gpu_setup((SogGpuState*)gpu_, mesh_nx, mesh_ny, mesh_nz,
                   mesh_green_energy.data(), mesh_green_force.data(),
@@ -1104,6 +1150,147 @@ void SOGKSpace::ensure_fft_plan() {
   }
   if (use_direct) enumerate_direct_kvecs();
   mesh_ready = true;
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// PPPM-style distributed brick/pencil plan
+// ──────────────────────────────────────────────────────────────────────
+
+void SOGKSpace::destroy_distributed_plan() {
+  delete dist_gc; dist_gc = nullptr;
+  delete dist_remap; dist_remap = nullptr;
+  delete dist_fft1; dist_fft1 = nullptr;
+  delete dist_fft2; dist_fft2 = nullptr;
+  dist_rho_brick.clear();
+  dist_u_brick.clear();
+  dist_density_fft.clear();
+  dist_work1.clear();
+  dist_work2.clear();
+  dist_gc_buf1.clear();
+  dist_gc_buf2.clear();
+  dist_ready = false;
+  dist_ngrid = dist_nfft_brick = dist_nfft = dist_nfft_both = 0;
+}
+
+size_t SOGKSpace::dist_brick_index(int ix, int iy, int iz) const {
+  const int nx = dist_nxhi_out - dist_nxlo_out + 1;
+  const int ny = dist_nyhi_out - dist_nylo_out + 1;
+  return static_cast<size_t>(iz - dist_nzlo_out) * ny * nx +
+         static_cast<size_t>(iy - dist_nylo_out) * nx +
+         static_cast<size_t>(ix - dist_nxlo_out);
+}
+
+int SOGKSpace::dist_local_index(int i, int n, int lo, int hi) const {
+  if (i < lo) i += ((lo - i + n - 1) / n) * n;
+  if (i > hi) i -= ((i - hi + n - 1) / n) * n;
+  if (i < lo || i > hi)
+    error->one(FLERR, "sog distributed stencil index is outside the local ghost brick");
+  return i;
+}
+
+void SOGKSpace::ensure_distributed_plan() {
+  if (spline_type < 4)
+    error->all(FLERR, "sog gpu_mpi distributed currently requires CubeS2 or QuadS");
+  if (dist_ready && dist_lx == mesh_lx && dist_ly == mesh_ly && dist_lz == mesh_lz)
+    return;
+
+  destroy_distributed_plan();
+  dist_lx = mesh_lx; dist_ly = mesh_ly; dist_lz = mesh_lz;
+
+  const int stencil_lo = (spline_type == 6) ? -2 : -1;
+  const int stencil_hi = (spline_type == 6) ? 3 : 2;
+  dist_gc = new Grid3d(lmp, world, mesh_nx, mesh_ny, mesh_nz);
+  dist_gc->set_distance(0.5 * neighbor->skin);
+  dist_gc->set_stencil_atom(stencil_lo, stencil_hi);
+  dist_gc->set_shift_atom(0.0, 0.0);
+  dist_gc->setup_grid(dist_nxlo_in, dist_nxhi_in,
+                      dist_nylo_in, dist_nyhi_in,
+                      dist_nzlo_in, dist_nzhi_in,
+                      dist_nxlo_out, dist_nxhi_out,
+                      dist_nylo_out, dist_nyhi_out,
+                      dist_nzlo_out, dist_nzhi_out);
+  dist_gc->setup_comm(dist_ngc_buf1, dist_ngc_buf2);
+
+  int npey = 1, npez = comm->nprocs;
+  sog_procs2grid2d(comm->nprocs, mesh_ny, mesh_nz, npey, npez);
+  const int me_y = comm->me % npey;
+  const int me_z = comm->me / npey;
+  dist_nxlo_fft = 0; dist_nxhi_fft = mesh_nx - 1;
+  dist_nylo_fft = me_y * mesh_ny / npey;
+  dist_nyhi_fft = (me_y + 1) * mesh_ny / npey - 1;
+  dist_nzlo_fft = me_z * mesh_nz / npez;
+  dist_nzhi_fft = (me_z + 1) * mesh_nz / npez - 1;
+
+  dist_ngrid = (dist_nxhi_out-dist_nxlo_out+1) *
+               (dist_nyhi_out-dist_nylo_out+1) *
+               (dist_nzhi_out-dist_nzlo_out+1);
+  dist_nfft_brick = (dist_nxhi_in-dist_nxlo_in+1) *
+                    (dist_nyhi_in-dist_nylo_in+1) *
+                    (dist_nzhi_in-dist_nzlo_in+1);
+  dist_nfft = (dist_nxhi_fft-dist_nxlo_fft+1) *
+              (dist_nyhi_fft-dist_nylo_fft+1) *
+              (dist_nzhi_fft-dist_nzlo_fft+1);
+  dist_nfft_both = std::max(dist_nfft, dist_nfft_brick);
+
+  dist_rho_brick.assign(dist_ngrid, 0.0);
+  dist_u_brick.assign(dist_ngrid, 0.0);
+  dist_density_fft.assign(dist_nfft_both, 0.0);
+  dist_work1.assign(2 * static_cast<size_t>(dist_nfft_both), 0.0);
+  dist_work2.assign(2 * static_cast<size_t>(dist_nfft_both), 0.0);
+  dist_gc_buf1.assign(dist_ngc_buf1, 0.0);
+  dist_gc_buf2.assign(dist_ngc_buf2, 0.0);
+
+  int tmp = 0;
+  dist_fft1 = new FFT3d(lmp, world, mesh_nx, mesh_ny, mesh_nz,
+                        dist_nxlo_fft, dist_nxhi_fft,
+                        dist_nylo_fft, dist_nyhi_fft,
+                        dist_nzlo_fft, dist_nzhi_fft,
+                        dist_nxlo_fft, dist_nxhi_fft,
+                        dist_nylo_fft, dist_nyhi_fft,
+                        dist_nzlo_fft, dist_nzhi_fft,
+                        0, 0, &tmp, collective_flag, 0);
+  dist_fft2 = new FFT3d(lmp, world, mesh_nx, mesh_ny, mesh_nz,
+                        dist_nxlo_fft, dist_nxhi_fft,
+                        dist_nylo_fft, dist_nyhi_fft,
+                        dist_nzlo_fft, dist_nzhi_fft,
+                        dist_nxlo_in, dist_nxhi_in,
+                        dist_nylo_in, dist_nyhi_in,
+                        dist_nzlo_in, dist_nzhi_in,
+                        0, 0, &tmp, collective_flag, 0);
+  dist_remap = new Remap(lmp, world,
+                         dist_nxlo_in, dist_nxhi_in,
+                         dist_nylo_in, dist_nyhi_in,
+                         dist_nzlo_in, dist_nzhi_in,
+                         dist_nxlo_fft, dist_nxhi_fft,
+                         dist_nylo_fft, dist_nyhi_fft,
+                         dist_nzlo_fft, dist_nzhi_fft,
+                         1, 0, 0, FFT_PRECISION, collective_flag, 0);
+  dist_ready = true;
+
+  if (comm->me == 0)
+    utils::logmesg(lmp, fmt::format(
+        "  SOG distributed mesh: {}x{}x{}, {} MPI pencils, CUDA local spread/gather\n",
+        mesh_nx, mesh_ny, mesh_nz, comm->nprocs));
+}
+
+void SOGKSpace::pack_forward_grid(int, void *vbuf, int nlist, int *list) {
+  auto *buf = static_cast<FFT_SCALAR *>(vbuf);
+  for (int i = 0; i < nlist; ++i) buf[i] = dist_u_brick[list[i]];
+}
+
+void SOGKSpace::unpack_forward_grid(int, void *vbuf, int nlist, int *list) {
+  auto *buf = static_cast<FFT_SCALAR *>(vbuf);
+  for (int i = 0; i < nlist; ++i) dist_u_brick[list[i]] = buf[i];
+}
+
+void SOGKSpace::pack_reverse_grid(int, void *vbuf, int nlist, int *list) {
+  auto *buf = static_cast<FFT_SCALAR *>(vbuf);
+  for (int i = 0; i < nlist; ++i) buf[i] = dist_rho_brick[list[i]];
+}
+
+void SOGKSpace::unpack_reverse_grid(int, void *vbuf, int nlist, int *list) {
+  auto *buf = static_cast<FFT_SCALAR *>(vbuf);
+  for (int i = 0; i < nlist; ++i) dist_rho_brick[list[i]] += buf[i];
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -1659,20 +1846,195 @@ void SOGKSpace::compute(int eflag, int vflag) {
 // compute — per-step force/energy/virial
 // ──────────────────────────────────────────────────────────────────────
 
+void SOGKSpace::compute_distributed(int eflag, int vflag) {
+  ensure_distributed_plan();
+
+  const int nlocal = atom->nlocal;
+  double **x = atom->x;
+  double *q = atom->q;
+  const double volume = mesh_lx * mesh_ly * mesh_lz;
+  const double rho_scale = static_cast<double>(mesh_nx) * mesh_ny * mesh_nz / volume;
+  const double qscale = force->qqrd2e * scale;
+  const bool want_energy = (eflag & ENERGY_GLOBAL);
+  const bool want_virial = (vflag & (VIRIAL_PAIR | VIRIAL_FDOTR));
+
+  double q2_local = 0.0;
+  for (int i = 0; i < nlocal; ++i) q2_local += q[i] * q[i];
+  double q2_all = 0.0;
+  MPI_Allreduce(&q2_local, &q2_all, 1, MPI_DOUBLE, MPI_SUM, world);
+
+  std::vector<double> xx(3 * static_cast<size_t>(nlocal));
+  for (int i = 0; i < nlocal; ++i) {
+    xx[3*i] = x[i][0]; xx[3*i+1] = x[i][1]; xx[3*i+2] = x[i][2];
+  }
+  if (!gpu_) gpu_ = sog_gpu_create();
+  const int spl = is_quads ? (100 + spline_type) : spline_type;
+  const double boxlo[3] = {domain->boxlo[0], domain->boxlo[1], domain->boxlo[2]};
+  std::vector<double> rho_host(static_cast<size_t>(dist_ngrid));
+  sog_gpu_spread_brick(static_cast<SogGpuState *>(gpu_), nlocal, xx.data(), boxlo,
+                       mesh_lx, mesh_ly, mesh_lz, q, rho_scale, spl,
+                       mesh_nx, mesh_ny, mesh_nz,
+                       dist_nxlo_out, dist_nxhi_out,
+                       dist_nylo_out, dist_nyhi_out,
+                       dist_nzlo_out, dist_nzhi_out, rho_host.data());
+  for (int i = 0; i < dist_ngrid; ++i)
+    dist_rho_brick[i] = static_cast<FFT_SCALAR>(rho_host[i]);
+
+  // Add ghost contributions into the owning brick, then remap bricks to FFT pencils.
+  dist_gc->reverse_comm(Grid3d::KSPACE, this, 0, 1, sizeof(FFT_SCALAR),
+                        dist_gc_buf1.data(), dist_gc_buf2.data(), MPI_FFT_SCALAR);
+  int n = 0;
+  for (int iz = dist_nzlo_in; iz <= dist_nzhi_in; ++iz)
+    for (int iy = dist_nylo_in; iy <= dist_nyhi_in; ++iy)
+      for (int ix = dist_nxlo_in; ix <= dist_nxhi_in; ++ix)
+        dist_density_fft[n++] = dist_rho_brick[dist_brick_index(ix, iy, iz)];
+  dist_remap->perform(dist_density_fft.data(), dist_density_fft.data(), dist_work1.data());
+
+  for (int i = 0; i < dist_nfft; ++i) {
+    dist_work1[2*i] = dist_density_fft[i];
+    dist_work1[2*i+1] = 0.0;
+  }
+  dist_fft1->compute(dist_work1.data(), dist_work1.data(), FFT3d::FORWARD);
+
+  const double scaleinv = 1.0 / (static_cast<double>(mesh_nx) * mesh_ny * mesh_nz);
+  const double s2 = scaleinv * scaleinv;
+  const double dkx = MY_2PI / mesh_lx, dky = MY_2PI / mesh_ly, dkz = MY_2PI / mesh_lz;
+  double accum_local[14] = {0.0}; // energy, diag, fv[6], self-virial[6]
+  n = 0;
+  for (int iz = dist_nzlo_fft; iz <= dist_nzhi_fft; ++iz) {
+    const int kzm = iz - mesh_nz * (2 * iz / mesh_nz);
+    const double kz = dkz * kzm;
+    for (int iy = dist_nylo_fft; iy <= dist_nyhi_fft; ++iy) {
+      const int kym = iy - mesh_ny * (2 * iy / mesh_ny);
+      const double ky = dky * kym;
+      for (int ix = dist_nxlo_fft; ix <= dist_nxhi_fft; ++ix) {
+        const int kxm = ix - mesh_nx * (2 * ix / mesh_nx);
+        const double kx = dkx * kxm;
+        const size_t gi = mesh_index(ix, iy, iz);
+        const double ge = mesh_green_energy[gi];
+        const double gf = mesh_green_force[gi];
+        const double rr = dist_work1[n], ri = dist_work1[n+1];
+        const bool active = !(ge == 0.0 && gf == 0.0);
+        if (active) {
+          const double rho2 = rr*rr + ri*ri;
+          accum_local[1] += mesh_green_self[gi];
+          if (want_energy) accum_local[0] += s2 * ge * rho2;
+          if (want_virial) {
+            const double gv = mesh_green_virial[gi];
+            const double p = s2 * rho2;
+            accum_local[2] += p * (ge - gv*kx*kx);
+            accum_local[3] += p * (ge - gv*ky*ky);
+            accum_local[4] += p * (ge - gv*kz*kz);
+            accum_local[5] += p * (-gv*kx*ky);
+            accum_local[6] += p * (-gv*kx*kz);
+            accum_local[7] += p * (-gv*ky*kz);
+            const double gsv = mesh_green_self_virial[gi];
+            accum_local[8]  += gsv*kx*kx;
+            accum_local[9]  += gsv*ky*ky;
+            accum_local[10] += gsv*kz*kz;
+            accum_local[11] += gsv*kx*ky;
+            accum_local[12] += gsv*kx*kz;
+            accum_local[13] += gsv*ky*kz;
+          }
+        }
+        // The AD force and charge response both use the energy potential.
+        dist_work2[n] = static_cast<FFT_SCALAR>(scaleinv * ge * rr);
+        dist_work2[n+1] = static_cast<FFT_SCALAR>(scaleinv * ge * ri);
+        n += 2;
+      }
+    }
+  }
+
+  double accum[14] = {0.0};
+  MPI_Allreduce(accum_local, accum, 14, MPI_DOUBLE, MPI_SUM, world);
+  dist_fft2->compute(dist_work2.data(), dist_work2.data(), FFT3d::BACKWARD);
+  std::fill(dist_u_brick.begin(), dist_u_brick.end(), 0.0);
+  n = 0;
+  for (int iz = dist_nzlo_in; iz <= dist_nzhi_in; ++iz)
+    for (int iy = dist_nylo_in; iy <= dist_nyhi_in; ++iy)
+      for (int ix = dist_nxlo_in; ix <= dist_nxhi_in; ++ix) {
+        dist_u_brick[dist_brick_index(ix, iy, iz)] = dist_work2[n];
+        n += 2;
+      }
+  dist_gc->forward_comm(Grid3d::KSPACE, this, 0, 1, sizeof(FFT_SCALAR),
+                        dist_gc_buf1.data(), dist_gc_buf2.data(), MPI_FFT_SCALAR);
+
+  std::vector<double> u_host(static_cast<size_t>(dist_ngrid));
+  for (int i = 0; i < dist_ngrid; ++i) u_host[i] = dist_u_brick[i];
+  std::vector<double> f_local(3 * static_cast<size_t>(nlocal));
+  std::vector<double> vp_local(static_cast<size_t>(nlocal));
+  sog_gpu_gather_brick(static_cast<SogGpuState *>(gpu_), nlocal, xx.data(), boxlo,
+                       mesh_lx, mesh_ly, mesh_lz, q, qscale, spl,
+                       mesh_nx, mesh_ny, mesh_nz,
+                       dist_nxlo_out, dist_nxhi_out,
+                       dist_nylo_out, dist_nyhi_out,
+                       dist_nzlo_out, dist_nzhi_out, u_host.data(),
+                       f_local.data(), vp_local.data());
+  const double rsi = remove_self_interaction ? accum[1] / volume : 0.0;
+  vpot.assign(nlocal, 0.0);
+  for (int i = 0; i < nlocal; ++i) {
+    atom->f[i][0] += f_local[3*i];
+    atom->f[i][1] += f_local[3*i+1];
+    atom->f[i][2] += f_local[3*i+2];
+    vpot[i] = vp_local[i] - qscale*q[i]*(rsi + 2.0*self_coeff);
+  }
+
+  energy = 0.0;
+  if (want_energy) {
+    energy = 0.5 * volume * accum[0];
+    if (remove_self_interaction) energy -= q2_all * accum[1] / (2.0*volume);
+    energy -= self_coeff * q2_all;
+    energy *= qscale;
+  }
+  for (int j = 0; j < 6; ++j) virial[j] = 0.0;
+  if (want_virial) {
+    for (int j = 0; j < 6; ++j) virial[j] = 0.5 * volume * qscale * accum[2+j];
+    if (remove_self_interaction) {
+      const double pref = qscale * q2_all / (2.0*volume);
+      virial[0] += pref * (accum[8] - accum[1]);
+      virial[1] += pref * (accum[9] - accum[1]);
+      virial[2] += pref * (accum[10] - accum[1]);
+      virial[3] += pref * accum[11];
+      virial[4] += pref * accum[12];
+      virial[5] += pref * accum[13];
+    }
+  }
+}
+
 void SOGKSpace::compute_single(int eflag, int vflag) {
   ev_init(eflag, vflag, 0);
 
   // ── GPU path (plugin-internal raw CUDA + cuFFT) ──
   // ── local variables used by both CPU and GPU paths ──
   int nlocal = atom->nlocal;
-  if (nlocal <= 0) return;
+  // A rank may temporarily own no atoms.  It must still participate in the
+  // mesh collectives; returning on nlocal==0 would deadlock an MPI run.
+  if (atom->natoms <= 0) return;
   double **x = atom->x, *q = atom->q;
+  // The adjoint force needs the real-space potential irrespective of whether
+  // the caller also consumes per-atom charge-response potentials.
+  want_potential = true;
+
+  if (enable_gpu && gpu_mpi_mode == 2 && comm->nprocs > 1) {
+    ensure_fft_plan();
+    compute_distributed(eflag, vflag);
+    return;
+  }
 
   // ── GPU path (plugin-internal raw CUDA + cuFFT) ──
   if (enable_gpu) {
     ensure_fft_plan();                 // sizes grid + (re)creates plan/green tables on box/grid change
-    auto g = (SogGpuState *)gpu_;
-    if (!g) { g = sog_gpu_create(); gpu_ = g; }
+    const bool root_only = (gpu_mpi_mode == 1 && comm->nprocs > 1);
+    const bool gpu_active = (!root_only || comm->me == 0);
+    auto g = gpu_active ? static_cast<SogGpuState *>(gpu_) : nullptr;
+    if (gpu_active && !g) {
+      g = sog_gpu_create();
+      gpu_ = g;
+      sog_gpu_setup(g, mesh_nx, mesh_ny, mesh_nz,
+                    mesh_green_energy.data(), mesh_green_force.data(),
+                    mesh_green_self.data(), mesh_green_virial.data(),
+                    mesh_green_self_virial.data());
+    }
     int spl = is_quads ? (100 + spline_type) : spline_type;  // SOG_QUADS_4=104 / _6=106
     double qscale = force->qqrd2e * scale;
     double boxlo[3] = {domain->boxlo[0], domain->boxlo[1], domain->boxlo[2]};
@@ -1687,19 +2049,99 @@ void SOGKSpace::compute_single(int eflag, int vflag) {
     if (want_potential) vpot.assign(nlocal, 0.0);
     double qsqsum_gpu = 0.0;
     for (int i = 0; i < nlocal; ++i) qsqsum_gpu += q[i] * q[i];
-    // (single-rank isolated kspace; MPI-reduce qsqsum when this path goes multi-rank)
-    std::vector<double> vv(6), fk(3 * nlocal);
-    energy = sog_gpu_compute(g, nlocal, xx.data(), boxlo, lx, ly, lz, q, qscale,
-                             spl, want_potential ? 1 : 0, fk.data(), vv.data(),
-                             want_potential ? vpot.data() : nullptr,
-                             self_coeff, qsqsum_gpu, remove_self_interaction ? 1 : 0);
-    for (int i = 0; i < nlocal; ++i) {   // ADD kspace force to atom->f (pair already wrote its part)
-      fx[i][0] += fk[i * 3 + 0];
-      fx[i][1] += fk[i * 3 + 1];
-      fx[i][2] += fk[i * 3 + 2];
+
+    int gpu_natoms = nlocal;
+    int local_offset = 0;
+    const double *gpu_x = xx.data();
+    const double *gpu_q = q;
+    std::vector<int> atom_counts, atom_displs, xyz_counts, xyz_displs;
+    std::vector<double> xx_global, q_global;
+    if (comm->nprocs > 1) {
+      atom_counts.resize(comm->nprocs);
+      atom_displs.resize(comm->nprocs);
+      xyz_counts.resize(comm->nprocs);
+      xyz_displs.resize(comm->nprocs);
+      MPI_Allgather(&nlocal, 1, MPI_INT, atom_counts.data(), 1, MPI_INT, world);
+      gpu_natoms = 0;
+      for (int r = 0; r < comm->nprocs; ++r) {
+        atom_displs[r] = gpu_natoms;
+        xyz_displs[r] = 3 * gpu_natoms;
+        xyz_counts[r] = 3 * atom_counts[r];
+        gpu_natoms += atom_counts[r];
+      }
+      local_offset = atom_displs[comm->me];
+      if (!root_only || comm->me == 0) {
+        xx_global.resize(3 * static_cast<size_t>(gpu_natoms));
+        q_global.resize(static_cast<size_t>(gpu_natoms));
+      }
+      if (root_only) {
+        MPI_Gatherv(xx.data(), 3 * nlocal, MPI_DOUBLE,
+                    comm->me == 0 ? xx_global.data() : nullptr,
+                    xyz_counts.data(), xyz_displs.data(), MPI_DOUBLE, 0, world);
+        MPI_Gatherv(q, nlocal, MPI_DOUBLE,
+                    comm->me == 0 ? q_global.data() : nullptr,
+                    atom_counts.data(), atom_displs.data(), MPI_DOUBLE, 0, world);
+      } else {
+        MPI_Allgatherv(xx.data(), 3 * nlocal, MPI_DOUBLE, xx_global.data(),
+                       xyz_counts.data(), xyz_displs.data(), MPI_DOUBLE, world);
+        MPI_Allgatherv(q, nlocal, MPI_DOUBLE, q_global.data(), atom_counts.data(),
+                       atom_displs.data(), MPI_DOUBLE, world);
+      }
+      if (!root_only || comm->me == 0) {
+        gpu_x = xx_global.data();
+        gpu_q = q_global.data();
+      }
+      double qsqsum_all = 0.0;
+      MPI_Allreduce(&qsqsum_gpu, &qsqsum_all, 1, MPI_DOUBLE, MPI_SUM, world);
+      qsqsum_gpu = qsqsum_all;
+      static bool mpi_notice_printed = false;
+      if (comm->me == 0 && !mpi_notice_printed) {
+        utils::logmesg(lmp, fmt::format(
+            "  SOG GPU MPI: {} ranks, {} backend, {} global atoms\n",
+            comm->nprocs, root_only ? "root-only single k-space solve" : "replicated global mesh",
+            gpu_natoms));
+        mpi_notice_printed = true;
+      }
+    }
+
+    std::vector<double> vv(6, 0.0);
+    std::vector<double> fk;
+    std::vector<double> vpot_gpu;
+    if (gpu_active) {
+      fk.resize(3 * static_cast<size_t>(gpu_natoms));
+      vpot_gpu.assign(static_cast<size_t>(gpu_natoms), 0.0);
+      energy = sog_gpu_compute(g, gpu_natoms, gpu_x, boxlo, lx, ly, lz, gpu_q, qscale,
+                               spl, 1, fk.data(), vv.data(), vpot_gpu.data(),
+                               self_coeff, qsqsum_gpu, remove_self_interaction ? 1 : 0);
+    }
+
+    if (root_only) {
+      MPI_Bcast(&energy, 1, MPI_DOUBLE, 0, world);
+      MPI_Bcast(vv.data(), 6, MPI_DOUBLE, 0, world);
+      std::vector<double> fk_local(3 * static_cast<size_t>(nlocal));
+      std::vector<double> vpot_local(static_cast<size_t>(nlocal));
+      MPI_Scatterv(comm->me == 0 ? fk.data() : nullptr,
+                   xyz_counts.data(), xyz_displs.data(), MPI_DOUBLE,
+                   fk_local.data(), 3 * nlocal, MPI_DOUBLE, 0, world);
+      MPI_Scatterv(comm->me == 0 ? vpot_gpu.data() : nullptr,
+                   atom_counts.data(), atom_displs.data(), MPI_DOUBLE,
+                   vpot_local.data(), nlocal, MPI_DOUBLE, 0, world);
+      for (int i = 0; i < nlocal; ++i) {
+        fx[i][0] += fk_local[3 * i + 0];
+        fx[i][1] += fk_local[3 * i + 1];
+        fx[i][2] += fk_local[3 * i + 2];
+        vpot[i] = vpot_local[i];
+      }
+    } else {
+      for (int i = 0; i < nlocal; ++i) {
+        const int gi = local_offset + i;
+        fx[i][0] += fk[3 * gi + 0];
+        fx[i][1] += fk[3 * gi + 1];
+        fx[i][2] += fk[3 * gi + 2];
+        vpot[i] = vpot_gpu[gi];
+      }
     }
     for (int j = 0; j < 6; ++j) virial[j] = vv[j];
-    // k=0: zero for neutral Q=0. GPU already handles diag_sum + W_self_strain.
     return;
   }
 
@@ -1744,6 +2186,14 @@ void SOGKSpace::compute_single(int eflag, int vflag) {
   // TEMP validation hook: SOG_DUMP_POT=1 forces v_i computation + one-time dump,
   // so v_i = ∂E_k/∂q_i can be finite-difference validated before the fix exists.
   if (!want_potential && getenv("SOG_DUMP_POT")) want_potential = true;
+  // The production particle-mesh force is the exact derivative of the
+  // discrete mesh energy.  This requires the real-space potential and the
+  // coordinate derivatives of the spreading weights (PPPM ``ad`` form).
+  // Keep the potential path enabled even when charge-response output is not
+  // requested; otherwise the force would silently fall back to non-variational
+  // Fourier ``ik`` differentiation.
+  // The variational AD force differentiates the discrete mesh energy and needs
+  // the real-space mesh potential even when charge-response feedback is off.
 
   energy = 0.0;
   for (int j = 0; j < 6; ++j) virial[j] = 0.0;
@@ -1992,15 +2442,16 @@ void SOGKSpace::compute_single(int eflag, int vflag) {
           sv_local[5] += gsv * ky * kz;
         }
 
-        const double vk_re = scaleinv * geff * rho_re;
-        const double vk_im = scaleinv * geff * rho_im;
-
-        mesh_gradx[2 * idx] = static_cast<FFT_SCALAR>(-kx * vk_im);
-        mesh_gradx[2 * idx + 1] = static_cast<FFT_SCALAR>(kx * vk_re);
-        mesh_grady[2 * idx] = static_cast<FFT_SCALAR>(-ky * vk_im);
-        mesh_grady[2 * idx + 1] = static_cast<FFT_SCALAR>(ky * vk_re);
-        mesh_gradz[2 * idx] = static_cast<FFT_SCALAR>(-kz * vk_im);
-        mesh_gradz[2 * idx + 1] = static_cast<FFT_SCALAR>(kz * vk_re);
+        if (spline_type < 4) {
+          const double vk_re = scaleinv * geff * rho_re;
+          const double vk_im = scaleinv * geff * rho_im;
+          mesh_gradx[2 * idx] = static_cast<FFT_SCALAR>(-kx * vk_im);
+          mesh_gradx[2 * idx + 1] = static_cast<FFT_SCALAR>(kx * vk_re);
+          mesh_grady[2 * idx] = static_cast<FFT_SCALAR>(-ky * vk_im);
+          mesh_grady[2 * idx + 1] = static_cast<FFT_SCALAR>(ky * vk_re);
+          mesh_gradz[2 * idx] = static_cast<FFT_SCALAR>(-kz * vk_im);
+          mesh_gradz[2 * idx + 1] = static_cast<FFT_SCALAR>(kz * vk_re);
+        }
 
         // ── Potential mesh u(k) = scaleinv·geff_energy·ρ(k) (no ik factor) ──
         // v_i = ∂E_k/∂q_i is the potential at atom i: gather this mesh with the same
@@ -2013,11 +2464,13 @@ void SOGKSpace::compute_single(int eflag, int vflag) {
     }
   }
 
-  // ── FFT backward (3 gradients) ──
-  mesh_fft->compute(mesh_gradx.data(), mesh_gradx.data(), FFT3d::BACKWARD);
-  mesh_fft->compute(mesh_grady.data(), mesh_grady.data(), FFT3d::BACKWARD);
-  mesh_fft->compute(mesh_gradz.data(), mesh_gradz.data(), FFT3d::BACKWARD);
-  // 4th inverse FFT: real-space mesh potential u_j (for v_i = ∂E_k/∂q_i)
+  // The adjoint CubeS2/QuadS force needs one inverse FFT of the mesh
+  // potential. The legacy B-spline control retains its three ik gradients.
+  if (spline_type < 4) {
+    mesh_fft->compute(mesh_gradx.data(), mesh_gradx.data(), FFT3d::BACKWARD);
+    mesh_fft->compute(mesh_grady.data(), mesh_grady.data(), FFT3d::BACKWARD);
+    mesh_fft->compute(mesh_gradz.data(), mesh_gradz.data(), FFT3d::BACKWARD);
+  }
   if (want_potential) {
     mesh_fft->compute(mesh_pot.data(), mesh_pot.data(), FFT3d::BACKWARD);
   }
@@ -2055,11 +2508,11 @@ void SOGKSpace::compute_single(int eflag, int vflag) {
       const double tx = fx - static_cast<double>(ix0);
       const double ty = fy - static_cast<double>(iy0);
       const double tz = fz - static_cast<double>(iz0);
-      double gx = 0.0, gy = 0.0, gz = 0.0, gpot = 0.0;
-      double wx[6], wy[6], wz[6];
-      quads_weights_1d(tx, xi, spline_type, wx);
-      quads_weights_1d(ty, xi, spline_type, wy);
-      quads_weights_1d(tz, xi, spline_type, wz);
+      double dtx = 0.0, dty = 0.0, dtz = 0.0, gpot = 0.0;
+      double wx[6], wy[6], wz[6], dwx[6], dwy[6], dwz[6];
+      quads_weights_derivs_1d(tx, xi, spline_type, wx, dwx);
+      quads_weights_derivs_1d(ty, xi, spline_type, wy, dwy);
+      quads_weights_derivs_1d(tz, xi, spline_type, wz, dwz);
       for (int a = 0; a < n1d; ++a) {
         const int igx = wrap_index(ix0 + offs[a], mesh_nx);
         for (int b = 0; b < n1d; ++b) {
@@ -2069,17 +2522,18 @@ void SOGKSpace::compute_single(int eflag, int vflag) {
             const int igz = wrap_index(iz0 + offs[c], mesh_nz);
             const size_t idx = mesh_index(igx, igy, igz);
             const double w = wxy * wz[c];
-            gx += w * static_cast<double>(mesh_gradx[2 * idx]);
-            gy += w * static_cast<double>(mesh_grady[2 * idx]);
-            gz += w * static_cast<double>(mesh_gradz[2 * idx]);
-            if (want_potential) gpot += w * static_cast<double>(mesh_pot[2 * idx]);
+            const double u = static_cast<double>(mesh_pot[2 * idx]);
+            dtx += dwx[a] * wy[b] * wz[c] * u;
+            dty += wx[a] * dwy[b] * wz[c] * u;
+            dtz += wx[a] * wy[b] * dwz[c] * u;
+            gpot += w * u;
           }
         }
       }
       const double qi = q[i];
-      const double fxs_q = -qscale * qi * gx;
-      const double fys_q = -qscale * qi * gy;
-      const double fzs_q = -qscale * qi * gz;
+      const double fxs_q = -qscale * qi * dtx * mesh_nx / mesh_lx;
+      const double fys_q = -qscale * qi * dty * mesh_ny / mesh_ly;
+      const double fzs_q = -qscale * qi * dtz * mesh_nz / mesh_lz;
       atom->f[i][0] += fxs_q;
       atom->f[i][1] += fys_q;
       atom->f[i][2] += fzs_q;
@@ -2106,43 +2560,43 @@ void SOGKSpace::compute_single(int eflag, int vflag) {
       const double ty = fy - static_cast<double>(iy0);
       const double tz = fz - static_cast<double>(iz0);
 
-      double gx = 0.0, gy = 0.0, gz = 0.0;
+      double dtx = 0.0, dty = 0.0, dtz = 0.0;
       double gpot = 0.0;
 
       if (spline_type == 4) {
         for (int k = 0; k < kCubes2NumNodes4; ++k) {
           const auto &node = kCubes2Nodes4[k];
-          const double w = cubes2_weight_4(tx, ty, tz, node, xi);
+          const auto wg = cubes2_weight_grad_4(tx, ty, tz, node, xi);
+          const double w = wg.value;
           if (w == 0.0) continue;
           const int igx = wrap_index(ix0 + node.dx, mesh_nx);
           const int igy = wrap_index(iy0 + node.dy, mesh_ny);
           const int igz = wrap_index(iz0 + node.dz, mesh_nz);
           const size_t idx = mesh_index(igx, igy, igz);
-          gx += w * static_cast<double>(mesh_gradx[2 * idx]);
-          gy += w * static_cast<double>(mesh_grady[2 * idx]);
-          gz += w * static_cast<double>(mesh_gradz[2 * idx]);
-          if (want_potential) gpot += w * static_cast<double>(mesh_pot[2 * idx]);
+          const double u = static_cast<double>(mesh_pot[2 * idx]);
+          dtx += wg.d[0] * u; dty += wg.d[1] * u; dtz += wg.d[2] * u;
+          gpot += w * u;
         }
       } else {  // spline_type == 6 (88-node CubeS₂)
         for (int k = 0; k < kCubes2NumNodes6; ++k) {
           const auto &node = kCubes2Nodes6[k];
-          const double w = cubes2_weight_6(tx, ty, tz, node, xi);
+          const auto wg = cubes2_weight_grad_6(tx, ty, tz, node, xi);
+          const double w = wg.value;
           if (w == 0.0) continue;
           const int igx = wrap_index(ix0 + node.dx, mesh_nx);
           const int igy = wrap_index(iy0 + node.dy, mesh_ny);
           const int igz = wrap_index(iz0 + node.dz, mesh_nz);
           const size_t idx = mesh_index(igx, igy, igz);
-          gx += w * static_cast<double>(mesh_gradx[2 * idx]);
-          gy += w * static_cast<double>(mesh_grady[2 * idx]);
-          gz += w * static_cast<double>(mesh_gradz[2 * idx]);
-          if (want_potential) gpot += w * static_cast<double>(mesh_pot[2 * idx]);
+          const double u = static_cast<double>(mesh_pot[2 * idx]);
+          dtx += wg.d[0] * u; dty += wg.d[1] * u; dtz += wg.d[2] * u;
+          gpot += w * u;
         }
       }
 
       const double qi = q[i];
-      const double fxs = -qscale * qi * gx;
-      const double fys = -qscale * qi * gy;
-      const double fzs = -qscale * qi * gz;
+      const double fxs = -qscale * qi * dtx * mesh_nx / mesh_lx;
+      const double fys = -qscale * qi * dty * mesh_ny / mesh_ly;
+      const double fzs = -qscale * qi * dtz * mesh_nz / mesh_lz;
 
       atom->f[i][0] += fxs;
       atom->f[i][1] += fys;

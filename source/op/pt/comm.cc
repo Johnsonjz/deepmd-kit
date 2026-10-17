@@ -77,6 +77,10 @@ class Border : public torch::autograd::Function<Border> {
     int* recvnum = recvnum_tensor.data_ptr<int>();
     int tensor_size = g1.size(1);
     int nswap = sendproc_tensor.size(0);
+    int* firstrecv =
+        (recvnum_tensor.dim() == 2 && recvnum_tensor.size(0) >= 2)
+            ? recvnum + nswap
+            : nullptr;
 
     int nlocal = nlocal_tensor.item<int>();
     int nghost = nghost_tensor.item<int>();
@@ -109,12 +113,15 @@ class Border : public torch::autograd::Function<Border> {
     }
 #endif
 #endif
-    FPTYPE* recv_g1 = recv_g1_tensor.data_ptr<FPTYPE>() + nlocal * tensor_size;
-    int recv_offset = nlocal;
+    FPTYPE* recv_base = recv_g1_tensor.data_ptr<FPTYPE>();
+    int cumulative_recv_offset = nlocal;
     auto int32_options = torch::TensorOptions().dtype(torch::kInt32);
     for (int iswap = 0; iswap < nswap; ++iswap) {
       int nrecv = recvnum[iswap];
       int nsend = sendnum[iswap];
+      const int recv_offset = firstrecv ? firstrecv[iswap]
+                                        : cumulative_recv_offset;
+      FPTYPE* recv_g1 = recv_base + recv_offset * tensor_size;
       torch::Tensor isendlist;
       torch::Tensor send_g1_tensor;
       FPTYPE* send_g1;
@@ -147,8 +154,7 @@ class Border : public torch::autograd::Function<Border> {
 #ifdef USE_MPI
       }
 #endif
-      recv_offset += nrecv;
-      recv_g1 += nrecv * tensor_size;
+      cumulative_recv_offset += nrecv;
     }
 #ifdef USE_MPI
 #if defined(GOOGLE_CUDA) || defined(TENSORFLOW_USE_ROCM)
@@ -216,10 +222,14 @@ class Border : public torch::autograd::Function<Border> {
     int* sendproc = recvproc_tensor.data_ptr<int>();
     int* recvnum = sendnum_tensor.data_ptr<int>();
     int* sendnum = recvnum_tensor.data_ptr<int>();
+    int nswap = sendproc_tensor.size(0);
+    int* firstrecv =
+        (recvnum_tensor.dim() == 2 && recvnum_tensor.size(0) >= 2)
+            ? sendnum + nswap
+            : nullptr;
 
     FPTYPE* local_g1 = d_local_g1_tensor.data_ptr<FPTYPE>();
     int tensor_size = d_local_g1_tensor.size(1);
-    int nswap = sendproc_tensor.size(0);
 
     int nlocal = nlocal_tensor.item<int>();
     int nghost = nghost_tensor.item<int>();
@@ -236,10 +246,10 @@ class Border : public torch::autograd::Function<Border> {
                          .device(d_local_g1_tensor.device());
       recv_g1_tensor = torch::empty({max_recvnum, tensor_size}, options);
       recv_g1 = recv_g1_tensor.data_ptr<FPTYPE>();
-      send_g1 = send_g1_tensor.data_ptr<FPTYPE>() + ntotal * tensor_size;
+      send_g1 = send_g1_tensor.data_ptr<FPTYPE>();
     }
 
-    int end = ntotal;
+    int cumulative_send_end = ntotal;
     auto int32_options = torch::TensorOptions().dtype(torch::kInt32);
     for (int iswap = nswap - 1; iswap >= 0; --iswap) {
       int nrecv = recvnum[iswap];
@@ -251,8 +261,11 @@ class Border : public torch::autograd::Function<Border> {
                         .to(d_local_g1_tensor.device());
       }
       if (nsend) {
-        send_g1 -= nsend * tensor_size;
+        const int send_offset = firstrecv ? firstrecv[iswap]
+                                          : (cumulative_send_end - nsend);
+        send_g1 = send_g1_tensor.data_ptr<FPTYPE>() + send_offset * tensor_size;
       }
+      cumulative_send_end -= nsend;
 #ifdef USE_MPI
       if (sendproc[iswap] != me) {
         if (nrecv) {

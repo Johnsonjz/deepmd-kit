@@ -34,6 +34,8 @@ KSpaceStyle(sog, SOGKSpace)
 namespace LAMMPS_NS {
 
 class FFT3d;
+class Grid3d;
+class Remap;
 
 class SOGKSpace : public KSpace {
  public:
@@ -46,6 +48,12 @@ class SOGKSpace : public KSpace {
   void compute(int eflag, int vflag) override;
   void compute_single(int eflag, int vflag);
   double memory_usage() override;
+
+  // Grid3d callbacks for the PPPM-style distributed real-space brick.
+  void pack_forward_grid(int, void *, int, int *) override;
+  void unpack_forward_grid(int, void *, int, int *) override;
+  void pack_reverse_grid(int, void *, int, int *) override;
+  void unpack_reverse_grid(int, void *, int, int *) override;
 
   // Per-atom electrostatic potential v_i = ∂E_k/∂q_i (filled in compute_single when
   // want_potential is set). Consumed by the charge-response fix to feed the model's
@@ -72,6 +80,11 @@ class SOGKSpace : public KSpace {
   double phi_max_user;   // user-specified φ_max override (>0 means active, −1 = auto)
   double phi_accuracy_user;  // target rel-accuracy ε for the φ_max general method (−1 = default)
   bool enable_gpu = false;   // route compute_single to sog_gpu.cu (raw CUDA + cuFFT)
+  // MPI execution policy for the monolithic cuFFT backend:
+  //   0 = replicated (legacy correctness path: every rank solves the global mesh)
+  //   1 = root (rank 0 solves once, then scatters local force/potential slices)
+  //   2 = distributed (local CUDA spread/gather + Grid3d/Remap/FFT3d pencils)
+  int gpu_mpi_mode = 0;
   void *gpu_ = nullptr;      // opaque SogGpuState* (global-ns; sog_gpu.cuh is C)
 
   // ── Computed from SOG params + cutoff ──
@@ -119,6 +132,32 @@ class SOGKSpace : public KSpace {
   std::vector<double> cubes2_influence_im;  // Im[Φ(k)]
   std::vector<double> cubes2_influence_sq;  // |Φ(k)|²
 
+  // ── PPPM-style distributed brick/pencil backend ──
+  bool dist_ready = false;
+  double dist_lx = 0.0, dist_ly = 0.0, dist_lz = 0.0;
+  int dist_nxlo_in = 0, dist_nxhi_in = -1;
+  int dist_nylo_in = 0, dist_nyhi_in = -1;
+  int dist_nzlo_in = 0, dist_nzhi_in = -1;
+  int dist_nxlo_out = 0, dist_nxhi_out = -1;
+  int dist_nylo_out = 0, dist_nyhi_out = -1;
+  int dist_nzlo_out = 0, dist_nzhi_out = -1;
+  int dist_nxlo_fft = 0, dist_nxhi_fft = -1;
+  int dist_nylo_fft = 0, dist_nyhi_fft = -1;
+  int dist_nzlo_fft = 0, dist_nzhi_fft = -1;
+  int dist_ngrid = 0, dist_nfft_brick = 0, dist_nfft = 0, dist_nfft_both = 0;
+  int dist_ngc_buf1 = 0, dist_ngc_buf2 = 0;
+  Grid3d *dist_gc = nullptr;
+  Remap *dist_remap = nullptr;
+  FFT3d *dist_fft1 = nullptr;
+  FFT3d *dist_fft2 = nullptr;
+  std::vector<FFT_SCALAR> dist_rho_brick;
+  std::vector<FFT_SCALAR> dist_u_brick;
+  std::vector<FFT_SCALAR> dist_density_fft;
+  std::vector<FFT_SCALAR> dist_work1;
+  std::vector<FFT_SCALAR> dist_work2;
+  std::vector<FFT_SCALAR> dist_gc_buf1;
+  std::vector<FFT_SCALAR> dist_gc_buf2;
+
   // ── Direct k-space mode (exact reference, no mesh/FFT) ──
   bool use_direct = false;                  // gate: route compute_single to compute_direct
   double direct_kmax = -1.0;                // k_max in Å⁻¹ for direct k-vector sphere
@@ -139,6 +178,11 @@ class SOGKSpace : public KSpace {
   double spectral_kernel_virial(double ksq) const;
   void ensure_fft_plan();
   void destroy_fft_plan();
+  void ensure_distributed_plan();
+  void destroy_distributed_plan();
+  void compute_distributed(int eflag, int vflag);
+  size_t dist_brick_index(int ix, int iy, int iz) const;
+  int dist_local_index(int i, int n, int lo, int hi) const;
   void precompute_sinc_tables();
   void precompute_cubes2_influence();
   void precompute_green_functions();

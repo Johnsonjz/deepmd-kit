@@ -1,7 +1,7 @@
 #define GIT_SUMM 
-#define GIT_HASH f3bd2d40f
+#define GIT_HASH 2d0709516
 #define GIT_BRANCH sog-lmp
-#define GIT_DATE 2026-06-02 23:06:21 +0800
+#define GIT_DATE 2026-09-23 12:54:11 +0800
 #define DEEPMD_ROOT /data/home/public/jiangzhen/dp/deepmd-kit/build/sog_lmp_stable
 #define BACKEND_INCLUDE_DIRS /data/home/public/.conda/envs/mlip/lib/python3.10/site-packages/torch/include;/data/home/public/.conda/envs/mlip/lib/python3.10/site-packages/torch/include/torch/csrc/api/include
 #define BACKEND_LIBRARY_PATH /data/home/public/.conda/envs/mlip/lib/python3.10/site-packages/torch/lib

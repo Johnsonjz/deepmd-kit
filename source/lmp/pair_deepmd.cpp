@@ -219,6 +219,14 @@ void PairDeepMD::compute(int eflag, int vflag) {
 
   // int ago = numb_models > 1 ? 0 : neighbor->ago;
   int ago = neighbor->ago;
+  // Message-passing SOG models consume LAMMPS border-exchange metadata in
+  // comm_dict.  The send/receive spans can change between force evaluations
+  // even when the pair neighbor list is reused; retaining the previous
+  // comm_dict then lets border_op address beyond the current extended-atom
+  // tensor.  Rebuild the DeepMD neighbor/communication tensors every step for
+  // the latent-charge path.  The particle-mesh solver remains independently
+  // cached, so this affects only the small host-side communication metadata.
+  if (latent_charge_to_q) ago = 0;
   if (numb_models > 1) {
     if (multi_models_no_mod_devi &&
         (out_freq > 0 && update->ntimestep % out_freq == 0)) {
