@@ -174,10 +174,11 @@ class LRFittingNet(Fitting):
             all(self.trainable) if isinstance(self.trainable, list) else self.trainable
         )
         self.remove_vaccum_contribution = remove_vaccum_contribution
-        # Soft-bound on the per-type charge bias. Must exceed the largest formal
-        # charge (P^5+ = 5 in Li6PS5Cl) so bias_atom_q can be initialized to the
-        # formal charges; the LR net then learns only the response correction.
-        self.bias_atom_q_bound = 6.0
+        # `bias_atom_q` is stored and used as the RAW per-type charge bias.
+        # Do NOT tanh-compress it: the bound on the learned charge is already
+        # provided by `activation_function_lr` at the LR readout, and compressing
+        # the bias would (a) shift the configured formal charges and (b) compound
+        # on every checkpoint save/load (serialize stores the compressed value).
         # When True (default), _corr_head enforces per-frame charge neutrality.
         # Set to False when neutrality is handled downstream (e.g., SOG lib's charge_neutral).
         self._enable_corr_head = True
@@ -549,26 +550,20 @@ class LRFittingNet(Fitting):
         mean_q = lr_out.mean(dim=1, keepdim=True)
         return lr_out - mean_q
 
-    def _compress_bias_atom_q(self, bias: torch.Tensor) -> torch.Tensor:
-        # Keep lr bias numerically stable in a bounded range.
-        return self.bias_atom_q_bound * torch.tanh(bias / self.bias_atom_q_bound)
-
     def _get_bias_atom_q_table(self) -> torch.Tensor:
+        """Return the per-type charge bias as-is (raw, no tanh compression)."""
         if isinstance(self.bias_atom_q, torch.nn.Parameter):
-            return self._compress_bias_atom_q(self.bias_atom_q)
+            return self.bias_atom_q
         # `TypeEmbedNet` appends one zero-padding row; keep only real atom types.
-        bias_table = self.bias_atom_q.get_full_embedding(self.bias_atom_e.device)[
+        return self.bias_atom_q.get_full_embedding(self.bias_atom_e.device)[
             : self.ntypes
         ]
-        return self._compress_bias_atom_q(bias_table)
 
     def _get_lr_bias(self, atype: torch.Tensor) -> torch.Tensor:
         atype_long = atype.to(torch.long)
         if isinstance(self.bias_atom_q, torch.nn.Parameter):
-            return self._compress_bias_atom_q(self.bias_atom_q[atype_long].to(self.prec))
-        return self._compress_bias_atom_q(
-            self.bias_atom_q(atype_long).to(self.prec)
-        )
+            return self.bias_atom_q[atype_long].to(self.prec)
+        return self.bias_atom_q(atype_long).to(self.prec)
 
     def _extend_f_avg_std(self, xx: torch.Tensor, nb: int) -> torch.Tensor:
         return torch.tile(xx.view([1, self.numb_fparam]), [nb, 1])

@@ -1129,7 +1129,7 @@ void SOGKSpace::ensure_fft_plan() {
   mesh_fft = new FFT3d(lmp, world, mesh_nx, mesh_ny, mesh_nz, 0, mesh_nx - 1,
                         0, mesh_ny - 1, 0, mesh_nz - 1, 0, mesh_nx - 1, 0,
                         mesh_ny - 1, 0, mesh_nz - 1, 0, 0, &tmp,
-                        collective_flag, 0);
+                        collective_flag);
 
   // CubeS₂ (Form B) needs no spline-influence precompute: precompute_green_functions() builds the
   // separable variance-subtraction Green tables directly from amp/bandwidth. Only the legacy B-spline
@@ -1248,7 +1248,7 @@ void SOGKSpace::ensure_distributed_plan() {
                         dist_nxlo_fft, dist_nxhi_fft,
                         dist_nylo_fft, dist_nyhi_fft,
                         dist_nzlo_fft, dist_nzhi_fft,
-                        0, 0, &tmp, collective_flag, 0);
+                        0, 0, &tmp, collective_flag);
   dist_fft2 = new FFT3d(lmp, world, mesh_nx, mesh_ny, mesh_nz,
                         dist_nxlo_fft, dist_nxhi_fft,
                         dist_nylo_fft, dist_nyhi_fft,
@@ -1256,7 +1256,7 @@ void SOGKSpace::ensure_distributed_plan() {
                         dist_nxlo_in, dist_nxhi_in,
                         dist_nylo_in, dist_nyhi_in,
                         dist_nzlo_in, dist_nzhi_in,
-                        0, 0, &tmp, collective_flag, 0);
+                        0, 0, &tmp, collective_flag);
   dist_remap = new Remap(lmp, world,
                          dist_nxlo_in, dist_nxhi_in,
                          dist_nylo_in, dist_nyhi_in,
@@ -1264,7 +1264,7 @@ void SOGKSpace::ensure_distributed_plan() {
                          dist_nxlo_fft, dist_nxhi_fft,
                          dist_nylo_fft, dist_nyhi_fft,
                          dist_nzlo_fft, dist_nzhi_fft,
-                         1, 0, 0, FFT_PRECISION, collective_flag, 0);
+                         1, 0, 0, FFT_PRECISION, collective_flag);
   dist_ready = true;
 
   if (comm->me == 0)
@@ -1871,6 +1871,7 @@ void SOGKSpace::compute_distributed(int eflag, int vflag) {
   const int spl = is_quads ? (100 + spline_type) : spline_type;
   const double boxlo[3] = {domain->boxlo[0], domain->boxlo[1], domain->boxlo[2]};
   std::vector<double> rho_host(static_cast<size_t>(dist_ngrid));
+  const double t_spread0 = MPI_Wtime();
   sog_gpu_spread_brick(static_cast<SogGpuState *>(gpu_), nlocal, xx.data(), boxlo,
                        mesh_lx, mesh_ly, mesh_lz, q, rho_scale, spl,
                        mesh_nx, mesh_ny, mesh_nz,
@@ -1879,6 +1880,7 @@ void SOGKSpace::compute_distributed(int eflag, int vflag) {
                        dist_nzlo_out, dist_nzhi_out, rho_host.data());
   for (int i = 0; i < dist_ngrid; ++i)
     dist_rho_brick[i] = static_cast<FFT_SCALAR>(rho_host[i]);
+  const double t_spread1 = MPI_Wtime();
 
   // Add ghost contributions into the owning brick, then remap bricks to FFT pencils.
   dist_gc->reverse_comm(Grid3d::KSPACE, this, 0, 1, sizeof(FFT_SCALAR),
@@ -1889,12 +1891,14 @@ void SOGKSpace::compute_distributed(int eflag, int vflag) {
       for (int ix = dist_nxlo_in; ix <= dist_nxhi_in; ++ix)
         dist_density_fft[n++] = dist_rho_brick[dist_brick_index(ix, iy, iz)];
   dist_remap->perform(dist_density_fft.data(), dist_density_fft.data(), dist_work1.data());
+  const double t_remap1 = MPI_Wtime();
 
   for (int i = 0; i < dist_nfft; ++i) {
     dist_work1[2*i] = dist_density_fft[i];
     dist_work1[2*i+1] = 0.0;
   }
   dist_fft1->compute(dist_work1.data(), dist_work1.data(), FFT3d::FORWARD);
+  const double t_fft1 = MPI_Wtime();
 
   const double scaleinv = 1.0 / (static_cast<double>(mesh_nx) * mesh_ny * mesh_nz);
   const double s2 = scaleinv * scaleinv;
@@ -1945,9 +1949,12 @@ void SOGKSpace::compute_distributed(int eflag, int vflag) {
     }
   }
 
+  const double t_green = MPI_Wtime();
+
   double accum[14] = {0.0};
   MPI_Allreduce(accum_local, accum, 14, MPI_DOUBLE, MPI_SUM, world);
   dist_fft2->compute(dist_work2.data(), dist_work2.data(), FFT3d::BACKWARD);
+  const double t_fft2 = MPI_Wtime();
   std::fill(dist_u_brick.begin(), dist_u_brick.end(), 0.0);
   n = 0;
   for (int iz = dist_nzlo_in; iz <= dist_nzhi_in; ++iz)
@@ -1970,6 +1977,7 @@ void SOGKSpace::compute_distributed(int eflag, int vflag) {
                        dist_nylo_out, dist_nyhi_out,
                        dist_nzlo_out, dist_nzhi_out, u_host.data(),
                        f_local.data(), vp_local.data());
+  const double t_gather = MPI_Wtime();
   const double rsi = remove_self_interaction ? accum[1] / volume : 0.0;
   vpot.assign(nlocal, 0.0);
   for (int i = 0; i < nlocal; ++i) {
@@ -1998,6 +2006,28 @@ void SOGKSpace::compute_distributed(int eflag, int vflag) {
       virial[4] += pref * accum[12];
       virial[5] += pref * accum[13];
     }
+  }
+
+  // ── Distributed phase timing (rank 0, averaged over every 100 calls) ──
+  dist_acc_spread += t_spread1 - t_spread0;
+  dist_acc_remap  += t_remap1  - t_spread1;
+  dist_acc_fft1   += t_fft1    - t_remap1;
+  dist_acc_green  += t_green   - t_fft1;
+  dist_acc_fft2   += t_fft2    - t_green;
+  dist_acc_gather += t_gather  - t_fft2;
+  if (++dist_timing_count >= 100) {
+    if (comm->me == 0) {
+      const double inv = 1000.0 / static_cast<double>(dist_timing_count);
+      utils::logmesg(lmp, fmt::format(
+          "SOG_DIST_GPU_TIMING (n={}): spread={:.3f} remap={:.3f} fft_fwd={:.3f} "
+          "green={:.3f} fft_inv={:.3f} gather={:.3f} ms/step grid={}x{}x{} pencils={}\n",
+          dist_timing_count, dist_acc_spread * inv, dist_acc_remap * inv,
+          dist_acc_fft1 * inv, dist_acc_green * inv, dist_acc_fft2 * inv,
+          dist_acc_gather * inv, mesh_nx, mesh_ny, mesh_nz, comm->nprocs));
+    }
+    dist_acc_spread = dist_acc_remap = dist_acc_fft1 = 0.0;
+    dist_acc_green = dist_acc_fft2 = dist_acc_gather = 0.0;
+    dist_timing_count = 0;
   }
 }
 

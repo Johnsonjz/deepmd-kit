@@ -401,7 +401,16 @@ class SOGEnergyModel(DPModelCommon, SOGEnergyModel_):
         #                                     kspace analytical virial)
         nframes = extended_atype.shape[0]
         extended_coord = extended_coord.view(nframes, -1, 3).requires_grad_(True)
-        nlist = self.format_nlist(extended_coord, extended_atype, nlist)
+        # Must mirror forward_common_lower: dpa3/repflows requires a distance-
+        # sorted nlist (need_sorted_nlist_for_lower() == True).  LAMMPS supplies
+        # an unsorted list, so omitting this flag silently changes the descriptor
+        # input and hence the SR energy/force.
+        nlist = self.format_nlist(
+            extended_coord,
+            extended_atype,
+            nlist,
+            extra_nlist_sort=self.need_sorted_nlist_for_lower(),
+        )
         cc_ext, _, _, _, input_prec = self._input_type_cast(extended_coord)
         atomic_ret = self.atomic_model.forward_common_atomic(
             cc_ext,
@@ -452,7 +461,16 @@ class SOGEnergyModel(DPModelCommon, SOGEnergyModel_):
         # weights / same descriptor+fitting path as forward_lower — only the returned derivatives differ.
         nframes = extended_atype.shape[0]
         extended_coord = extended_coord.view(nframes, -1, 3)
-        nlist = self.format_nlist(extended_coord, extended_atype, nlist)
+        # Must mirror forward_common_lower: dpa3/repflows requires a distance-
+        # sorted nlist (need_sorted_nlist_for_lower() == True).  LAMMPS supplies
+        # an unsorted list, so omitting this flag silently changes the descriptor
+        # input and hence the SR energy/force.
+        nlist = self.format_nlist(
+            extended_coord,
+            extended_atype,
+            nlist,
+            extra_nlist_sort=self.need_sorted_nlist_for_lower(),
+        )
         cc_ext, _, _, _, input_prec = self._input_type_cast(extended_coord)
         atomic_ret = self.atomic_model.forward_common_atomic(
             cc_ext,

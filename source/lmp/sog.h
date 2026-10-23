@@ -157,6 +157,10 @@ class SOGKSpace : public KSpace {
   std::vector<FFT_SCALAR> dist_work2;
   std::vector<FFT_SCALAR> dist_gc_buf1;
   std::vector<FFT_SCALAR> dist_gc_buf2;
+  // Host-side phase timers for the distributed backend (rank 0 reports every N steps).
+  double dist_acc_spread = 0.0, dist_acc_remap = 0.0, dist_acc_fft1 = 0.0;
+  double dist_acc_green = 0.0, dist_acc_fft2 = 0.0, dist_acc_gather = 0.0;
+  int dist_timing_count = 0;
 
   // ── Direct k-space mode (exact reference, no mesh/FFT) ──
   bool use_direct = false;                  // gate: route compute_single to compute_direct
