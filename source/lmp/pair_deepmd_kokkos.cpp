@@ -36,6 +36,7 @@ PairDeepMDKokkos<DeviceType>::PairDeepMDKokkos(LAMMPS* lmp)
       edge_vec_fp32(false),
       canonical_graph(false),
       canonical_source_csr(false),
+      canonical_halo(false),
       device_path_ok(false),
       reverse_virial(false),
       reverse_used_host(false) {
@@ -222,6 +223,7 @@ void PairDeepMDKokkos<DeviceType>::init_style() {
   edge_vec_fp32 = deep_pot.uses_fp32_edge_vectors();
   canonical_graph = deep_pot.uses_canonical_graph_inference();
   canonical_source_csr = deep_pot.canonical_graph_requires_source_csr();
+  canonical_halo = canonical_graph && deep_pot.canonical_graph_requires_halo();
   // PairDeepMD::init_style() has confined a model with a long-range module to
   // a system periodic in every dimension or in none. The device edge path
   // passes such a module no cell, so a periodic system reaches it through the
@@ -241,6 +243,16 @@ void PairDeepMDKokkos<DeviceType>::init_style() {
   // The model node set is shared by both input schemas; type_idx_map is
   // populated by the base coeff().
   compact_graph.setup(type_idx_map, multi_rank);
+  // The halo exchange follows the swaps of the communication atom for atom,
+  // which the nodes of an extended node set do only without virtual atoms.
+  if (canonical_halo && multi_rank && compact_graph.has_null_types) {
+    error->all(FLERR,
+               "pair style deepmd/kk exchanges the features of ghost atoms of "
+               "a model with further message-passing blocks atom for atom "
+               "across ranks, which atoms of a type mapped to NULL in "
+               "pair_coeff break; map every type to an element, or run on a "
+               "single rank.");
+  }
 }
 
 template <class DeviceType>
@@ -558,9 +570,12 @@ void PairDeepMDKokkos<DeviceType>::compute(int eflag, int vflag) {
 
   // Send/recv swap metadata for a message-passing model under domain
   // decomposition: ghost features are exchanged across ranks inside the forward
-  // pass. It is passed only when the raw LAMMPS atom indices in the swap lists
-  // match the model-node indices, i.e. when no virtual (NULL-type) atoms
-  // compact the node set; otherwise the extended edge-input path is rejected.
+  // pass. The swap lists address LAMMPS atoms, which are the model-node indices
+  // too unless virtual (NULL-type) atoms compact the node set. The compact
+  // canonical lower then translates them through the same map its graph was
+  // built from; the edge-input lower has no channel for the translation, so it
+  // states no payload and lets the model layer refuse the decomposed frame
+  // rather than refresh every halo with stale features.
   deepmd_compat::InputNlist comm_list;
   const deepmd_compat::InputNlist* comm_ptr = nullptr;
   if (multi_rank && !compact_graph.has_null_types) {
@@ -570,10 +585,19 @@ void PairDeepMDKokkos<DeviceType>::compute(int eflag, int vflag) {
 
   // A model with a long-range module evaluates the system over all the ranks
   // that hold it, so on several ranks every rank calls it at every step, one
-  // without nodes included, and passes it the communicator.
-  void* const world_ptr =
-      long_range && multi_rank ? static_cast<void*>(&world) : nullptr;
-  if ((canonical_graph && (nnode_m > 0 || world_ptr != nullptr)) ||
+  // without nodes included, and passes it the communicator. A model with
+  // further message-passing blocks refreshes the features of the ghost nodes
+  // from the ranks that own them, through the communicator and the swaps of
+  // the communication, which a rank without nodes takes no part in.
+  const DP_HaloExchange* const halo =
+      canonical_graph && multi_rank
+          ? halo_exchange.plan(comm, error, neighbor->ago == 0)
+          : nullptr;
+  void* const world_ptr = (long_range || halo != nullptr) && multi_rank
+                              ? static_cast<void*>(&world)
+                              : nullptr;
+  const bool joins_long_range = long_range && multi_rank;
+  if ((canonical_graph && (nnode_m > 0 || joins_long_range)) ||
       (!canonical_graph && (nloc_m > 0 || comm_ptr != nullptr))) {
     // Fully device-resident inference: raw device pointers in and out. The
     // compact canonical model is enqueued on the Kokkos stream that builds its
@@ -614,7 +638,7 @@ void PairDeepMDKokkos<DeviceType>::compute(int eflag, int vflag) {
             compact_graph.d_destination_row_ptr.data(),
             source_csr ? compact_graph.d_source_row_ptr.data() : nullptr,
             source_csr ? compact_graph.d_source_order.data() : nullptr,
-            coord_ptr, world_ptr, cell_ptr, nloc_m, nnode_m,
+            coord_ptr, world_ptr, halo, cell_ptr, nloc_m, nnode_m,
             compact_graph.storage_count, model_stream);
       } else if (edge_vec_fp32) {
         deep_pot.compute_edges_gpu(d_atom_energy.data(), d_out_force.data(),

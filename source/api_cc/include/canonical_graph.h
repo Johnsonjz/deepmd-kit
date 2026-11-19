@@ -9,6 +9,16 @@ typedef enum DP_CanonicalIndexWidth {
   DP_CANONICAL_INDEX64 = 8
 } DP_CanonicalIndexWidth;
 
+typedef struct DP_HaloExchange {
+  int nswap;
+  const int* sendproc;
+  const int* recvproc;
+  const int* sendnum;
+  const int* recvnum;
+  const int* firstrecv;
+  const int* d_sendlist;
+} DP_HaloExchange;
+
 #ifdef __cplusplus
 namespace deepmd {
 /** Select node-index width, preserving signed words at native host boundaries.

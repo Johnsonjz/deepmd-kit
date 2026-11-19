@@ -2864,6 +2864,7 @@ void DeepPotPTExpt::compute_canonical_graph_gpu_impl(
     const std::int64_t* d_source_order,
     const double* d_coord,
     void* world,
+    const DP_HaloExchange* halo,
     const double* box,
     const std::int64_t nloc,
     const std::int64_t nall_nodes,
@@ -2944,7 +2945,7 @@ void DeepPotPTExpt::compute_canonical_graph_gpu_impl(
         "assembles the force without it.");
   }
 
-  translate_error([&] {
+  translate_error([&, halo, world] {
     // The source CSR placeholders and the replay belong to the instance, so
     // one evaluation at a time prepares and runs them.
     const std::lock_guard<std::recursive_mutex> evaluation(evaluation_mutex_);
@@ -3012,10 +3013,61 @@ void DeepPotPTExpt::compute_canonical_graph_gpu_impl(
                                                 {nall_nodes, 3}, opt_f64)
                              : torch::Tensor();
       std::map<std::string, torch::Tensor> output;
-      extract_outputs(output, run_model_canonical_graph(
-                                  atype, n_node, n_local, source, edge_vec,
-                                  destination_row_ptr, source_row_ptr,
-                                  source_order, coord, world, cell));
+      // Kokkos supplies the halo plan, not the host int** table border_op
+      // consumes; materialise the eight comm tensors and use the canonical
+      // with-comm sibling for a decomposed frame.
+      std::vector<int> kk_nodes;
+      std::vector<std::vector<int>> kk_swaps;
+      std::vector<int*> kk_ptrs;
+      std::vector<at::Tensor> canonical_comm;
+      if (world != nullptr && with_comm_loader && halo != nullptr &&
+          halo->nswap > 0) {
+        const int nswap = halo->nswap;
+        int sent = 0;
+        for (int s = 0; s < nswap; ++s) sent += halo->sendnum[s];
+        kk_nodes.resize(sent);
+        if (sent > 0) {
+          cudaDeviceSynchronize();
+          cudaMemcpy(kk_nodes.data(), halo->d_sendlist,
+                     (size_t)sent * sizeof(int), cudaMemcpyDeviceToHost);
+        }
+        kk_swaps.resize(nswap);
+        kk_ptrs.resize(nswap);
+        int off = 0;
+        for (int s = 0; s < nswap; ++s) {
+          kk_swaps[s].assign(kk_nodes.begin() + off,
+                             kk_nodes.begin() + off + halo->sendnum[s]);
+          kk_ptrs[s] = kk_swaps[s].data();
+          off += halo->sendnum[s];
+        }
+        const auto i32 = torch::TensorOptions().dtype(torch::kInt32);
+        const auto i64 = torch::TensorOptions().dtype(torch::kInt64);
+        canonical_comm = {
+            at::from_blob(kk_ptrs.data(), {nswap}, i64).clone(),
+            at::from_blob(const_cast<int*>(halo->sendproc), {nswap}, i32).clone(),
+            at::from_blob(const_cast<int*>(halo->recvproc), {nswap}, i32).clone(),
+            at::from_blob(const_cast<int*>(halo->sendnum), {nswap}, i32).clone(),
+            at::from_blob(const_cast<int*>(halo->recvnum), {nswap}, i32).clone(),
+            torch::tensor(
+                (int64_t)reinterpret_cast<std::uintptr_t>(
+                    *reinterpret_cast<void* const*>(world)),
+                i64),
+            torch::tensor((int64_t)nloc, i32),
+            torch::tensor((int64_t)(nall_nodes - nloc), i32),
+        };
+      }
+      if (!canonical_comm.empty()) {
+        extract_outputs(output,
+                        run_model_canonical_graph_with_comm(
+                            atype, n_node, n_local, source, edge_vec,
+                            destination_row_ptr, source_row_ptr, source_order,
+                            coord, world, cell, canonical_comm));
+      } else {
+        extract_outputs(output, run_model_canonical_graph(
+                                    atype, n_node, n_local, source, edge_vec,
+                                    destination_row_ptr, source_row_ptr,
+                                    source_order, coord, world, cell));
+      }
       // Debug: dump the compact canonical arrays and the outputs of this rank,
       // so a replay through the Python model separates "the arrays are wrong"
       // from "the model is wrong". Enabled by DEEPMD_CANONICAL_DUMP=<dir>; the
@@ -3204,6 +3256,7 @@ void DeepPotPTExpt::compute_canonical_graph_gpu(
     const std::int64_t* d_source_order,
     const double* d_coord,
     void* world,
+    const DP_HaloExchange* halo,
     const double* box,
     const std::int64_t nloc,
     const std::int64_t nall_nodes,
@@ -3212,8 +3265,8 @@ void DeepPotPTExpt::compute_canonical_graph_gpu(
   compute_canonical_graph_gpu_impl(
       d_atom_energy, d_force, d_virial, d_atom_virial, d_atype, d_source,
       index_width, d_edge_vec, d_destination_row_ptr, d_source_row_ptr,
-      d_source_order, d_coord, world, box, nloc, nall_nodes, edge_storage,
-      stream);
+      d_source_order, d_coord, world, halo, box, nloc, nall_nodes,
+      edge_storage, stream);
 }
 
 bool DeepPotPTExpt::uses_fp32_edge_vectors() const {

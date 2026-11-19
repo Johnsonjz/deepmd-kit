@@ -1383,6 +1383,7 @@ class DeepPot : public DeepBaseModel {
                                    const int64_t* d_source_order,
                                    const double* d_coord,
                                    void* world,
+                                   const DP_HaloExchange* halo,
                                    const double* box,
                                    const int64_t nloc,
                                    const int64_t nall_nodes,
@@ -1391,8 +1392,8 @@ class DeepPot : public DeepBaseModel {
     DP_DPA4ComputeCanonicalGraphGPU(
         dp, d_atom_energy, d_force, d_virial, d_atom_virial, d_atype, d_source,
         index_width, d_edge_vec, d_destination_row_ptr, d_source_row_ptr,
-        d_source_order, d_coord, world, box, nloc, nall_nodes, edge_storage,
-        stream);
+        d_source_order, d_coord, world, halo, box, nloc, nall_nodes,
+        edge_storage, stream);
     DP_CHECK_OK(DP_DeepPotCheckOK, dp);
   }
 
@@ -1437,6 +1438,8 @@ class DeepPot : public DeepBaseModel {
   /**
    * @brief Query whether the compact canonical graph ABI is active.
    */
+  bool canonical_graph_requires_halo() const { return false; }
+
   bool uses_canonical_graph_inference() const {
     const bool result = DP_DeepPotUsesCanonicalGraphInference(dp);
     DP_CHECK_OK(DP_DeepPotCheckOK, dp);

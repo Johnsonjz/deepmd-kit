@@ -519,6 +519,7 @@ extern void DP_DPA4ComputeCanonicalGraphGPU(
     const int64_t* d_source_order,
     const double* d_coord,
     void* world,
+    const DP_HaloExchange* halo,
     const double* box,
     int64_t nloc,
     int64_t nall_nodes,
