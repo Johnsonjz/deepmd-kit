@@ -282,6 +282,8 @@ def _reference(
     prefactor: float,
     order: int,
     spacing: float,
+    mesh_backend: int = 0,
+    force_mode: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Evaluate the operator in float64, over the explicit pairs or the meshes."""
     if int(communicator.reshape(-1)[0]) != 0:
@@ -349,6 +351,8 @@ def _fake(
     prefactor: float,
     order: int,
     spacing: float,
+    mesh_backend: int = 0,
+    force_mode: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     n = coord.shape[0]
     return (
