@@ -1132,6 +1132,8 @@ def _build_canonical_graph_dynamic_shapes_with_comm(
     )
     if has_long_range:
         shapes = (*shapes, {0: node_dim}, None, {0: nframes_val})
+    elif len(shapes) == 8:
+        shapes = (*shapes, None, None, None)
     return (*shapes, *(None,) * 8)
 
 
@@ -2675,7 +2677,17 @@ def _trace_and_export_impl(
                 # The positions, the communicator that serves the long-range
                 # module and the cells follow the compact eight exactly as in
                 # the plain canonical ABI; the comm payload follows them.
+                # The with-comm ABI always carries the three long-range slots
+                # between the compact eight and the comm payload; a
+                # short-range-only model leaves them None.
                 compact_inputs = tuple(sample_inputs)
+                if not want_long_range and len(compact_inputs) == 8:
+                    compact_inputs = (
+                        *compact_inputs,
+                        torch.empty((0, 3), dtype=torch.float64),
+                        torch.empty((0,), dtype=torch.int64),
+                        torch.empty((0, 9), dtype=torch.float64),
+                    )
                 nnode = int(sample_inputs[1].reshape(-1)[0])
                 nloc = int(sample_inputs[2].reshape(-1)[0])
                 comm_inputs = _make_comm_sample_inputs(

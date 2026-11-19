@@ -711,13 +711,19 @@ std::vector<torch::Tensor> DeepPotPTExpt::run_model_canonical_graph_with_comm(
       n_local,        canonicalIndexBytes(source),
       edge_vec,       destination_row_ptr,
       source_row_ptr, source_order};
-  if (long_range_) {
-    // The module reads its own communicator; the payload's communicator drives
-    // the descriptor's border exchange.
-    inputs.push_back(coord);
-    inputs.push_back(communicator_tensor(world));
-    inputs.push_back(cell);
-  }
+  // The traced with-comm ABI always carries the three long-range slots, even
+  // for a short-range-only model; the artifact ignores empty ones.
+  inputs.push_back(coord.defined() ? coord
+                                   : torch::empty(
+                                         {0, 3},
+                                         torch::TensorOptions()
+                                             .dtype(torch::kFloat64)));
+  inputs.push_back(communicator_tensor(world));
+  inputs.push_back(cell.defined() ? cell
+                                  : torch::empty(
+                                        {0, 9},
+                                        torch::TensorOptions()
+                                            .dtype(torch::kFloat64)));
   for (const auto& t : comm_tensors) {
     inputs.push_back(t);
   }
