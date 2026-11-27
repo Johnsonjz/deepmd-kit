@@ -2588,6 +2588,10 @@ class DescrptDPA4(ExpertComponent, NativeOP, BaseDescriptor):
     def get_nsel(self) -> int:
         return sum(self.sel)
 
+    def supports_long_range(self) -> bool:
+        """Whether the combination with long-range modules is validated."""
+        return True
+
     def get_ntypes(self) -> int:
         return self.ntypes
 
