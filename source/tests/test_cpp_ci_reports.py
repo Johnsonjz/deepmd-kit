@@ -310,7 +310,7 @@ def test_kokkos_report_commands_preserve_pytest_status(
         "                 'test_lammps_kokkos_atom_energy.py',\n"
         "                 'test_lammps_dpa4c_multiblock_kokkos.py',\n"
         "                 'test_lammps_model_devi_canonical.py'},\n"
-        "    'long-range.xml': {'test_lammps_dpa4c_long_range_kokkos.py'},\n"
+        "    'long-range.xml': {'test_lammps_dpa4c_long_range_kokkos.py', 'test_lammps_dpa4_2l_canonical.py'},\n"
         "}\n"
         "assert {Path(a).name for a in sys.argv if a.endswith('.py')} == expected[report.name]\n"
         "report.write_text('<testsuites/>')\n"

@@ -40,9 +40,9 @@ composition of models.
 
 ## Configuration
 
-The module is a `long_range` section of a standard energy model, beside the
-descriptor and the fitting. It is currently available with the
-[DPA4C](./dpa4c.md) descriptor:
+The module is a `long_range` section of a standard energy model (or a `dpa4`
+model), beside the descriptor and the fitting. It is available with the
+[DPA4](./dpa4.md) (SeZM) and [DPA4C](./dpa4c.md) descriptors:
 
 ```json
 "model": {
@@ -153,9 +153,13 @@ selects how training evaluates the sum:
   mesh that resolves every cell of the batch at
   {ref}`pme_spacing <model[standard]/long_range[latent_charge]/pme_spacing>`,
   whose transform gives the sum; the cost grows nearly linearly with the
-  number of atoms. With the default order 8 and spacing $0.75\pi/k_{max}$, the
-  energy and the forces stay within a few parts in a million of the sum over
-  the wave numbers.
+  number of atoms. By default the mesh spacing is the largest spacing that
+  reaches {ref}`pme_accuracy <model[standard]/long_range[latent_charge]/pme_accuracy>`
+  under the measured error law of `deepmd.dpmodel.long_range.grid_rule` for the
+  selected mesh backend, spline order, and force mode; an explicit
+  {ref}`pme_spacing <model[standard]/long_range[latent_charge]/pme_spacing>` is
+  used when `pme_accuracy` is left at its default, while an explicit
+  `pme_accuracy` wins over `pme_spacing`.
 - `ragged`: over the wave numbers of every frame within $k_{max}$, listed for
   every batch; their number grows with the volume of the cell.
 - `fixed`: over one integer grid shared by the frames of a batch, sized by the
@@ -202,6 +206,12 @@ long-range interaction is part of the compiled model: the pairs, the wave
 numbers or the mesh of each batch are built outside the compiled region and
 enter it as inputs of dynamic size. Compiled training of a periodic model in
 the `pme` mode on the CPU requires PyTorch 2.13 or later.
+
+The SOG kernel can be held fixed while the rest of the model warms up, then
+trained with its own learning-rate ramp via the optimizer options
+`long_range_kernel_train_start_step`, `long_range_kernel_lr_scale`,
+`long_range_kernel_lr_scale_start`, and `long_range_kernel_lr_ramp_steps` (or
+`long_range_kernel_lr_ramp_frac`).
 
 `dp --pt-expt freeze` exports the model, long-range module included, to
 `.pt2` or `.pte`, and `dp --pt-expt compress` compresses its descriptor into a
@@ -251,3 +261,27 @@ The following are not supported for a model with a long-range module:
 multi-rank (domain-decomposed) inference of a model that the dedicated
 operator does not evaluate, such as an uncompressed one, spin models, the
 tabulated ZBL potential, and short-range bridging.
+
+
+### Mesh backends, force modes, and distributed z-slab solve
+
+The CUDA operator `deepmd::latent_charge_sum` selects its periodic mesh solver with
+{ref}`mesh_backend <model[standard]/long_range[latent_charge]/mesh_backend>`:
+`bspline` (default) for smooth particle-mesh Ewald, `midtown` for the CubeS2
+splines and cuFFT solver of SOG-Net, or `quads` for the separable QuadS stencil.
+The `midtown` and `quads` solvers serve the `sog` kernel with one charge
+channel. Its force is differentiated according to
+{ref}`force_mode <model[standard]/long_range[latent_charge]/force_mode>`: `ad`
+(default) differentiates the assignment weights (exact gradient of the mesh
+energy), while `ik` differentiates the potential in Fourier space (`midtown`
+and `quads` only).
+
+Across MPI ranks, both compressed DPA4C and compact-canonical DPA4 (`dpa_canonical`)
+archives evaluate multi-rank domains in `pair_style deepmd` and
+`pair_style deepmd/kk`, refreshing ghost features through `DP_HaloExchange` when
+`DP_DeepPotCanonicalGraphRequiresHalo` holds and passing the source CSR when
+`DP_DeepPotCanonicalGraphRequiresSourceCSR` holds. By default each rank
+evaluates a replicated periodic mesh; setting `SOG_MIDTOWN_SLAB=1` (with one GPU
+per rank and DeePMD-kit built with MPI and NCCL) switches periodic solves to the
+pencil/z-slab distributed FFT (`SOG_SLAB_IK=1` enables `ik` force differentiation
+on the slab path).

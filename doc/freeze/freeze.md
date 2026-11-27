@@ -60,6 +60,23 @@ extension. `--lower-kind graph` requires a graph-eligible model. Conversely, a
 graph-capable DPA model may override a requested `nlist` lower with the graph
 form and emit a warning. In multi-task mode, select a model branch with
 `--task CHOSEN_BRANCH` (aliases: `--head`, `--model-branch`).
+
+**Compact canonical lower & compression.** On a CUDA device, eligible single-precision
+DPA4 models and compressed DPA1/DPA4C models automatically export on the
+compact canonical schema (`lower_input_kind=dpa_canonical`, `float32` edges).
+Add `--compress` to fold deployment constants and tabulate supported
+descriptors in one step:
+
+```bash
+dp --pt-expt freeze -c model.ckpt.pt -o model.pt2 --compress
+```
+
+For long-range (`latent_charge`) models on CUDA, the compact canonical lower
+evaluates the reciprocal-space sum inside the compiled program via
+`deepmd::latent_charge_sum` and carries the cross-rank `BorderPlan` halo
+exchange (`deepmd::border_exchange`) directly in its main ABI
+(`has_comm_artifact: false`), supporting both single-rank and multi-rank
+inference across `pair_style deepmd` and `pair_style deepmd/kk`.
 :::
 
 :::{tab-item} Paddle {{ paddle_icon }}
