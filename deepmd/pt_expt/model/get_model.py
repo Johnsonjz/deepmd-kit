@@ -392,6 +392,9 @@ def get_spin_model(data: dict) -> SpinEnergyModel:
     )
 
 
+_LEGACY_SOG_TYPES = {"sezm_sog", "dpa4_sog", "sog_sezm", "dpa4c_sog"}
+
+
 def get_model(data: dict) -> BaseModel:
     """Get a model from a config dictionary.
 
@@ -400,6 +403,16 @@ def get_model(data: dict) -> BaseModel:
     data : dict
         The data to construct the model.
     """
+    model_type = str(data.get("type", "standard")).lower()
+    if model_type in _LEGACY_SOG_TYPES:
+        raise ValueError(
+            f"the legacy SOG model type {model_type!r} is not part of the "
+            "upstream `long_range` schema. Convert its configuration and "
+            "checkpoint with "
+            "`convert_sog_to_long_range`, then use "
+            "`model.type: dpa4` (or `standard` for DPA4C) with a "
+            "`long_range: latent_charge` section."
+        )
     data = expand_bridging_method(data)
     if data.get("lora") is not None:
         # The expansion keeps trainer-owned `lora` at the composition top

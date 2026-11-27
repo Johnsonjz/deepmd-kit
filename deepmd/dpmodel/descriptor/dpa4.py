@@ -2971,7 +2971,16 @@ class DescrptDPA4(ExpertComponent, NativeOP, BaseDescriptor):
         check_frequency
             The overflow check frequency
         """
-        raise NotImplementedError("Compression is unsupported for SeZM.")
+        import logging
+
+        logging.getLogger(__name__).info(
+            "SeZM has no tabulated compression; `--compress` selects the "
+            "compact canonical graph adapter instead."
+        )
+
+    def compression_needs_min_nbor_dist(self) -> bool:
+        """SeZM tabulates nothing: its canonical lower is a graph adapter."""
+        return False
 
     def change_type_map(
         self, type_map: list[str], model_with_new_type_stat: Any | None = None

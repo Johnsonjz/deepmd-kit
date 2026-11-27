@@ -311,6 +311,18 @@ class EnergyModel(DPModelCommon, DPEnergyModel_):
             )
         )
         if evaluator == "graph":
+            long_range_op = None
+            if self.atomic_model.required_topologies():
+                if coord is None:
+                    raise ValueError(
+                        "a model with a long-range module reads the node positions"
+                    )
+                check_owned_frames(n_node, n_local, communicator, box)
+                long_range_op = {
+                    "coord": coord,
+                    "communicator": communicator,
+                    "box": box,
+                }
             # The graph forward differentiates the energy with respect to the
             # edge vectors and assembles the force over both CSR views.
             view = neighbor_graph_from_canonical(graph, atype.shape[0])
@@ -330,6 +342,7 @@ class EnergyModel(DPModelCommon, DPEnergyModel_):
                 charge_spin=charge_spin,
                 spin=spin,
                 comm_dict=border,
+                long_range_op=long_range_op,
             )
             return self._translate_eager_call(
                 model_ret, atype, do_atomic_virial=do_atomic_virial

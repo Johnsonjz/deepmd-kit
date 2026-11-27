@@ -80,6 +80,51 @@ def model_uses_graph_lower(model: Any) -> bool:
     return bool(atomic_model.uses_graph_lower())
 
 
+def _graph_canonical_long_range_ok(model: Any) -> bool:
+    """Whether a model's topologies can be evaluated inside the compact graph lower.
+
+    The compact canonical ABI carries node positions, cells, and the MPI
+    communicator rather than reciprocal-space topology tensors.  A graph-lower
+    energy model with no topologies always qualifies; one with a latent-charge
+    long-range module qualifies when ``latent_charge_sum`` serves the module
+    inside the compiled program without frame charge-state inputs, pair
+    potentials, exclusions, or native-spin containers.
+    """
+    atomic_model = getattr(model, "atomic_model", None)
+    if atomic_model is None:
+        return False
+    if not atomic_model.required_topologies():
+        return True
+    from deepmd.dpmodel.model.native_spin_model import (
+        NativeSpinModelKind,
+    )
+    from deepmd.pt_expt.kernels.long_range import (
+        op_available as latent_charge_op_available,
+    )
+    from deepmd.pt_expt.long_range.latent_charge import (
+        LatentChargeLongRange,
+    )
+
+    if isinstance(model, NativeSpinModelKind):
+        return False
+    if getattr(atomic_model, "pair_excl", None) is not None:
+        return False
+    if getattr(atomic_model, "atom_excl", None) is not None:
+        return False
+    parts = atomic_model.fused_decomposition()
+    if parts is None or parts[0] is None or parts[1] is not None:
+        return False
+    if not parts[0].has_long_range():
+        return False
+    long_range = parts[0].long_range
+    return (
+        isinstance(long_range, LatentChargeLongRange)
+        and latent_charge_op_available()
+        and bool(long_range.operator_eligible())
+        and not bool(long_range.uses_charge_spin())
+    )
+
+
 def canonical_lower_evaluator(model: Any) -> str | None:
     """Return what evaluates a model on the compact canonical lower.
 
@@ -90,9 +135,9 @@ def canonical_lower_evaluator(model: Any) -> str | None:
     forward of the model evaluates it on a ``NeighborGraph`` view of the
     compact graph: a graph-lower energy model whose atomic model evaluates
     the compact canonical graph (see ``supports_canonical_graph``), deployed
-    on a CUDA device, that reads no frame or atomic parameter, which the
-    compact schema does not carry, and has no long-range module, which only
-    the fused DPA4C operators evaluate there.
+    on a CUDA device, that reads no frame or atomic parameter and either has
+    no topology inputs or evaluates its latent-charge long-range module
+    through ``latent_charge_sum``.
 
     Parameters
     ----------
@@ -126,7 +171,7 @@ def canonical_lower_evaluator(model: Any) -> str | None:
         and bool(model.atomic_model.supports_canonical_graph())
         and model.get_dim_fparam() == 0
         and model.get_dim_aparam() == 0
-        and not model.atomic_model.required_topologies()
+        and _graph_canonical_long_range_ok(model)
     ):
         return "graph"
     return None
