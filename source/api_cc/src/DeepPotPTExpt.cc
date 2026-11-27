@@ -932,6 +932,12 @@ void DeepPotPTExpt::extract_outputs(
   for (size_t i = 0; i < output_keys.size(); ++i) {
     output_map[output_keys[i]] = flat_outputs[i];
   }
+  // Every caller reads some of these slots with reshape(), so an undefined one
+  // -- an operator exception the AOTI proxy executor caught and never
+  // rethrew -- must be reported HERE, by name.  Checking in the individual
+  // callers was not enough: the canonical-graph GPU entry point, which is the
+  // one `pair deepmd/kk` uses, reshapes the slots directly.
+  deepmd::require_defined_outputs(output_map, "DeepPotPTExpt");
 }
 
 template <typename VALUETYPE, typename ENERGYVTYPE>

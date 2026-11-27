@@ -703,6 +703,9 @@ void NativeSpinPTExpt::extract_outputs(
   for (size_t i = 0; i < output_keys.size(); ++i) {
     output_map[output_keys[i]] = flat_outputs[i];
   }
+  // Same guard as DeepPotPTExpt / DeepSpinPTExpt: report undefined outputs
+  // swallowed by the AOTI proxy executor before downstream reshape() calls.
+  deepmd::require_defined_outputs(output_map, "NativeSpinPTExpt");
 }
 
 // ============================================================================
