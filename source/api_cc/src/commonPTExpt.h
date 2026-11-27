@@ -234,6 +234,20 @@ class CallerStreamScope {
       return;
     }
 #ifdef DEEPMD_TORCH_HAS_CUDA
+    // c10::cuda::getStreamFromExternal stores the handle verbatim as a stream
+    // id and c10::cuda::CUDAStream::stream() treats an even, non-zero id as an
+    // external stream, but decodes an odd id as a native one: the caller then
+    // fails on its first PyTorch operation with "Unrecognized stream ...
+    // PRIORITY ...". A CUDA stream handle is aligned, so an odd value means the
+    // caller passed something else, which a caller built against another C API
+    // version does when its shifted arguments put, for example, an edge count
+    // in the stream slot. Name the fault here instead of inside PyTorch.
+    if ((reinterpret_cast<std::uintptr_t>(stream) & 1U) != 0U) {
+      throw deepmd::deepmd_exception(
+          "the caller stream is not a CUDA stream handle (its low bit is set); "
+          "the caller was probably built against another DeePMD-kit C API "
+          "version, so its arguments do not line up with this library");
+    }
     guard_.emplace(c10::cuda::getStreamFromExternal(
         static_cast<cudaStream_t>(stream),
         static_cast<c10::DeviceIndex>(device)));
@@ -250,6 +264,13 @@ class CallerStreamScope {
   std::optional<c10::cuda::CUDAStreamGuard> guard_;
 #endif
 };
+
+// A capture evaluates the model against a private pool that cannot grow while
+// the capture is under way, so a model whose eager working set is a large part
+// of the card fails inside the capture and takes the eager fallback down with
+// it: the partially captured pool stays reserved and the next eager call runs
+// out of memory.  Above this footprint the model evaluates eagerly only.
+constexpr std::size_t kMaxCapturedFootprint = std::size_t(6) << 30;
 
 /**
  * @brief Whether the AOTInductor package of ``model`` runs on a CUDA device.
@@ -395,7 +416,17 @@ class GraphReplay {
       // its constants) outside the graph.
       release();
       key_.clear();
+#ifdef DEEPMD_TORCH_HAS_CUDA
+      std::size_t free_before = 0, free_after = 0, total_b = 0;
+      cudaMemGetInfo(&free_before, &total_b);
       evaluate();
+      cudaMemGetInfo(&free_after, &total_b);
+      if (free_before > free_after) {
+        eager_footprint_ = free_before - free_after;
+      }
+#else
+      evaluate();
+#endif
       key_ = key;
       return;
     }
@@ -459,6 +490,40 @@ class GraphReplay {
     // device memory instead of adding to it.
     c10::cuda::device_synchronize();
     c10::cuda::CUDACachingAllocator::emptyCache();
+#ifdef DEEPMD_TORCH_HAS_CUDA
+    // The private pool of a capture holds a second copy of the working set.
+    // When the model already occupies most of the card the pool cannot be
+    // satisfied: the capture fails, the memory of its partial evaluation
+    // stays reserved with the abandoned graph, and the eager fallback that
+    // follows then runs out of memory as well -- a large message-passing
+    // frame fits on the card, evaluates once, and dies on its second call.
+    // Skip the capture and stay eager while the headroom is below the live
+    // footprint plus a margin.
+    {
+      // The working set is not visible in cudaMemGetInfo at this point: the
+      // buffers of the preceding eager call were just released, so the device
+      // looks nearly empty even when the evaluation reserves 20 GiB.  The
+      // footprint measured by that eager call is what sizes the private pool
+      // a capture has to satisfy, and the pool cannot grow during a capture.
+      std::size_t free_bytes = 0, total_bytes = 0;
+      cudaMemGetInfo(&free_bytes, &total_bytes);
+      if (eager_footprint_ > kMaxCapturedFootprint ||
+          free_bytes < static_cast<std::size_t>(eager_footprint_ * 1.2)) {
+        if (std::getenv("DP_REPLAY_DEBUG") != nullptr) {
+          std::cerr << "[replay] skip capture: free " << free_bytes / 1048576
+                    << " MiB, footprint " << eager_footprint_ / 1048576
+                    << " MiB" << std::endl;
+        }
+        capturable_ = false;
+        return false;
+      }
+      if (std::getenv("DP_REPLAY_DEBUG") != nullptr) {
+        std::cerr << "[replay] capture: free " << free_bytes / 1048576
+                  << " MiB, footprint " << eager_footprint_ / 1048576 << " MiB"
+                  << std::endl;
+      }
+    }
+#endif
     auto graph = std::make_unique<at::cuda::CUDAGraph>();
     try {
       // A capture needs a stream other than the legacy default one, on which
@@ -504,6 +569,9 @@ class GraphReplay {
   Key key_;
   int device_ = 0;
   bool capturable_ = true;
+  // Bytes the last eager evaluation reserved; a capture must hold a second
+  // copy of them in its private pool.
+  std::size_t eager_footprint_ = 0;
   std::unique_ptr<at::cuda::CUDAGraph> graph_;
   std::unique_ptr<at::cuda::CUDAGraph> abandoned_;
 #endif

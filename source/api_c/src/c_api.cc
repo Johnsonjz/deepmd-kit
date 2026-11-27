@@ -14,6 +14,8 @@
 
 extern "C" {
 
+int DP_GetApiVersion(void) { return DP_C_API_VERSION; }
+
 DP_Nlist::DP_Nlist() {}
 DP_Nlist::DP_Nlist(deepmd::InputNlist& nl) : nl(nl) {}
 

@@ -15,7 +15,18 @@ extern "C" {
 /** C API version. Bumped whenever the API is changed.
  * @since API version 22
  */
-#define DP_C_API_VERSION 32
+#define DP_C_API_VERSION 33
+
+/**
+ * @brief Return the API version of the library this symbol resolves to.
+ *
+ * Compare the returned value with the DP_C_API_VERSION the caller was compiled
+ * against so a plugin and library built from mismatched C API versions fail
+ * fast at load time instead of calling functions with shifted arguments.
+ * @return the DP_C_API_VERSION of the library.
+ * @since API version 33
+ */
+extern int DP_GetApiVersion(void);
 
 /**
  * @brief Neighbor list.
